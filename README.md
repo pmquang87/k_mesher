@@ -1,5 +1,7 @@
 # k_mesher
 
+[![tests](https://github.com/pmquang87/k_mesher/actions/workflows/ci.yml/badge.svg)](https://github.com/pmquang87/k_mesher/actions/workflows/ci.yml)
+
 Mesh STEP geometry into solid tetrahedra (TET4/TET10) or shells (TRI3/QUAD4)
 and export an LS-DYNA keyword file (`.k`). Features: symmetry planes
 (half/quarter/eighth models), per-body parts, defeaturing (remove holes/
@@ -8,6 +10,10 @@ refinement (regions and per-face sizes), LS-DYNA quality criteria with
 failed-element sets, quality-driven auto-remeshing, mass properties, shell
 integrity checks, parameter presets and a batch queue. Meshing is done with
 [gmsh](https://gmsh.info) (OpenCASCADE kernel), the GUI is plain tkinter.
+
+| Mesh parameters & refinement | Symmetry, face BCs/loads, defeature |
+|---|---|
+| ![Mesh tab](docs/screenshot_mesh.png) | ![Face sets and roles](docs/screenshot_faces.png) |
 
 ## Install & run
 
