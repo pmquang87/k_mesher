@@ -1,0 +1,19 @@
+# virtual environment / IDE
+.venv/
+.idea/
+__pycache__/
+*.pyc
+
+# user-local GUI state (contains local file paths)
+k_mesher_settings.json
+k_mesher_presets.json
+
+# generated test/example outputs
+tests/out/
+examples/*.step
+examples/*.stp
+examples/*.k
+*_preview.msh
+
+# Claude Code local settings
+.claude/
