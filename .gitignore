@@ -12,6 +12,11 @@ k_mesher_presets.json
 tests/out/
 examples/*.step
 examples/*.stp
+examples/*.iges
+examples/*.igs
+examples/*.brep
+examples/*.brp
+examples/*.stl
 examples/*.k
 *_preview.msh
 

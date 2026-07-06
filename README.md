@@ -2,14 +2,26 @@
 
 [![tests](https://github.com/pmquang87/k_mesher/actions/workflows/ci.yml/badge.svg)](https://github.com/pmquang87/k_mesher/actions/workflows/ci.yml)
 
-Mesh STEP geometry into solid tetrahedra (TET4/TET10) or shells (TRI3/QUAD4)
+Mesh CAD geometry (STEP / IGES / BREP) or a surface tessellation
+(STL / OBJ / PLY) into solid tetrahedra (TET4/TET10) or shells (TRI3/QUAD4)
 and export an LS-DYNA keyword file (`.k`). Features: symmetry planes
-(half/quarter/eighth models), per-body parts, defeaturing (remove holes/
-fillets), face sets with BCs and loads (SPC / pressure / force), local mesh
-refinement (regions and per-face sizes), LS-DYNA quality criteria with
-failed-element sets, quality-driven auto-remeshing, mass properties, shell
-integrity checks, parameter presets and a batch queue. Meshing is done with
-[gmsh](https://gmsh.info) (OpenCASCADE kernel), the GUI is plain tkinter.
+(half/quarter/eighth models) with separate node-set and boundary-condition
+options (symmetric / anti-symmetric / fixed / custom DOFs), per-body parts,
+defeaturing (remove holes/fillets), face sets with BCs and loads
+(SPC / pressure / force), local mesh refinement (regions and per-face sizes),
+LS-DYNA quality criteria with failed-element sets, quality-driven auto-remeshing,
+mass properties, shell integrity checks, parameter presets and a batch queue.
+Meshing is done with [gmsh](https://gmsh.info) (OpenCASCADE kernel), the GUI is
+plain tkinter.
+
+**Input formats** — STEP (`.step/.stp`), IGES (`.iges/.igs`) and BREP
+(`.brep/.brp`) are B-rep CAD and support the full pipeline (solids, symmetry,
+defeature, face sets). STL/OBJ/PLY are surface tessellations: meshed as-is with
+shells, or — when the surface is watertight — tetrahedralized (TET4/TET10) by
+reconstructing the enclosed volume. Tessellations still have no CAD geometry, so
+symmetry/defeature/refinement need a B-rep. See
+[docs/cad_formats.md](docs/cad_formats.md) for the full survey of CAD formats and
+what is / isn't importable.
 
 | Mesh parameters & refinement | Symmetry, face BCs/loads, defeature |
 |---|---|
@@ -29,9 +41,15 @@ Command line (batch) use:
 
 ```
 python mesh_cli.py part.stp --size-max 8 --size-min 1
-python mesh_cli.py part.stp -o half.k --sym x --mat --elform 13
-python mesh_cli.py part.stp --etype tet10 --algo hxt --sym x:0:+ --sym y:5:-
+python mesh_cli.py part.iges -o half.k --sym x --mat --elform 13
+python mesh_cli.py part.brep --etype tet10 --algo hxt --sym x:0:+ --sym y:5:-
+python mesh_cli.py part.stl --etype tri3 --thickness 1.2      # STL -> shells
+python mesh_cli.py part.stl --etype tet4                      # watertight STL -> tets
 python mesh_cli.py sheet.stp --etype quad4 --thickness 2.5
+python mesh_cli.py part.stp --sym x --sym-constraint antisymmetric
+python mesh_cli.py part.stp --sym x --no-sym-spc              # node set, no BC
+python mesh_cli.py part.stp --sym x --sym-dofs 13             # custom SPC DOFs
+python mesh_cli.py part.stp --sym x --sym-segset              # + plane segment set
 python mesh_cli.py part.stp --list-faces
 python mesh_cli.py part.stp --face-nodeset 7 --face-segset 12
 python mesh_cli.py part.stp --refine-sphere 0:0:0:15:1.5 --face-size 6:2.0
@@ -45,7 +63,8 @@ window close).
 
 ## Workflow (GUI)
 
-1. **Files** — pick the STEP input; the `.k` output path is auto-filled.
+1. **Files** — pick the CAD/mesh input (STEP/IGES/BREP or STL/OBJ/PLY); the
+   `.k` output path is auto-filled.
 2. **Mesh tab**
    - *Max/Min element size* in the model's length units.
    - *Refine by curvature* — targets N elements per full circle, so holes and
@@ -73,16 +92,30 @@ window close).
      SHRF = 0.8333). Surface-only STEP files are meshed directly with
      shells; for solids, the body's boundary surfaces are meshed.
    - Base part ID: each solid body in the STEP file becomes its own `*PART`
-     (PID, PID+1, ...; shell meshes are one part). Start node/element IDs
-     allow merging into assembly decks without ID clashes.
+     (PID, PID+1, ...; shell meshes are one part). Start node/element/set IDs
+     (the last renumbers node/segment/SPC/element sets) let you merge into
+     assembly decks without ID clashes.
    - Optional `*MAT_ELASTIC` card (E, ν, ρ; defaults are steel in mm-t-s).
      Without it, define your own `*MAT_` with MID = base PID.
 4. **Symmetry & face sets tab**
    - Symmetry: tick X/Y/Z planes, set the plane position and which side to
      keep. The geometry is cut by boolean intersection *before* meshing, so
-     the mesh conforms exactly to the plane. Nodes on each plane are written
-     as `*SET_NODE_LIST` + `*BOUNDARY_SPC_SET` with proper symmetry
-     constraints.
+     the mesh conforms exactly to the plane. The node set and the boundary
+     condition are now **separate options**:
+     - *Write node set* — emit `*SET_NODE_LIST` for the symmetry-plane nodes.
+     - *Apply boundary condition* — emit `*BOUNDARY_SPC_SET`, with a choice of
+       constraint: **Symmetric** (default; fixes the normal translation and the
+       two in-plane rotations), **Anti-symmetric** (the complement, for
+       anti-symmetric loading), **Fixed** (all 6 DOFs), or **Custom DOFs** (type
+       the DOF digits, e.g. `13`).
+
+     Turn the BC off to get just the node set (e.g. to apply your own
+     constraint, contact or coupling); turning the node set off while the BC is
+     on still writes the node set the SPC references. *Write segment set*
+     additionally emits a `*SET_SEGMENT` for the boundary faces lying on each
+     symmetry plane (solids only — useful for contact or pressure on the cut
+     face). (STL/OBJ/PLY inputs have no CAD geometry to cut, so symmetry is
+     unavailable for them.)
    - Face sets: **Scan faces from geometry** lists all model faces with
      type, area and centroid (uses the current symmetry/glue settings —
      rescan after changing them). "Select small faces" finds candidates for
@@ -162,11 +195,12 @@ big meshes:
 | `start_gui.py` | launcher that relaunches via the project `.venv` (double-click friendly) |
 | `mesh_cli.py` | command-line interface for batch meshing |
 | `gui.py` | tkinter GUI |
-| `mesher.py` | gmsh meshing core (import, symmetry, refinement, tet/shell extraction) |
+| `mesher.py` | gmsh meshing core (STEP/IGES/BREP/STL/OBJ/PLY import, symmetry, refinement, tet/shell extraction) |
 | `dyna_writer.py` | LS-DYNA `.k` writer |
 | `preview.py` | standalone Gmsh viewer process |
-| `examples/make_test_step.py` | generates test parts |
-| `tests/test_headless.py` | end-to-end tests (all element types, symmetry, parts, sets, refinement) |
+| `examples/make_test_step.py` | generates test parts (STEP + IGES/BREP/STL) |
+| `tests/test_headless.py` | end-to-end tests (all element types, formats, symmetry BCs, parts, sets, refinement) |
+| `docs/cad_formats.md` | survey of CAD input formats and what is importable |
 
 ## Notes on element types
 

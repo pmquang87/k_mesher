@@ -13,9 +13,20 @@ sys.path.insert(0, os.path.join(ROOT, "examples"))
 
 import dyna_writer
 import mesher
-from make_test_step import make, make_two_bodies, make_shell
+from make_test_step import make, make_two_bodies, make_shell, make_formats
 
 QUIET = lambda m: None
+
+
+def spc_dofs(text):
+    """Return the 6 DOF flags [dofx..dofrz] of the first *BOUNDARY_SPC_SET."""
+    lines = text.splitlines()
+    for i, ln in enumerate(lines):
+        if ln.startswith("*BOUNDARY_SPC_SET"):
+            data = lines[i + 2]   # keyword, $# header, then the value line
+            vals = [int(data[j:j + 10]) for j in range(0, 80, 10)]
+            return vals[2:8]
+    return None
 
 
 def parse_k(path):
@@ -385,6 +396,160 @@ def main():
         raise AssertionError("expected RuntimeError for empty cut")
     except RuntimeError as e:
         print(f"OK: got expected error: {e}")
+
+    # ---- 16. symmetry BC options: node-set-only, anti-sym, fixed, custom -------
+    print("=== symmetry BC options (node set / SPC / anti-sym / custom) ===")
+    settings = mesher.MeshSettings(
+        step_file=step, size_max=8.0, size_min=2.0,
+        symmetry=[mesher.SymmetryPlane("x", 0.0, "+")])
+    res = mesher.mesh_step(settings, log=QUIET)
+    nodes_x = res.sym_nodes["x"]
+
+    # (a) node set only, no boundary condition
+    k = os.path.join(out_dir, "sym_nodeset_only.k")
+    dyna_writer.write_k(k, res.coords, res.elems, sym_sets=(
+        {"axis": "x", "offset": 0.0, "nodes": nodes_x, "spc": False},))
+    _, _, _, kws = parse_k(k)
+    assert "*SET_NODE_LIST_TITLE" in kws, "node set must be written"
+    assert "*BOUNDARY_SPC_SET" not in kws, "no SPC when spc=False"
+
+    # (b) default symmetric -> constrain X translation + in-plane rotations
+    k = os.path.join(out_dir, "sym_symmetric.k")
+    dyna_writer.write_k(k, res.coords, res.elems, sym_sets=(
+        {"axis": "x", "offset": 0.0, "nodes": nodes_x, "spc": True},))
+    assert spc_dofs(open(k).read()) == [1, 0, 0, 0, 1, 1]
+
+    # (c) anti-symmetric -> the complement
+    k = os.path.join(out_dir, "sym_antisym.k")
+    dyna_writer.write_k(k, res.coords, res.elems, sym_sets=(
+        {"axis": "x", "offset": 0.0, "nodes": nodes_x, "spc": True,
+         "constraint": "antisymmetric"},))
+    txt = open(k).read()
+    assert spc_dofs(txt) == [0, 1, 1, 1, 0, 0]
+    assert "(antisymmetric)" in txt, "title should note the constraint kind"
+
+    # (d) fixed -> all six DOFs
+    k = os.path.join(out_dir, "sym_fixed.k")
+    dyna_writer.write_k(k, res.coords, res.elems, sym_sets=(
+        {"axis": "x", "offset": 0.0, "nodes": nodes_x, "spc": True,
+         "constraint": "fixed"},))
+    assert spc_dofs(open(k).read()) == [1, 1, 1, 1, 1, 1]
+
+    # (e) custom DOFs "13" -> dofx, dofz
+    k = os.path.join(out_dir, "sym_custom.k")
+    dyna_writer.write_k(k, res.coords, res.elems, sym_sets=(
+        {"axis": "x", "offset": 0.0, "nodes": nodes_x, "spc": True,
+         "dofs": "13"},))
+    assert spc_dofs(open(k).read()) == [1, 0, 1, 0, 0, 0]
+
+    # (f) start_sid offsets every set id (merge-friendly; parallels start_nid)
+    k = os.path.join(out_dir, "sym_startsid.k")
+    dyna_writer.write_k(k, res.coords, res.elems, start_sid=100, sym_sets=(
+        {"axis": "x", "offset": 0.0, "nodes": nodes_x, "spc": True},))
+    lines = open(k).read().splitlines()
+    i = next(j for j, l in enumerate(lines) if l.startswith("*SET_NODE_LIST_TITLE"))
+    assert int(lines[i + 3][0:10]) == 100, "node set SID must start at start_sid"
+    s = next(j for j, l in enumerate(lines) if l.startswith("*BOUNDARY_SPC_SET"))
+    assert int(lines[s + 2][0:10]) == 100, "SPC must reference the offset set id"
+
+    # (g) symmetry-plane segment set: boundary faces on the plane, all corners
+    # on the plane, written as *SET_SEGMENT
+    seg = res.sym_segs["x"]
+    on_plane = set(nodes_x.tolist())
+    assert len(seg) > 5 and seg.shape[1] == 4
+    assert all(int(c) in on_plane for c in seg[:, :3].ravel())
+    assert (seg[:, 2] == seg[:, 3]).all(), "tets -> triangle segments padded to quad"
+    k = os.path.join(out_dir, "sym_segset.k")
+    dyna_writer.write_k(k, res.coords, res.elems, sym_sets=(
+        {"axis": "x", "offset": 0.0, "nodes": nodes_x, "spc": True,
+         "segset": seg},))
+    _, _, _, kws = parse_k(k)
+    assert "*SET_SEGMENT_TITLE" in kws, "segment set must be written"
+    print("OK: node-set-only, symmetric, anti-symmetric, fixed, custom, "
+          "start_sid, plane segset verified")
+
+    # ---- 17. multi-format input: BREP / IGES / STL ----------------------------
+    print("=== multi-format input (BREP / IGES / STL) ===")
+    base = os.path.join(ex, "test_part")
+    if not all(os.path.isfile(base + e) for e in (".iges", ".brep", ".stl")):
+        make_formats(base)
+
+    # BREP solid reproduces the STEP volume exactly (same OCC kernel)
+    rb = mesher.mesh_step(mesher.MeshSettings(
+        step_file=base + ".brep", size_max=8.0, size_min=2.0), log=QUIET)
+    assert abs(rb.stats["measure"] - 117146.0) / 117146.0 < 0.02
+
+    # IGES imports as surfaces and is sewn into a solid
+    ri = mesher.mesh_step(mesher.MeshSettings(
+        step_file=base + ".iges", size_max=8.0, size_min=2.0), log=QUIET)
+    assert abs(ri.stats["measure"] - 117146.0) / 117146.0 < 0.02
+
+    # IGES rejects the OCC target-unit override -> import must fall back to
+    # file units instead of crashing
+    riu = mesher.mesh_step(mesher.MeshSettings(
+        step_file=base + ".iges", size_max=8.0, size_min=2.0,
+        occ_unit="MM"), log=QUIET)
+    assert abs(riu.stats["measure"] - 117146.0) / 117146.0 < 0.02
+
+    # IGES shell: sewing makes it watertight
+    ris = mesher.mesh_step(mesher.MeshSettings(
+        step_file=base + ".iges", element_type="TRI3", size_max=8.0), log=QUIET)
+    assert ris.stats["free_edges"] == 0, \
+        f"IGES shell not watertight: {ris.stats['free_edges']} free edges"
+
+    # STL shell: tessellation used as-is, coincident nodes welded -> watertight
+    rs = mesher.mesh_step(mesher.MeshSettings(
+        step_file=base + ".stl", element_type="TRI3"), log=QUIET)
+    assert rs.elems.shape[1] == 4 and (rs.elems[:, 2] == rs.elems[:, 3]).all()
+    assert rs.stats["free_edges"] == 0, \
+        f"STL shell not watertight: {rs.stats['free_edges']} free edges"
+
+    # STL -> solid: reconstruct the volume from the watertight surface (TET4)
+    rss = mesher.mesh_step(mesher.MeshSettings(
+        step_file=base + ".stl", element_type="TET4", size_max=8.0), log=QUIET)
+    assert rss.elems.shape[1] == 4
+    assert abs(rss.stats["measure"] - 117146.0) / 117146.0 < 0.02, \
+        f"STL solid volume off: {rss.stats['measure']}"
+    k_stl_solid = os.path.join(out_dir, "stl_solid.k")
+    dyna_writer.write_k(k_stl_solid, rss.coords, rss.elems)
+    nodes, elems, _, _ = parse_k(k_stl_solid)
+    assert (tet_volumes(nodes, elems) > 0).all(), "STL tets must be positive-volume"
+    # STL -> TET10 solid
+    rst = mesher.mesh_step(mesher.MeshSettings(
+        step_file=base + ".stl", element_type="TET10", size_max=8.0), log=QUIET)
+    assert rst.elems.shape[1] == 10
+
+    # STL guards: symmetry, defeature and face scanning still rejected (no B-rep)
+    for bad in (dict(element_type="TRI3",
+                     symmetry=[mesher.SymmetryPlane("x", 0.0, "+")]),
+                dict(element_type="TRI3", defeature_faces=[1])):
+        try:
+            mesher.mesh_step(mesher.MeshSettings(step_file=base + ".stl", **bad),
+                             log=QUIET)
+            raise AssertionError(f"STL should reject {bad}")
+        except RuntimeError:
+            pass
+    try:
+        mesher.list_faces(mesher.MeshSettings(step_file=base + ".stl"), log=QUIET)
+        raise AssertionError("list_faces should reject STL")
+    except RuntimeError:
+        pass
+
+    # an open (non-watertight) tessellation cannot be tetrahedralized
+    open_stl = os.path.join(out_dir, "open.stl")
+    with open(open_stl, "w") as fh:
+        fh.write("solid t\nfacet normal 0 0 0\n outer loop\n"
+                 "  vertex 0 0 0\n  vertex 1 0 0\n  vertex 0 1 0\n"
+                 " endloop\nendfacet\nendsolid t\n")
+    try:
+        mesher.mesh_step(mesher.MeshSettings(step_file=open_stl,
+                                             element_type="TET4"), log=QUIET)
+        raise AssertionError("open STL should be rejected for solid meshing")
+    except RuntimeError:
+        pass
+    print(f"OK: BREP vol {rb.stats['measure']:.0f}, IGES vol "
+          f"{ri.stats['measure']:.0f}, IGES/STL shells watertight, STL solid "
+          f"vol {rss.stats['measure']:.0f}, guards fire")
 
     print("\nALL TESTS PASSED")
 

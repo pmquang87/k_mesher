@@ -14,15 +14,51 @@ from datetime import datetime
 
 import numpy as np
 
-# SPC DOFs per symmetry plane: constrain translation normal to the plane and
-# the two in-plane rotations (needed for shells; irrelevant but harmless for
-# solids).
+# Symmetry SPC DOFs per plane: constrain the translation normal to the plane
+# and the two in-plane rotations (needed for shells; irrelevant but harmless
+# for solids). This is the standard "symmetric" boundary condition.
 #            dofx dofy dofz dofrx dofry dofrz
 _SYM_DOFS = {
     "x": (1, 0, 0, 0, 1, 1),
     "y": (0, 1, 0, 1, 0, 1),
     "z": (0, 0, 1, 1, 1, 0),
 }
+
+# Anti-symmetric boundary condition (the complement): constrain the two
+# in-plane translations and the rotation about the plane normal. Use this on a
+# symmetry plane when the loading is anti-symmetric about it.
+_ANTISYM_DOFS = {
+    "x": (0, 1, 1, 1, 0, 0),
+    "y": (1, 0, 1, 0, 1, 0),
+    "z": (1, 1, 0, 0, 0, 1),
+}
+
+# fully fixed (encastre)
+_FIXED_DOFS = (1, 1, 1, 1, 1, 1)
+
+# named constraint kinds usable on a symmetry plane
+SYM_CONSTRAINTS = ("symmetric", "antisymmetric", "fixed", "custom")
+
+
+def _resolve_sym_dofs(item: dict) -> tuple[int, ...]:
+    """Return the 6 DOF flags for a symmetry set item.
+
+    Honours an explicit ``dofs`` key (a 6-sequence of 0/1, or a digit string
+    such as ``"16"`` meaning DOFs 1 and 6), otherwise falls back to the named
+    ``constraint`` (symmetric / antisymmetric / fixed), defaulting to the
+    symmetric pattern for the item's axis.
+    """
+    dofs = item.get("dofs")
+    if dofs is not None:
+        if isinstance(dofs, str):
+            return tuple(1 if str(d) in dofs else 0 for d in range(1, 7))
+        return tuple(int(bool(v)) for v in dofs)
+    constraint = (item.get("constraint") or "symmetric").lower()
+    if constraint == "antisymmetric":
+        return _ANTISYM_DOFS[item["axis"]]
+    if constraint == "fixed":
+        return _FIXED_DOFS
+    return _SYM_DOFS[item["axis"]]
 
 
 def write_k(
@@ -37,9 +73,15 @@ def write_k(
     thickness: float = 1.0,    # shell thickness (shells only)
     start_nid: int = 1,
     start_eid: int = 1,
+    start_sid: int = 1,        # first set id (node/segment/SPC/element sets)
     title: str = "k_mesher mesh",
     comments: tuple[str, ...] = (),
-    sym_sets: tuple[dict, ...] = (),   # {"axis","offset","nodes"(1-based),"spc":bool}
+    sym_sets: tuple[dict, ...] = (),   # {"axis","offset","nodes"(1-based),
+                                       #  "spc":bool - write *BOUNDARY_SPC_SET,
+                                       #  "constraint": symmetric|antisymmetric|
+                                       #                fixed (default symmetric),
+                                       #  "dofs": optional 6-seq/digit-str override,
+                                       #  "segset": optional (S,4) plane segments}
     mat: dict | None = None,           # {"e": E, "pr": nu, "ro": density} -> *MAT_ELASTIC
     part_ids: np.ndarray | None = None,   # (M,) per-element part id; default all = pid
     part_titles: dict[int, str] | None = None,
@@ -146,14 +188,21 @@ def write_k(
             f.write(f"{0.0:20.10g}{0.0:20.10g}\n")
             f.write(f"{1.0:20.10g}{1.0:20.10g}\n")
 
-        sid = 0
+        sid = start_sid - 1
         for s in sym_sets:
             sid += 1
             set_nids = np.asarray(s["nodes"], dtype=np.int64) - 1 + start_nid
+            constraint = (s.get("constraint") or "symmetric").lower()
+            suffix = "" if constraint == "symmetric" else f" ({constraint})"
             _write_node_set(f, sid, f"SYM_{s['axis'].upper()} plane at "
-                                    f"{s['offset']:g}", set_nids)
+                                    f"{s['offset']:g}{suffix}", set_nids)
             if s.get("spc", True):
-                _write_spc(f, sid, _SYM_DOFS[s["axis"]])
+                _write_spc(f, sid, _resolve_sym_dofs(s))
+            if s.get("segset") is not None and len(s["segset"]):
+                sid += 1
+                segs = np.asarray(s["segset"], dtype=np.int64) - 1 + start_nid
+                _write_segment_set(f, sid, f"SYM_{s['axis'].upper()} plane at "
+                                           f"{s['offset']:g} segments", segs)
 
         for s in face_sets:
             sid += 1

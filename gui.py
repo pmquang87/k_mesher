@@ -49,6 +49,21 @@ REFINE_HINTS = {
 }
 FACE_ROLES = ["Set only", "Fix (SPC)", "Pressure", "Force X", "Force Y",
               "Force Z", "Mesh size", "Suppress (defeature)"]
+# symmetry-plane boundary-condition kinds (label -> dyna_writer constraint id)
+SYM_CONSTRAINTS = {
+    "Symmetric (normal transl. + in-plane rot.)": "symmetric",
+    "Anti-symmetric": "antisymmetric",
+    "Fixed (all 6 DOFs)": "fixed",
+    "Custom DOFs": "custom",
+}
+# input file dialog filter (STEP/IGES/BREP CAD + STL/OBJ/PLY tessellation)
+CAD_FILETYPES = [
+    ("CAD & mesh files",
+     "*.step *.stp *.iges *.igs *.brep *.brp *.stl *.obj *.ply"),
+    ("STEP", "*.step *.stp"), ("IGES", "*.iges *.igs"),
+    ("BREP", "*.brep *.brp"), ("Tessellation (STL/OBJ/PLY)", "*.stl *.obj *.ply"),
+    ("All files", "*.*"),
+]
 _HERE = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_FILE = os.path.join(_HERE, "k_mesher_settings.json")
 PRESETS_FILE = os.path.join(_HERE, "k_mesher_presets.json")
@@ -80,7 +95,7 @@ class KMesherGUI:
         files.grid(row=0, column=0, sticky="ew", **pad)
         files.columnconfigure(1, weight=1)
 
-        ttk.Label(files, text="STEP input:").grid(row=0, column=0, sticky="w")
+        ttk.Label(files, text="CAD/mesh input:").grid(row=0, column=0, sticky="w")
         self.var_step = tk.StringVar()
         ttk.Entry(files, textvariable=self.var_step).grid(row=0, column=1, sticky="ew", padx=4)
         ttk.Button(files, text="Browse...", command=self._browse_step).grid(row=0, column=2)
@@ -130,6 +145,7 @@ class KMesherGUI:
 
         self._load_settings()
         self._sync_elforms()
+        self._sync_sym_bc()
         self._refresh_presets()
         root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._poll_log()
@@ -240,11 +256,17 @@ class KMesherGUI:
         self.var_eid0 = tk.StringVar(value="1")
         ttk.Entry(dyna, textvariable=self.var_eid0, width=10).grid(row=2, column=3, sticky="w", padx=4)
 
+        ttk.Label(dyna, text="Start set ID:").grid(row=3, column=0, sticky="w")
+        self.var_sid0 = tk.StringVar(value="1")
+        ttk.Entry(dyna, textvariable=self.var_sid0, width=10).grid(row=3, column=1, sticky="w", padx=4)
+        ttk.Label(dyna, text="(node / segment / SPC / element set IDs)",
+                  foreground="gray").grid(row=3, column=2, columnspan=2, sticky="w")
+
         self.var_mat = tk.BooleanVar(value=False)
         ttk.Checkbutton(dyna, text="Write *MAT_ELASTIC   E:",
-                        variable=self.var_mat).grid(row=3, column=0, sticky="w")
+                        variable=self.var_mat).grid(row=4, column=0, sticky="w")
         matrow = ttk.Frame(dyna)
-        matrow.grid(row=3, column=1, columnspan=3, sticky="w")
+        matrow.grid(row=4, column=1, columnspan=3, sticky="w")
         self.var_mat_e = tk.StringVar(value="210000")
         ttk.Entry(matrow, textvariable=self.var_mat_e, width=10).pack(side="left", padx=4)
         ttk.Label(matrow, text="ν:").pack(side="left")
@@ -258,10 +280,10 @@ class KMesherGUI:
         self.var_implicit = tk.BooleanVar(value=False)
         ttk.Checkbutton(dyna, text="Write implicit static control cards "
                                    "(*CONTROL_IMPLICIT_..., termination, d3plot)",
-                        variable=self.var_implicit).grid(row=4, column=0, columnspan=4, sticky="w")
+                        variable=self.var_implicit).grid(row=5, column=0, columnspan=4, sticky="w")
         self.var_qa = tk.BooleanVar(value=True)
         ttk.Checkbutton(dyna, text="Write element set with quality-criteria failures",
-                        variable=self.var_qa).grid(row=5, column=0, columnspan=4, sticky="w")
+                        variable=self.var_qa).grid(row=6, column=0, columnspan=4, sticky="w")
 
     # ----------------------------------------- tab: symmetry & face sets --
     def _build_sym_tab(self, tab, pad):
@@ -288,11 +310,40 @@ class KMesherGUI:
                          ).grid(row=r, column=3, sticky="w", padx=4)
             self.sym_rows[axis] = (enabled, offset, keep)
 
-        self.var_symsets = tk.BooleanVar(value=True)
-        ttk.Checkbutton(sym, text="Write *SET_NODE_LIST + *BOUNDARY_SPC_SET "
-                                  "for symmetry-plane nodes",
-                        variable=self.var_symsets).grid(row=4, column=0, columnspan=4,
-                                                        sticky="w", pady=(6, 0))
+        # --- separate node-set / boundary-condition options for the planes ---
+        opts = ttk.Frame(sym)
+        opts.grid(row=4, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        self.var_sym_nodeset = tk.BooleanVar(value=True)
+        ttk.Checkbutton(opts, text="Write node set (*SET_NODE_LIST) for "
+                                   "symmetry-plane nodes",
+                        variable=self.var_sym_nodeset).grid(
+            row=0, column=0, columnspan=3, sticky="w")
+
+        self.var_sym_spc = tk.BooleanVar(value=True)
+        ttk.Checkbutton(opts, text="Apply boundary condition "
+                                   "(*BOUNDARY_SPC_SET):",
+                        variable=self.var_sym_spc,
+                        command=self._sync_sym_bc).grid(row=1, column=0, sticky="w")
+        self.var_sym_constraint = tk.StringVar(value=next(iter(SYM_CONSTRAINTS)))
+        self.cmb_sym_constraint = ttk.Combobox(
+            opts, textvariable=self.var_sym_constraint, state="readonly",
+            width=34, values=list(SYM_CONSTRAINTS))
+        self.cmb_sym_constraint.grid(row=1, column=1, sticky="w", padx=4)
+        self.cmb_sym_constraint.bind("<<ComboboxSelected>>",
+                                     lambda e: self._sync_sym_bc())
+        ttk.Label(opts, text="DOFs:").grid(row=1, column=2, sticky="e")
+        self.var_sym_dofs = tk.StringVar(value="123456")
+        self.ent_sym_dofs = ttk.Entry(opts, textvariable=self.var_sym_dofs, width=9)
+        self.ent_sym_dofs.grid(row=1, column=3, sticky="w", padx=2)
+        ttk.Label(opts, text="Symmetric BC fixes the normal translation + the "
+                             "two in-plane rotations; anti-symmetric is the "
+                             "complement.", foreground="gray").grid(
+            row=2, column=0, columnspan=4, sticky="w", pady=(2, 0))
+        self.var_sym_segset = tk.BooleanVar(value=False)
+        ttk.Checkbutton(opts, text="Write segment set (*SET_SEGMENT) for the "
+                                   "symmetry-plane faces (solids only)",
+                        variable=self.var_sym_segset).grid(
+            row=3, column=0, columnspan=4, sticky="w")
 
         faces = ttk.LabelFrame(tab, text="Faces: sets, BCs, loads, sizes, defeature",
                                padding=6)
@@ -368,7 +419,7 @@ class KMesherGUI:
 
         btns = ttk.Frame(bat)
         btns.grid(row=0, column=0, sticky="ew")
-        ttk.Button(btns, text="Add STEP files...", command=self._batch_add
+        ttk.Button(btns, text="Add CAD/mesh files...", command=self._batch_add
                    ).pack(side="left")
         ttk.Button(btns, text="Remove selected", command=self._batch_remove
                    ).pack(side="left", padx=6)
@@ -391,6 +442,15 @@ class KMesherGUI:
 
     def _sync_ref_hint(self):
         self.lbl_ref_hint.config(text=REFINE_HINTS[self.var_ref_kind.get()])
+
+    def _sync_sym_bc(self):
+        """Enable the constraint combo only when the symmetry SPC is on, and the
+        custom-DOFs entry only for the 'Custom DOFs' constraint."""
+        spc_on = self.var_sym_spc.get()
+        self.cmb_sym_constraint.config(state="readonly" if spc_on else "disabled")
+        custom = SYM_CONSTRAINTS.get(self.var_sym_constraint.get()) == "custom"
+        self.ent_sym_dofs.config(state="normal" if (spc_on and custom)
+                                 else "disabled")
 
     # -------------------------------------------------- refinements -------
     def _add_refinement(self):
@@ -565,6 +625,7 @@ class KMesherGUI:
         if name in presets:
             self._apply_settings_data(presets[name])
             self._sync_elforms()
+            self._sync_sym_bc()
             self._log_write(f"Applied preset '{name}'")
 
     def _delete_preset(self):
@@ -581,8 +642,8 @@ class KMesherGUI:
 
     def _batch_add(self):
         paths = filedialog.askopenfilenames(
-            title="Select STEP files for the batch queue",
-            filetypes=[("STEP files", "*.step *.stp *.STEP *.STP"), ("All files", "*.*")])
+            title="Select CAD/mesh files for the batch queue",
+            filetypes=CAD_FILETYPES)
         for path in paths:
             out = os.path.splitext(path)[0] + ".k"
             try:
@@ -615,7 +676,7 @@ class KMesherGUI:
 
     def _batch_run(self):
         if not self.batch_jobs:
-            messagebox.showinfo("Batch", "The queue is empty - add STEP files first.")
+            messagebox.showinfo("Batch", "The queue is empty - add CAD/mesh files first.")
             return
         if self.worker and self.worker.is_alive():
             return
@@ -644,8 +705,8 @@ class KMesherGUI:
     # ------------------------------------------------------------ files ---
     def _browse_step(self) -> None:
         path = filedialog.askopenfilename(
-            title="Select STEP file",
-            filetypes=[("STEP files", "*.step *.stp *.STEP *.STP"), ("All files", "*.*")])
+            title="Select CAD/mesh file (STEP/IGES/BREP/STL)",
+            filetypes=CAD_FILETYPES)
         if path:
             self.var_step.set(path)
             if not self.var_out.get():
@@ -664,7 +725,7 @@ class KMesherGUI:
         step = (step_override or self.var_step.get()).strip()
         out = self.var_out.get().strip()
         if not step or not os.path.isfile(step):
-            raise ValueError("Select an existing STEP input file.")
+            raise ValueError("Select an existing CAD/mesh input file.")
         if need_out and not out:
             raise ValueError("Select an output .k file path.")
 
@@ -701,6 +762,14 @@ class KMesherGUI:
                     offset=num(offset, f"{axis.upper()}-plane position"),
                     keep=keep.get().strip()[0],
                 ))
+
+        sym_constraint = SYM_CONSTRAINTS.get(self.var_sym_constraint.get(),
+                                             "symmetric")
+        sym_dofs = self.var_sym_dofs.get().strip()
+        if (symmetry and self.var_sym_spc.get() and sym_constraint == "custom"):
+            if not sym_dofs or any(ch not in "123456" for ch in sym_dofs):
+                raise ValueError("Custom symmetry DOFs must be digits 1-6, "
+                                 "e.g. 13 or 123456.")
 
         # faces: plain set selection + role assignments
         face_tags, face_sizes, defeature, face_roles = [], {}, [], []
@@ -770,7 +839,12 @@ class KMesherGUI:
             "thickness": thickness,
             "start_nid": integer(self.var_nid0, "Start node ID"),
             "start_eid": integer(self.var_eid0, "Start element ID"),
-            "write_sym_sets": self.var_symsets.get(),
+            "start_sid": integer(self.var_sid0, "Start set ID"),
+            "sym_nodeset": self.var_sym_nodeset.get(),
+            "sym_spc": self.var_sym_spc.get(),
+            "sym_constraint": sym_constraint,
+            "sym_dofs": sym_dofs,
+            "sym_segset": self.var_sym_segset.get(),
             "mat": mat,
             "face_nodesets": self.var_face_nodes.get(),
             "face_segsets": self.var_face_segs.get(),
@@ -832,10 +906,17 @@ class KMesherGUI:
         result = mesher.mesh_step_auto(settings, log=log, preview_path=preview_path)
 
         sym_sets = []
-        if kopts["write_sym_sets"]:
+        if kopts["sym_nodeset"] or kopts["sym_spc"]:
             for sp in settings.symmetry:
-                sym_sets.append({"axis": sp.axis, "offset": sp.offset,
-                                 "nodes": result.sym_nodes[sp.axis], "spc": True})
+                item = {"axis": sp.axis, "offset": sp.offset,
+                        "nodes": result.sym_nodes[sp.axis],
+                        "spc": kopts["sym_spc"],
+                        "constraint": kopts["sym_constraint"]}
+                if kopts["sym_constraint"] == "custom":
+                    item["dofs"] = kopts["sym_dofs"]
+                if kopts["sym_segset"] and len(result.sym_segs.get(sp.axis, ())) > 0:
+                    item["segset"] = result.sym_segs[sp.axis]
+                sym_sets.append(item)
 
         face_sets = []
         for tag in kopts["plain_faces"]:
@@ -899,6 +980,7 @@ class KMesherGUI:
             element_kind=kopts["element_kind"],
             pid=pid0, elform=kopts["elform"], thickness=kopts["thickness"],
             start_nid=kopts["start_nid"], start_eid=kopts["start_eid"],
+            start_sid=kopts["start_sid"],
             title=os.path.splitext(os.path.basename(out))[0],
             comments=tuple(comments), sym_sets=tuple(sym_sets),
             mat=kopts["mat"], part_ids=part_ids, part_titles=part_titles,
@@ -930,10 +1012,13 @@ class KMesherGUI:
             "autoref": self.var_autoref,
             "etype": self.var_etype, "elform": self.var_elform,
             "pid": self.var_pid, "nid0": self.var_nid0, "eid0": self.var_eid0,
-            "thick": self.var_thick,
+            "sid0": self.var_sid0, "thick": self.var_thick,
             "mat": self.var_mat, "mat_e": self.var_mat_e,
             "mat_nu": self.var_mat_nu, "mat_ro": self.var_mat_ro,
-            "symsets": self.var_symsets, "preview": self.var_preview,
+            "sym_nodeset": self.var_sym_nodeset, "sym_spc": self.var_sym_spc,
+            "sym_constraint": self.var_sym_constraint,
+            "sym_dofs": self.var_sym_dofs, "sym_segset": self.var_sym_segset,
+            "preview": self.var_preview,
             "face_nodes": self.var_face_nodes, "face_segs": self.var_face_segs,
             "implicit": self.var_implicit, "qa": self.var_qa,
         }

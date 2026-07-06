@@ -1,9 +1,16 @@
-"""Command-line interface: mesh a STEP file to an LS-DYNA .k without the GUI.
+"""Command-line interface: mesh a CAD/mesh file to an LS-DYNA .k without the GUI.
+
+Supported inputs: STEP (.step/.stp), IGES (.iges/.igs), BREP (.brep/.brp) CAD,
+and STL/OBJ/PLY surface tessellations. A watertight tessellation can also be
+tetrahedralized (TET4/TET10) by reconstructing the enclosed volume.
 
 Examples:
     python mesh_cli.py part.stp --size-max 8 --size-min 1
-    python mesh_cli.py part.stp -o half.k --sym x --mat 210000:0.3:7.85e-9
-    python mesh_cli.py part.stp --tet10 --algo hxt --sym x:0:+ --sym y:5:-
+    python mesh_cli.py part.iges -o half.k --sym x --mat 210000:0.3:7.85e-9
+    python mesh_cli.py part.brep --tet10 --algo hxt --sym x:0:+ --sym y:5:-
+    python mesh_cli.py part.stp --sym x --sym-constraint antisymmetric
+    python mesh_cli.py part.stp --sym x --no-sym-spc      # node set only
+    python mesh_cli.py part.stl --etype tri3 --thickness 1.2
     python mesh_cli.py part.stp --list-faces
     python mesh_cli.py part.stp --face-nodeset 7 --face-segset 12
     python mesh_cli.py part.stp --refine-sphere 0:0:0:15:1.5 --refine-box 0:0:0:10:10:10:2
@@ -116,9 +123,12 @@ def _parse_force(text: str) -> tuple[int, str, float]:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Mesh a STEP file to TET4/TET10 and write an LS-DYNA .k file.",
+        description="Mesh a STEP/IGES/BREP/STL file to TET4/TET10/TRI3/QUAD4 "
+                    "and write an LS-DYNA .k file.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    p.add_argument("input", help="STEP file (.step/.stp)")
+    p.add_argument("input", help="CAD/mesh input: STEP/IGES/BREP solid or "
+                                 "surface, or an STL/OBJ/PLY tessellation "
+                                 "(shells, or tets if watertight)")
     p.add_argument("-o", "--output", help="output .k file (default: input with .k)")
     p.add_argument("--etype", choices=["tet4", "tet10", "tri3", "quad4"],
                    default="tet4",
@@ -146,6 +156,21 @@ def build_parser() -> argparse.ArgumentParser:
                    help="symmetry plane, repeatable, e.g. x, x:10, x:0:-")
     p.add_argument("--no-sym-sets", action="store_true",
                    help="do not write node sets / SPC for symmetry planes")
+    p.add_argument("--no-sym-spc", action="store_true",
+                   help="write the symmetry-plane node set(s) but NOT the "
+                        "*BOUNDARY_SPC_SET boundary condition")
+    p.add_argument("--sym-constraint",
+                   choices=["symmetric", "antisymmetric", "fixed"],
+                   default="symmetric",
+                   help="symmetry-plane BC type: symmetric (normal translation "
+                        "+ in-plane rotations), antisymmetric (the complement), "
+                        "or fixed (123456)")
+    p.add_argument("--sym-dofs", metavar="DOFS", default=None,
+                   help="custom SPC DOF digits for the symmetry planes "
+                        "(e.g. 13), overriding --sym-constraint")
+    p.add_argument("--sym-segset", action="store_true",
+                   help="also write a *SET_SEGMENT for the symmetry-plane "
+                        "faces (solids only)")
     p.add_argument("--refine-sphere", type=parse_refine_sphere, action="append",
                    dest="refinements", default=[], metavar="CX:CY:CZ:R:SIZE",
                    help="spherical refinement region, repeatable")
@@ -190,6 +215,8 @@ def build_parser() -> argparse.ArgumentParser:
                         "TRI3 4, QUAD4 16)")
     p.add_argument("--start-nid", type=int, default=1, help="first node ID")
     p.add_argument("--start-eid", type=int, default=1, help="first element ID")
+    p.add_argument("--start-sid", type=int, default=1,
+                   help="first set ID (node/segment/SPC/element sets)")
     p.add_argument("--mat", type=parse_mat, nargs="?", const=dict(STEEL_MMTS),
                    default=None, metavar="E[:NU[:RHO]]",
                    help="write *MAT_ELASTIC (bare --mat = steel in mm-t-s: "
@@ -213,6 +240,10 @@ def main(argv=None) -> int:
     if elform not in allowed[etype]:
         print(f"error: ELFORM {elform} does not match {etype} "
               f"(allowed: {allowed[etype]})", file=sys.stderr)
+        return 2
+    if args.sym_dofs and any(ch not in "123456" for ch in args.sym_dofs):
+        print(f"error: --sym-dofs must be digits 1-6: {args.sym_dofs!r}",
+              file=sys.stderr)
         return 2
     is_shell = mesher.ETYPES[etype]["family"] == "shell"
 
@@ -267,8 +298,15 @@ def main(argv=None) -> int:
     sym_sets = []
     if not args.no_sym_sets:
         for sp in settings.symmetry:
-            sym_sets.append({"axis": sp.axis, "offset": sp.offset,
-                             "nodes": result.sym_nodes[sp.axis], "spc": True})
+            item = {"axis": sp.axis, "offset": sp.offset,
+                    "nodes": result.sym_nodes[sp.axis],
+                    "spc": not args.no_sym_spc,
+                    "constraint": args.sym_constraint}
+            if args.sym_dofs:
+                item["dofs"] = args.sym_dofs
+            if args.sym_segset and len(result.sym_segs.get(sp.axis, ())) > 0:
+                item["segset"] = result.sym_segs[sp.axis]
+            sym_sets.append(item)
 
     face_sets = []
     for tag in face_tags:
@@ -319,6 +357,7 @@ def main(argv=None) -> int:
         element_kind="shell" if is_shell else "solid",
         pid=args.pid, elform=elform, thickness=args.thickness,
         start_nid=args.start_nid, start_eid=args.start_eid,
+        start_sid=args.start_sid,
         title=os.path.splitext(os.path.basename(out))[0],
         comments=tuple(comments), sym_sets=tuple(sym_sets), mat=args.mat,
         part_ids=part_ids, part_titles=part_titles, face_sets=tuple(face_sets),
