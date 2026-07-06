@@ -31,6 +31,44 @@ OCC_UNITS = {
 
 AXIS_INDEX = {"x": 0, "y": 1, "z": 2}
 
+# ---------------------------------------------------------------------------
+# Supported input formats.
+#
+# CAD (boundary-representation) formats go through the OpenCASCADE kernel via
+# occ.importShapes and support the full pipeline (solids, symmetry cuts,
+# defeaturing, face scanning, curvature sizing, tet/shell meshing):
+#   .step/.stp  STEP    - the recommended solid exchange format
+#   .iges/.igs  IGES    - legacy surface format; sewn into solids on import
+#   .brep/.brp  BREP    - OpenCASCADE native, exact geometry
+#
+# Tessellated (mesh) formats carry only a surface triangulation, no CAD
+# geometry. They are imported as-is (coincident nodes welded) and meshed with
+# shell elements only - no symmetry/defeature/refinement, which need a B-rep:
+#   .stl        STL     - triangulated surface mesh (3D printing / CAD export)
+#   .obj        OBJ     - Wavefront surface mesh
+#   .ply        PLY     - Stanford polygon / scanned-surface mesh
+CAD_FORMATS = {".step", ".stp", ".iges", ".igs", ".brep", ".brp"}
+MESH_FORMATS = {".stl", ".obj", ".ply"}
+INPUT_FORMATS = CAD_FORMATS | MESH_FORMATS
+
+# human-readable format name per extension (for logs / errors)
+FORMAT_NAMES = {
+    ".step": "STEP", ".stp": "STEP",
+    ".iges": "IGES", ".igs": "IGES",
+    ".brep": "BREP", ".brp": "BREP",
+    ".stl": "STL", ".obj": "OBJ", ".ply": "PLY",
+}
+
+
+def input_kind(path: str) -> str:
+    """Return 'mesh' for tessellated inputs (STL), else 'cad' (STEP/IGES/BREP
+    or any other extension, which is optimistically handed to OpenCASCADE)."""
+    return "mesh" if os.path.splitext(path)[1].lower() in MESH_FORMATS else "cad"
+
+
+def format_name(path: str) -> str:
+    return FORMAT_NAMES.get(os.path.splitext(path)[1].lower(), "CAD")
+
 # supported element types
 ETYPES = {
     "TET4":  {"family": "solid", "order": 1},
@@ -74,7 +112,7 @@ class SymmetryPlane:
 
 @dataclass
 class MeshSettings:
-    step_file: str
+    step_file: str                     # input CAD/mesh file: STEP/IGES/BREP/STL
     element_type: str = "TET4"         # TET4 | TET10 | TRI3 | QUAD4
     size_max: float = 10.0
     size_min: float = 0.0
@@ -108,10 +146,14 @@ class MeshResult:
     face_nodes: dict[int, np.ndarray]  # face tag -> 1-based node indices
     face_segs: dict[int, np.ndarray]   # face tag -> (S, 4) 1-based segment nodes
     stats: dict
+    # axis -> (S, 4) 1-based boundary segments lying on the symmetry plane
+    # (solids only; triangles padded to a degenerate quad)
+    sym_segs: dict[str, np.ndarray] = field(default_factory=dict)
 
 
 def mesh_step(settings: MeshSettings, log=print, preview_path: str | None = None) -> MeshResult:
-    """Mesh a STEP file. Optionally save a .msh copy for preview."""
+    """Mesh a CAD/mesh file (STEP/IGES/BREP/STL/OBJ/PLY). Optionally save a
+    .msh copy for preview."""
     if settings.element_type not in ETYPES:
         raise ValueError(f"Unknown element type: {settings.element_type}")
     family = ETYPES[settings.element_type]["family"]
@@ -120,9 +162,10 @@ def mesh_step(settings: MeshSettings, log=print, preview_path: str | None = None
     # when meshing runs in the GUI worker thread (signals need the main thread)
     gmsh.initialize(interruptible=False)
     try:
-        bbox = _load_geometry(settings, log)
-        _apply_refinements(settings, log)
-        _generate_mesh(settings, log)
+        bbox, already_meshed = _load_geometry(settings, log)
+        if not already_meshed:
+            _apply_refinements(settings, log)
+            _generate_mesh(settings, log)
 
         shell_checks = {}
         if family == "solid":
@@ -133,6 +176,8 @@ def mesh_step(settings: MeshSettings, log=print, preview_path: str | None = None
                 _extract_shells(log)
 
         sym_nodes = _find_symmetry_nodes(coords, settings.symmetry, bbox)
+        sym_segs = _find_symmetry_segments(
+            coords, settings.symmetry, sym_nodes, tag_map, settings.element_type)
         face_nodes, face_segs = _collect_face_data(
             settings.collect_faces, tag_map, settings.element_type, log)
         stats = _collect_stats(coords, elems, settings.element_type, bbox)
@@ -145,7 +190,8 @@ def mesh_step(settings: MeshSettings, log=print, preview_path: str | None = None
 
         return MeshResult(coords=coords, elems=elems, elem_parts=elem_parts,
                           part_names=part_names, sym_nodes=sym_nodes,
-                          face_nodes=face_nodes, face_segs=face_segs, stats=stats)
+                          face_nodes=face_nodes, face_segs=face_segs, stats=stats,
+                          sym_segs=sym_segs)
     finally:
         gmsh.finalize()
 
@@ -184,6 +230,10 @@ def list_faces(settings: MeshSettings, log=print) -> list[dict]:
     """Load the geometry (with healing/glue/defeature/symmetry applied, no
     meshing) and return the model faces:
     [{"tag", "name", "type", "area", "diag", "centroid"}]."""
+    if input_kind(settings.step_file) == "mesh":
+        raise RuntimeError(
+            "Face scanning is not available for STL/tessellated input - it "
+            "has no CAD faces, only triangles. Use a STEP/IGES/BREP file.")
     gmsh.initialize(interruptible=False)
     try:
         _load_geometry(settings, log)
@@ -215,11 +265,18 @@ def list_faces(settings: MeshSettings, log=print) -> list[dict]:
 # --------------------------------------------------------------------------
 
 def _load_geometry(settings: MeshSettings, log):
-    """Import STEP, heal/sew/glue/defeature as configured, apply symmetry
-    cuts. Returns the bounding box after all cuts."""
+    """Import the CAD/mesh file, heal/sew/glue/defeature as configured, apply
+    symmetry cuts. Returns (bounding box after all cuts, already_meshed).
+
+    ``already_meshed`` is True for tessellated inputs (STL) whose triangles are
+    used directly - the caller then skips refinement and mesh generation."""
     family = ETYPES[settings.element_type]["family"]
     gmsh.option.setNumber("General.Terminal", 0)
 
+    if input_kind(settings.step_file) == "mesh":
+        return _load_tessellation(settings, family, log), True
+
+    fmt = format_name(settings.step_file)
     if settings.occ_unit:
         gmsh.option.setString("Geometry.OCCTargetUnit", settings.occ_unit)
     if settings.heal:
@@ -229,39 +286,78 @@ def _load_geometry(settings: MeshSettings, log):
         for opt in ("OCCFixDegenerated", "OCCFixSmallEdges", "OCCFixSmallFaces"):
             gmsh.option.setNumber(f"Geometry.{opt}", 1)
 
-    log(f"Importing STEP: {settings.step_file}")
-    gmsh.model.occ.importShapes(settings.step_file)
+    log(f"Importing {fmt}: {settings.step_file}")
+    try:
+        gmsh.model.occ.importShapes(settings.step_file)
+    except Exception as e:
+        # Some formats (notably IGES) reject the OpenCASCADE target-unit
+        # override; retry once in the file's own units so the import succeeds.
+        if settings.occ_unit:
+            log(f"  unit conversion to {settings.occ_unit} not supported for "
+                f"{fmt}; importing in file units instead")
+            gmsh.option.setString("Geometry.OCCTargetUnit", "")
+            gmsh.model.occ.importShapes(settings.step_file)
+        else:
+            raise
     gmsh.model.occ.synchronize()
 
     vols = gmsh.model.getEntities(3)
     surfs = gmsh.model.getEntities(2)
     if family == "solid":
         if not vols and surfs:
-            # Surface-only model: try to sew the faces into closed shells and
-            # build solids from them.
-            log("No solids in the STEP file - trying to sew the surfaces "
-                "into a solid ...")
-            gmsh.model.occ.healShapes(sewFaces=True, makeSolids=True)
+            # Surface-only model (always the case for IGES, sometimes STEP):
+            # sew the faces into closed shells and build solids from them. The
+            # sewing tolerance is scaled to the model size, otherwise the tiny
+            # gaps typical of IGES exports are never bridged.
+            log(f"No solids in the {fmt} file - trying to sew the "
+                f"{len(surfs)} surface(s) into a solid ...")
+            bb = gmsh.model.getBoundingBox(-1, -1)
+            diag = float(np.linalg.norm(np.array(bb[3:]) - np.array(bb[:3])))
+            tol = max(1e-5 * diag, 1e-6)
+            gmsh.model.occ.healShapes(sewFaces=True, makeSolids=True,
+                                      tolerance=tol)
             gmsh.model.occ.synchronize()
             vols = gmsh.model.getEntities(3)
+            if vols:
+                log(f"Sewn into {len(vols)} solid(s) (tolerance {tol:.3g})")
         if not vols:
             raise RuntimeError(
-                "The STEP file contains no solid volumes and no closed solid "
+                f"The {fmt} file contains no solid volumes and no closed solid "
                 "could be built from its surfaces. Only solid bodies can be "
-                "meshed with tetrahedra - re-export the model as a solid, "
-                "or mesh it with shell elements instead."
+                "meshed with tetrahedra - re-export the model as a solid "
+                "(STEP/BREP keep solids best), or mesh it with shell elements "
+                "instead."
             )
         log(f"Imported {len(vols)} solid volume(s)")
     else:
         if not surfs:
-            raise RuntimeError("The STEP file contains no surfaces to mesh "
+            raise RuntimeError(f"The {fmt} file contains no surfaces to mesh "
                                "with shell elements.")
         if vols:
             log(f"Imported {len(vols)} solid volume(s) - their boundary "
                 f"surfaces will be meshed with shells")
         else:
             log(f"Imported {len(surfs)} surface(s)")
+            if len(surfs) > 1:
+                # Sew the free-standing faces so neighbouring faces share
+                # edges (a conformal shell mesh). IGES exports in particular
+                # leave sub-tolerance gaps that removeAllDuplicates alone will
+                # not bridge; the tolerance is scaled to the model size. Only
+                # sewing is done (no small-edge/face fixing) to preserve tags.
+                bb = gmsh.model.getBoundingBox(-1, -1)
+                diag = float(np.linalg.norm(np.array(bb[3:]) - np.array(bb[:3])))
+                try:
+                    gmsh.model.occ.healShapes(
+                        sewFaces=True, makeSolids=False,
+                        tolerance=max(1e-5 * diag, 1e-6),
+                        fixDegenerated=False, fixSmallEdges=False,
+                        fixSmallFaces=False)
+                    gmsh.model.occ.synchronize()
+                except Exception as e:
+                    log(f"  (surface sewing skipped: {e})")
 
+    vols = gmsh.model.getEntities(3)
+    surfs = gmsh.model.getEntities(2)
     n_bodies = len(vols) if vols else len(surfs)
     # surface-only models: always merge duplicated border edges, otherwise
     # each face is meshed independently and the shell mesh is not conformal
@@ -283,7 +379,126 @@ def _load_geometry(settings: MeshSettings, log):
     if settings.symmetry:
         _apply_symmetry_cuts(settings.symmetry, bbox, log)
         bbox = gmsh.model.getBoundingBox(-1, -1)
-    return bbox
+    return bbox, False
+
+
+def _load_tessellation(settings: MeshSettings, family: str, log):
+    """Import a tessellated surface mesh (STL/OBJ/PLY) and weld coincident
+    nodes. Returns the bounding box. Shells use the triangulation as-is; solids
+    reconstruct a volume from the (watertight) surface and tetrahedralize the
+    interior. CAD-only features are rejected up front with an explanation."""
+    fmt = format_name(settings.step_file)
+    unsupported = [
+        ("symmetry planes", settings.symmetry),
+        ("defeaturing", settings.defeature_faces),
+        ("refinement regions", settings.refinements),
+        ("per-face mesh sizes", settings.face_sizes),
+        ("face sets / roles", settings.collect_faces),
+    ]
+    active = [name for name, val in unsupported if val]
+    if active:
+        raise RuntimeError(
+            f"{fmt} input carries no CAD geometry (only triangles), so these "
+            f"are not available: {', '.join(active)}. Use a STEP/IGES/BREP "
+            f"file for those features.")
+
+    log(f"Importing {fmt} tessellation: {settings.step_file}")
+    gmsh.merge(settings.step_file)
+    # STL stores every facet independently; weld coincident vertices so the
+    # mesh shares nodes (otherwise every edge is a free/cracked edge).
+    n_before = len(gmsh.model.mesh.getNodes()[0])
+    gmsh.model.mesh.removeDuplicateNodes()
+    n_after = len(gmsh.model.mesh.getNodes()[0])
+    n_tris = len(gmsh.model.mesh.getElementsByType(GMSH_TRI3)[0])
+    n_quads = len(gmsh.model.mesh.getElementsByType(GMSH_QUAD4)[0])
+    if n_tris + n_quads == 0:
+        raise RuntimeError(
+            f"No surface elements were found in the {fmt} file - it may be "
+            "empty or in an unsupported variant.")
+    if n_after < n_before:
+        log(f"Welded {n_before - n_after} coincident node(s) "
+            f"({n_before} -> {n_after})")
+    faces = f"{n_tris} triangles" + (f" + {n_quads} quads" if n_quads else "")
+    log(f"Imported {faces}, {n_after} nodes")
+
+    if family == "solid":
+        _tessellation_to_solid(settings, fmt, n_tris, n_quads, log)
+    return gmsh.model.getBoundingBox(-1, -1)
+
+
+def _tessellation_to_solid(settings: MeshSettings, fmt: str,
+                           n_tris: int, n_quads: int, log) -> None:
+    """Reconstruct a solid volume from a watertight surface tessellation and
+    tetrahedralize the interior, keeping the surface triangulation as the
+    boundary (no surface remeshing). The mesh must be a closed triangle
+    manifold."""
+    order = ETYPES[settings.element_type]["order"]
+    if n_quads:
+        raise RuntimeError(
+            f"{fmt} solid meshing needs an all-triangle surface, but this file "
+            f"has {n_quads} quad facet(s). Triangulate it, or mesh it with "
+            f"shell elements (TRI3/QUAD4).")
+
+    # A volume can only be built from a closed (watertight) surface; count the
+    # free edges of the triangulation and refuse otherwise.
+    conn = np.asarray(gmsh.model.mesh.getElementsByType(GMSH_TRI3)[1],
+                      dtype=np.int64).reshape(-1, 3)
+    edges = np.sort(np.vstack([conn[:, [0, 1]], conn[:, [1, 2]], conn[:, [2, 0]]]),
+                    axis=1)
+    _, counts = np.unique(edges, axis=0, return_counts=True)
+    n_free = int((counts == 1).sum())
+    n_nonman = int((counts > 2).sum())
+    if n_free:
+        raise RuntimeError(
+            f"{fmt} solid meshing needs a watertight (closed) surface, but "
+            f"{n_free} free edge(s) were found - the surface has holes or gaps. "
+            f"Repair the mesh (e.g. MeshLab/netfabb), or mesh it with shell "
+            f"elements (TRI3/QUAD4) instead.")
+    if n_nonman:
+        log(f"WARNING: {n_nonman} non-manifold edge(s) found - the volume "
+            f"mesh may fail or be invalid.")
+
+    log("Reconstructing a solid volume from the surface tessellation ...")
+    gmsh.model.mesh.createTopology()
+    surfs = [t for _, t in gmsh.model.getEntities(2)]
+    sl = gmsh.model.geo.addSurfaceLoop(surfs)
+    gmsh.model.geo.addVolume([sl])
+    gmsh.model.geo.synchronize()
+
+    # only the interior is meshed; the surface triangulation is fixed, so the
+    # size settings just control how coarse the interior tets may be
+    gmsh.option.setNumber("Mesh.MeshSizeMax", settings.size_max)
+    gmsh.option.setNumber("Mesh.MeshSizeMin", settings.size_min)
+    gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 0)
+    gmsh.option.setNumber("Mesh.Algorithm3D", ALGO3D.get(settings.algorithm3d, 1))
+    gmsh.option.setNumber("General.NumThreads", os.cpu_count() or 1)
+    gmsh.option.setNumber("Mesh.Optimize", 0)
+    gmsh.option.setNumber("Mesh.OptimizeNetgen", 0)
+
+    t0 = time.perf_counter()
+    try:
+        gmsh.model.mesh.generate(3)
+    except Exception as e:
+        raise RuntimeError(
+            f"Volume meshing of the reconstructed surface failed: {e}\n"
+            "The tessellation must be a clean, closed, non-self-intersecting "
+            "manifold. Repair it (MeshLab/netfabb) or mesh it with shells."
+        ) from e
+    n_tet = len(gmsh.model.mesh.getElementsByType(TET_TYPE[1][0])[0])
+    log(f"  volume mesh: {time.perf_counter() - t0:.1f} s ({n_tet} tets)")
+
+    if settings.optimize:
+        t0 = time.perf_counter()
+        try:
+            gmsh.model.mesh.optimize("Netgen")
+            log(f"  optimization (Netgen): {time.perf_counter() - t0:.1f} s")
+        except Exception as e:
+            log(f"  optimization skipped: {e}")
+
+    if order == 2:
+        t0 = time.perf_counter()
+        gmsh.model.mesh.setOrder(2)
+        log(f"  second order (TET10): {time.perf_counter() - t0:.1f} s")
 
 
 def _defeature(face_tags: list[int], log) -> None:
@@ -690,6 +905,42 @@ def _find_symmetry_nodes(coords: np.ndarray, planes: list[SymmetryPlane], bbox) 
         mask = np.abs(coords[:, i] - sp.offset) <= tol
         sym_nodes[sp.axis] = np.flatnonzero(mask) + 1
     return sym_nodes
+
+
+def _find_symmetry_segments(coords, planes, sym_nodes, tag_map,
+                            element_type: str) -> dict:
+    """Boundary surface segments (as (S, 4) 1-based node ids, triangles padded
+    to a degenerate quad) that lie entirely on each symmetry plane.
+
+    Only meaningful for solids - the symmetry cut leaves a flat model face
+    whose boundary triangles have all three corners on the plane. For shells
+    the plane is a cut edge with no area, so the result is empty."""
+    if ETYPES[element_type]["family"] != "solid" or not planes:
+        return {}
+    order = ETYPES[element_type]["order"]
+    gtype, nn = TET_TYPE[order][2], TET_TYPE[order][3]  # surface tri type / nodes
+    tags_sorted, new_id_all = tag_map
+    try:
+        _, conn = gmsh.model.mesh.getElementsByType(gtype)
+    except Exception:
+        return {}
+    if len(conn) == 0:
+        return {}
+    corners = np.asarray(conn, dtype=np.int64).reshape(-1, nn)[:, :3]
+    idx = np.minimum(np.searchsorted(tags_sorted, corners), len(tags_sorted) - 1)
+    ok = tags_sorted[idx] == corners
+    ids = np.where(ok, new_id_all[idx], 0)          # (T, 3) compact 1-based ids
+    ids = ids[(ids > 0).all(axis=1)]
+
+    n = len(coords)
+    sym_segs = {}
+    for sp in planes:
+        on_plane = np.zeros(n + 1, dtype=bool)       # index by 1-based node id
+        on_plane[np.asarray(sym_nodes[sp.axis], dtype=np.int64)] = True
+        segs = ids[on_plane[ids].all(axis=1)]
+        sym_segs[sp.axis] = (np.column_stack((segs, segs[:, 2])) if len(segs)
+                             else np.zeros((0, 4), dtype=np.int64))
+    return sym_segs
 
 
 def _count_duplicate_nodes(coords: np.ndarray) -> int:
