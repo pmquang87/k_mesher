@@ -727,7 +727,8 @@ class KMesherGUI:
         if not step or not os.path.isfile(step):
             raise ValueError("Select an existing CAD/mesh input file.")
         if need_out and not out:
-            raise ValueError("Select an output .k file path.")
+            # blank .k output -> default to the input name with a .k extension
+            out = os.path.splitext(step)[0] + ".k"
 
         def num(var, name, minval=None):
             try:
