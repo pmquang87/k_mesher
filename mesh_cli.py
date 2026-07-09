@@ -18,12 +18,24 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import sys
 
+import numpy as np
+
 import dyna_writer
 import mesher
+
+
+def _json_default(o):
+    """json.dump fallback for the numpy scalars/arrays in the mesh stats."""
+    if isinstance(o, np.ndarray):
+        return o.tolist()
+    if isinstance(o, np.generic):
+        return o.item()
+    raise TypeError(f"not JSON serializable: {type(o).__name__}")
 
 ALGO_CHOICES = {
     "delaunay": "Delaunay",
@@ -205,8 +217,17 @@ def build_parser() -> argparse.ArgumentParser:
                    help="remesh with local refinement at bad spots (max 2 rounds)")
     p.add_argument("--implicit-cards", action="store_true",
                    help="write basic implicit static control cards")
+    p.add_argument("--mesh-only", action="store_true",
+                   help="write an *INCLUDE-friendly file: nodes/elements/sets "
+                        "only, no PART/SECTION/MAT or control cards "
+                        "(--implicit-cards and --mat cards are suppressed)")
     p.add_argument("--no-qa-sets", action="store_true",
                    help="do not write the quality-failure element set")
+    p.add_argument("--title", default=None,
+                   help="deck *TITLE (default: output file name)")
+    p.add_argument("--stats-json", metavar="PATH",
+                   help="write the mesh statistics (counts, quality criteria, "
+                        "mass properties, timestep estimate) as JSON")
     p.add_argument("--pid", type=int, default=1,
                    help="base part ID (multiple bodies get PID, PID+1, ...)")
     p.add_argument("--elform", type=int, choices=[2, 4, 10, 13, 16, 17],
@@ -336,11 +357,16 @@ def main(argv=None) -> int:
         elem_sets.append({"title": "QA quality-criteria failures",
                           "eids": failed + 1})
 
+    mass = dt_est = None
     if args.mat:
         scale = args.mat["ro"] * (args.thickness if is_shell else 1.0)
+        mass = scale * result.stats["measure"]
         c = result.stats.get("cog", (0, 0, 0))
-        print(f"Mass: {scale * result.stats['measure']:.6g}   "
-              f"COG: ({c[0]:.4g}, {c[1]:.4g}, {c[2]:.4g})")
+        print(f"Mass: {mass:.6g}   COG: ({c[0]:.4g}, {c[1]:.4g}, {c[2]:.4g})")
+        dt_est = mesher.critical_timestep(result.stats, etype, args.mat)
+        if dt_est:
+            print(f"Estimated explicit critical timestep: {dt_est:.4g} "
+                  f"(dt = Lc/c, model time units, no TSSFAC)")
 
     part_ids = args.pid + result.elem_parts
     part_titles = {args.pid + i: (name or f"body {i + 1}")
@@ -358,12 +384,25 @@ def main(argv=None) -> int:
         pid=args.pid, elform=elform, thickness=args.thickness,
         start_nid=args.start_nid, start_eid=args.start_eid,
         start_sid=args.start_sid,
-        title=os.path.splitext(os.path.basename(out))[0],
+        title=args.title or os.path.splitext(os.path.basename(out))[0],
         comments=tuple(comments), sym_sets=tuple(sym_sets), mat=args.mat,
         part_ids=part_ids, part_titles=part_titles, face_sets=tuple(face_sets),
         elem_sets=tuple(elem_sets), implicit_cards=args.implicit_cards,
+        mesh_only=args.mesh_only,
     )
     print(f"Wrote {out}")
+
+    if args.stats_json:
+        payload = {
+            "input": args.input, "output": out,
+            "element_type": etype, "elform": elform,
+            "n_parts": len(result.part_names), "part_names": result.part_names,
+            "mass": mass, "critical_timestep": dt_est,
+            "material": args.mat, "stats": result.stats,
+        }
+        with open(args.stats_json, "w") as f:
+            json.dump(payload, f, indent=2, default=_json_default)
+        print(f"Wrote {args.stats_json}")
 
     if args.preview:
         script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "preview.py")
