@@ -284,6 +284,10 @@ class KMesherGUI:
         self.var_qa = tk.BooleanVar(value=True)
         ttk.Checkbutton(dyna, text="Write element set with quality-criteria failures",
                         variable=self.var_qa).grid(row=6, column=0, columnspan=4, sticky="w")
+        self.var_mesh_only = tk.BooleanVar(value=False)
+        ttk.Checkbutton(dyna, text="Mesh-only output for *INCLUDE (no PART / "
+                                   "SECTION / MAT / control cards)",
+                        variable=self.var_mesh_only).grid(row=7, column=0, columnspan=4, sticky="w")
 
     # ----------------------------------------- tab: symmetry & face sets --
     def _build_sym_tab(self, tab, pad):
@@ -854,6 +858,7 @@ class KMesherGUI:
                            if include_faces else [],
             "implicit_cards": self.var_implicit.get(),
             "qa_sets": self.var_qa.get(),
+            "mesh_only": self.var_mesh_only.get(),
         }
         return settings, out, kopts
 
@@ -907,7 +912,9 @@ class KMesherGUI:
         result = mesher.mesh_step_auto(settings, log=log, preview_path=preview_path)
 
         sym_sets = []
-        if kopts["sym_nodeset"] or kopts["sym_spc"]:
+        # segset alone still needs the sym_sets items (the node set it comes
+        # with is the carrier the writer requires)
+        if kopts["sym_nodeset"] or kopts["sym_spc"] or kopts["sym_segset"]:
             for sp in settings.symmetry:
                 item = {"axis": sp.axis, "offset": sp.offset,
                         "nodes": result.sym_nodes[sp.axis],
@@ -968,6 +975,11 @@ class KMesherGUI:
             log(f"Mass: {mass:.6g}   COG: ({c[0]:.4g}, {c[1]:.4g}, {c[2]:.4g})")
             log(f"Inertia about COG (Ixx, Iyy, Izz): "
                 f"{inertia[0, 0]:.6g}, {inertia[1, 1]:.6g}, {inertia[2, 2]:.6g}")
+            dt_est = mesher.critical_timestep(result.stats,
+                                              settings.element_type, kopts["mat"])
+            if dt_est:
+                log(f"Estimated explicit critical timestep: {dt_est:.4g} "
+                    f"(dt = Lc/c, model time units, no TSSFAC)")
 
         comments = [f"Source geometry: {settings.step_file}",
                     f"Element size: {settings.size_min:g} .. {settings.size_max:g}"]
@@ -987,6 +999,7 @@ class KMesherGUI:
             mat=kopts["mat"], part_ids=part_ids, part_titles=part_titles,
             face_sets=tuple(face_sets), elem_sets=tuple(elem_sets),
             implicit_cards=kopts["implicit_cards"],
+            mesh_only=kopts["mesh_only"],
         )
         log(f"Done in {time.perf_counter() - t_start:.1f} s. "
             f"{result.stats['n_nodes']} nodes / "
@@ -1022,6 +1035,7 @@ class KMesherGUI:
             "preview": self.var_preview,
             "face_nodes": self.var_face_nodes, "face_segs": self.var_face_segs,
             "implicit": self.var_implicit, "qa": self.var_qa,
+            "mesh_only": self.var_mesh_only,
         }
         for axis, (enabled, offset, keep) in self.sym_rows.items():
             d[f"sym_{axis}"] = enabled

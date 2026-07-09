@@ -377,7 +377,7 @@ def main():
     print(f"OK: nodes on the sized face {n0} -> {n1}")
 
     # ---- 14. auto-refine wrapper ---------------------------------------------------
-    print("=== auto-refine wrapper (clean geometry: no retry needed) ===")
+    print("=== auto-refine wrapper (returns the best mesh) ===")
     settings = mesher.MeshSettings(step_file=step2, size_max=6.0,
                                    auto_refine=True, auto_refine_rounds=1,
                                    auto_refine_threshold=0.99)
@@ -550,6 +550,116 @@ def main():
     print(f"OK: BREP vol {rb.stats['measure']:.0f}, IGES vol "
           f"{ri.stats['measure']:.0f}, IGES/STL shells watertight, STL solid "
           f"vol {rss.stats['measure']:.0f}, guards fire")
+
+    # ---- 18. auto-refine: threshold > 0.05 retries, best mesh + preview kept ----
+    print("=== auto-refine threshold / best-mesh preview / failure resilience ===")
+    logmsgs = []
+    pv = os.path.join(out_dir, "autoref_preview.msh")
+    settings = mesher.MeshSettings(step_file=step, size_max=8.0, size_min=2.0,
+                                   auto_refine=True, auto_refine_rounds=1,
+                                   auto_refine_threshold=0.99)
+    res = mesher.mesh_step_auto(settings, log=lambda m: logmsgs.append(str(m)),
+                                preview_path=pv)
+    retries = [m for m in logmsgs if str(m).startswith("Auto-refine: min quality")]
+    assert retries, "threshold 0.99 must trigger an auto-refine retry"
+    assert os.path.isfile(pv), "preview of the kept mesh must exist"
+    assert not [p for p in os.listdir(out_dir) if "autoref_preview.round" in p], \
+        "per-round preview files must be cleaned up"
+    # the preview must show the KEPT mesh, not simply the last round's
+    import gmsh as _gmsh
+    _gmsh.initialize(interruptible=False)
+    _gmsh.open(pv)
+    n_prev = len(_gmsh.model.mesh.getElementsByType(4)[0])
+    _gmsh.finalize()
+    assert n_prev == res.stats["n_elems"], \
+        f"preview mesh ({n_prev}) != kept mesh ({res.stats['n_elems']})"
+    # a failing refinement round must not throw away the good first mesh
+    orig_mesh_step, calls = mesher.mesh_step, {"n": 0}
+
+    def flaky(s, log=print, preview_path=None):
+        calls["n"] += 1
+        if calls["n"] > 1:
+            raise RuntimeError("simulated PLC error")
+        return orig_mesh_step(s, log=log, preview_path=preview_path)
+
+    mesher.mesh_step = flaky
+    try:
+        res2 = mesher.mesh_step_auto(settings, log=QUIET)
+    finally:
+        mesher.mesh_step = orig_mesh_step
+    assert calls["n"] == 2 and res2.stats["n_elems"] > 100, \
+        "round-1 failure must return the round-0 mesh"
+    print(f"OK: retry fired, preview matches kept mesh ({n_prev} tets), "
+          f"failed round kept {res2.stats['n_elems']} elements")
+
+    # ---- 19. mesh-only (*INCLUDE) output -----------------------------------------
+    print("=== mesh-only output (for *INCLUDE) ===")
+    settings = mesher.MeshSettings(step_file=step, size_max=8.0, size_min=2.0,
+                                   symmetry=[mesher.SymmetryPlane("x", 0.0, "+")])
+    res = mesher.mesh_step(settings, log=QUIET)
+    k_inc = os.path.join(out_dir, "mesh_only.k")
+    dyna_writer.write_k(
+        k_inc, res.coords, res.elems, mesh_only=True, implicit_cards=True,
+        mat={"e": 210000.0, "pr": 0.3, "ro": 7.85e-9},
+        sym_sets=({"axis": "x", "offset": 0.0, "nodes": res.sym_nodes["x"],
+                   "spc": True},))
+    nodes, elems, _, kws = parse_k(k_inc)
+    for kw in ("*PART", "*SECTION_SOLID", "*MAT_ELASTIC",
+               "*CONTROL_TERMINATION", "*CONTROL_IMPLICIT_GENERAL"):
+        assert kw not in kws, f"mesh-only file must not contain {kw}"
+    for kw in ("*NODE", "*ELEMENT_SOLID", "*SET_NODE_LIST_TITLE",
+               "*BOUNDARY_SPC_SET", "*END"):
+        assert kw in kws, f"mesh-only file must contain {kw}"
+    assert len(nodes) == res.stats["n_nodes"] and len(elems) == res.stats["n_elems"]
+    print(f"OK: {len(nodes)} nodes / {len(elems)} elements, no PART/SECTION/MAT/"
+          f"control cards")
+
+    # ---- 20. critical timestep estimate --------------------------------------------
+    print("=== explicit critical timestep estimate ===")
+    mat = {"e": 210000.0, "pr": 0.3, "ro": 7.85e-9}   # steel, mm-t-s
+    lc = res.stats["char_length"]
+    assert lc > 0, "solid stats must expose the characteristic length"
+    dt = mesher.critical_timestep(res.stats, "TET4", mat)
+    c_solid = (210000.0 * 0.7 / (1.3 * 0.4 * 7.85e-9)) ** 0.5
+    assert abs(dt - lc / c_solid) < 1e-12 * dt, "solid dt must be Lc/c (bulk c)"
+    # shells: plane-stress wave speed on the min edge
+    res_sh = mesher.mesh_step(mesher.MeshSettings(
+        step_file=step_sh, element_type="TRI3", size_max=5.0), log=QUIET)
+    dt_sh = mesher.critical_timestep(res_sh.stats, "TRI3", mat)
+    c_shell = (210000.0 / (7.85e-9 * (1 - 0.09))) ** 0.5
+    assert abs(dt_sh - res_sh.stats["char_length"] / c_shell) < 1e-12 * dt_sh
+    # invalid input -> None, not a crash
+    assert mesher.critical_timestep(res.stats, "TET4", None) is None
+    assert mesher.critical_timestep({}, "TET4", mat) is None
+    assert mesher.critical_timestep(res.stats, "TET4",
+                                    {"e": 210000.0, "pr": 0.5, "ro": 7.85e-9}) is None
+    print(f"OK: solid dt {dt:.4g} s, shell dt {dt_sh:.4g} s, guards fire")
+
+    # ---- 21. CLI: --mesh-only / --title / --stats-json ------------------------------
+    print("=== CLI: --mesh-only, --title, --stats-json ===")
+    import json
+    import mesh_cli
+    k_cli = os.path.join(out_dir, "cli_meshonly.k")
+    js_cli = os.path.join(out_dir, "cli_stats.json")
+    rc = mesh_cli.main([step, "-o", k_cli, "--size-max", "8", "--size-min", "2",
+                        "--mesh-only", "--title", "CLI TITLE TEST",
+                        "--stats-json", js_cli, "--mat"])
+    assert rc == 0
+    _, elems, _, kws = parse_k(k_cli)
+    assert "*PART" not in kws and "*SECTION_SOLID" not in kws \
+        and "*MAT_ELASTIC" not in kws, "mesh-only CLI file must skip cards"
+    with open(k_cli) as f:
+        head = f.read(400)
+    assert "CLI TITLE TEST" in head, "--title must set the deck title"
+    with open(js_cli) as f:
+        payload = json.load(f)
+    assert payload["element_type"] == "TET4"
+    assert payload["stats"]["n_elems"] == len(elems)
+    assert payload["mass"] > 0 and payload["critical_timestep"] > 0
+    assert payload["stats"]["quality_min"] > 0
+    assert isinstance(payload["stats"]["failed_elems"], list)
+    print(f"OK: title + mesh-only written, stats JSON has {payload['stats']['n_elems']} "
+          f"elements, mass {payload['mass']:.4g}, dt {payload['critical_timestep']:.4g}")
 
     print("\nALL TESTS PASSED")
 

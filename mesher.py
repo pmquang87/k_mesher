@@ -200,17 +200,36 @@ def mesh_step_auto(settings: MeshSettings, log=print,
                    preview_path: str | None = None) -> MeshResult:
     """mesh_step with an optional quality-driven retry loop: if the minimum
     element quality is below the threshold, add refinement spheres at the
-    worst spots and remesh (BatchMesher-style). Returns the best mesh."""
+    worst spots and remesh (BatchMesher-style). Returns the best mesh; the
+    preview file (if requested) always matches the mesh that is returned."""
     s = settings
     rounds = settings.auto_refine_rounds if settings.auto_refine else 0
-    best = None
+    best, best_preview, round_previews = None, None, []
     for rnd in range(rounds + 1):
-        res = mesh_step(s, log=log, preview_path=preview_path)
+        rp = preview_path
+        if preview_path and rounds:
+            # per-round file so the preview of the KEPT mesh can be restored
+            # even when a later (worse) round overwrote a shared path
+            # (suffix goes before the extension - gmsh picks the format by it)
+            base, ext = os.path.splitext(preview_path)
+            rp = f"{base}.round{rnd}{ext}"
+            round_previews.append(rp)
+        try:
+            res = mesh_step(s, log=log, preview_path=rp)
+        except Exception as e:
+            if best is None:
+                raise
+            # a failed refinement round must not throw away the good mesh
+            log(f"Auto-refine: remeshing failed in round {rnd}/{rounds} ({e}) "
+                f"- keeping the best mesh from the earlier rounds")
+            res = best
+            break
         if (best is None or res.stats.get("quality_min", 1.0)
                 > best.stats.get("quality_min", 1.0)):
-            best = res
+            best, best_preview = res, rp
         qmin = res.stats.get("quality_min", 1.0)
-        worst = res.stats.get("worst_elements") or []
+        worst = [w for w in (res.stats.get("worst_elements") or ())
+                 if w[0] < s.auto_refine_threshold]
         if rnd == rounds or qmin >= s.auto_refine_threshold or not worst:
             break
         add = [{"kind": "sphere", "params": [c[0], c[1], c[2], 3.0 * h],
@@ -220,6 +239,12 @@ def mesh_step_auto(settings: MeshSettings, log=print,
             f"{s.auto_refine_threshold:g} - adding {len(add)} refinement "
             f"sphere(s) and remeshing (round {rnd + 1}/{rounds}) ...")
         s = replace(s, refinements=list(s.refinements) + add)
+    if preview_path and rounds:
+        if best_preview and os.path.isfile(best_preview):
+            os.replace(best_preview, preview_path)
+        for p in round_previews:
+            if p != best_preview and os.path.isfile(p):
+                os.remove(p)
     if best.stats.get("quality_min", 1.0) != res.stats.get("quality_min", 1.0):
         log(f"Auto-refine: keeping the best of all rounds "
             f"(min quality {best.stats.get('quality_min', 1.0):.4f})")
@@ -1073,6 +1098,27 @@ def _mass_properties(coords, elems, element_type):
     return cog, inertia
 
 
+def critical_timestep(stats: dict, element_type: str, mat: dict) -> float | None:
+    """Estimated explicit critical timestep dt = Lc / c (no TSSFAC applied).
+
+    Lc is the smallest element characteristic length from the mesh statistics
+    (tet minimum altitude for solids, minimum edge for shells - a conservative
+    proxy) and c the acoustic wave speed of the elastic material: constrained
+    (bulk) for solids, plane-stress for shells. Units follow the model
+    (e.g. seconds in mm-t-s). Returns None if data is missing or invalid."""
+    lc = stats.get("char_length")
+    if not lc or lc <= 0 or not mat:
+        return None
+    e, nu, ro = float(mat["e"]), float(mat["pr"]), float(mat["ro"])
+    if e <= 0 or ro <= 0 or not -1.0 < nu < 0.5:
+        return None
+    if ETYPES[element_type]["family"] == "solid":
+        c = (e * (1.0 - nu) / ((1.0 + nu) * (1.0 - 2.0 * nu) * ro)) ** 0.5
+    else:
+        c = (e / (ro * (1.0 - nu * nu))) ** 0.5
+    return float(lc) / c
+
+
 def _collect_stats(coords: np.ndarray, elems: np.ndarray, element_type: str,
                    bbox) -> dict:
     family = ETYPES[element_type]["family"]
@@ -1126,15 +1172,20 @@ def _collect_stats(coords: np.ndarray, elems: np.ndarray, element_type: str,
         crit, failed = _quality_criteria(coords, elems, element_type, q)
         stats["criteria"] = crit
         stats["failed_elems"] = failed        # 0-based element rows
+        # timestep-critical characteristic length of the worst element
+        lc_name = "min altitude (dt)" if family == "solid" else "min edge"
+        for cr in crit:
+            if cr["name"] == lc_name:
+                stats["char_length"] = cr["worst"]
     except Exception:
         pass
 
     if family == "solid" and q is not None:
-        # locations + local size of the worst elements (dirty CAD spots);
-        # getElementsByType returns elements grouped by volume in tag order,
-        # matching the row order of `elems`
-        bad = np.flatnonzero(q < 0.05)
-        bad = bad[np.argsort(q[bad])][:5]
+        # locations + local size of the 5 worst elements, whatever their
+        # quality (auto-refine filters against its own threshold, the log
+        # warning against 0.05); getElementsByType returns elements grouped
+        # by volume in tag order, matching the row order of `elems`
+        bad = np.argsort(q)[:5]
         pairs = [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)]
         stats["worst_elements"] = []
         for i in bad:
@@ -1178,9 +1229,10 @@ def _log_stats(stats: dict, sym_nodes: dict, log) -> None:
         n_failed = len(stats.get("failed_elems", ()))
         if n_failed:
             log(f"{n_failed} element(s) fail at least one criterion")
-    if stats.get("worst_elements"):
+    bad_spots = [w for w in stats.get("worst_elements", ()) if w[0] < 0.05]
+    if bad_spots:
         log("WARNING: badly shaped elements (SICN < 0.05) at:")
-        for qual, c, h in stats["worst_elements"]:
+        for qual, c, h in bad_spots:
             log(f"    SICN {qual:.5f} near ({c[0]}, {c[1]}, {c[2]})")
         log("These are usually caused by dirty geometry at those locations "
             "(tangent faces, knife edges, tiny edges/faces). Suppressing the "

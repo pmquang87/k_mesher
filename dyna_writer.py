@@ -92,6 +92,8 @@ def write_k(
     elem_sets: tuple[dict, ...] = (),  # {"title","eids"(1-based rows)} -> failed
     implicit_cards: bool = False,      # write basic implicit static control deck
     curve_id: int = 1,                 # id of the generated unit ramp curve
+    mesh_only: bool = False,           # *INCLUDE-friendly file: skip PART/
+                                       # SECTION/MAT and control cards
 ) -> None:
     n_nodes = len(coords)
     nn = elems.shape[1]
@@ -111,40 +113,47 @@ def write_k(
         for c in comments:
             f.write(f"$ {c}\n")
 
-        if implicit_cards:
-            _write_implicit_cards(f)
-
-        # --- PART / SECTION / MAT -------------------------------------------
-        for p in unique_pids:
-            f.write("*PART\n")
-            f.write(f"{part_titles.get(p, f'part {p}')[:70]}\n")
-            f.write("$#     pid     secid       mid     eosid      hgid      grav"
-                    "    adpopt      tmid\n")
-            f.write(f"{p:10d}{pid:10d}{pid:10d}{0:10d}{0:10d}{0:10d}{0:10d}{0:10d}\n")
-        if mat is None:
-            f.write(f"$ NOTE: define a *MAT_ card with MID = {pid} "
-                    f"before running LS-DYNA.\n")
-
-        if element_kind == "solid":
-            f.write("*SECTION_SOLID\n")
-            f.write("$#   secid    elform       aet\n")
-            f.write(f"{pid:10d}{elform:10d}{0:10d}\n")
+        if mesh_only:
+            f.write(f"$ mesh-only file (for *INCLUDE): define *PART {pid}"
+                    f"{'' if len(unique_pids) == 1 else f'..{max(unique_pids)}'}"
+                    f", *SECTION and *MAT in the master deck.\n")
         else:
-            f.write("*SECTION_SHELL\n")
-            f.write("$#   secid    elform      shrf       nip     propt"
-                    "   qr/irid     icomp     setyp\n")
-            f.write(f"{pid:10d}{elform:10d}{0.8333:10.4f}{5:10d}{1.0:10.1f}"
-                    f"{0:10d}{0:10d}{1:10d}\n")
-            f.write("$#      t1        t2        t3        t4      nloc"
-                    "     marea      idof    edgset\n")
-            f.write(f"{thickness:10.4g}{thickness:10.4g}{thickness:10.4g}"
-                    f"{thickness:10.4g}\n")
+            if implicit_cards:
+                _write_implicit_cards(f)
 
-        if mat is not None:
-            f.write("*MAT_ELASTIC\n")
-            f.write("$#     mid        ro         e        pr        da        db\n")
-            f.write(f"{pid:10d}{mat['ro']:10.3e}{mat['e']:10.4g}{mat['pr']:10.4f}"
-                    f"{0.0:10.1f}{0.0:10.1f}\n")
+            # --- PART / SECTION / MAT ---------------------------------------
+            for p in unique_pids:
+                f.write("*PART\n")
+                f.write(f"{part_titles.get(p, f'part {p}')[:70]}\n")
+                f.write("$#     pid     secid       mid     eosid      hgid"
+                        "      grav    adpopt      tmid\n")
+                f.write(f"{p:10d}{pid:10d}{pid:10d}{0:10d}{0:10d}{0:10d}"
+                        f"{0:10d}{0:10d}\n")
+            if mat is None:
+                f.write(f"$ NOTE: define a *MAT_ card with MID = {pid} "
+                        f"before running LS-DYNA.\n")
+
+            if element_kind == "solid":
+                f.write("*SECTION_SOLID\n")
+                f.write("$#   secid    elform       aet\n")
+                f.write(f"{pid:10d}{elform:10d}{0:10d}\n")
+            else:
+                f.write("*SECTION_SHELL\n")
+                f.write("$#   secid    elform      shrf       nip     propt"
+                        "   qr/irid     icomp     setyp\n")
+                f.write(f"{pid:10d}{elform:10d}{0.8333:10.4f}{5:10d}{1.0:10.1f}"
+                        f"{0:10d}{0:10d}{1:10d}\n")
+                f.write("$#      t1        t2        t3        t4      nloc"
+                        "     marea      idof    edgset\n")
+                f.write(f"{thickness:10.4g}{thickness:10.4g}{thickness:10.4g}"
+                        f"{thickness:10.4g}\n")
+
+            if mat is not None:
+                f.write("*MAT_ELASTIC\n")
+                f.write("$#     mid        ro         e        pr        da"
+                        "        db\n")
+                f.write(f"{pid:10d}{mat['ro']:10.3e}{mat['e']:10.4g}"
+                        f"{mat['pr']:10.4f}{0.0:10.1f}{0.0:10.1f}\n")
 
         # --- NODES ----------------------------------------------------------
         f.write("*NODE\n")

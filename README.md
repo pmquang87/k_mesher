@@ -10,7 +10,9 @@ options (symmetric / anti-symmetric / fixed / custom DOFs), per-body parts,
 defeaturing (remove holes/fillets), face sets with BCs and loads
 (SPC / pressure / force), local mesh refinement (regions and per-face sizes),
 LS-DYNA quality criteria with failed-element sets, quality-driven auto-remeshing,
-mass properties, shell integrity checks, parameter presets and a batch queue.
+mass properties with an explicit critical-timestep estimate, shell integrity
+checks, mesh-only output for `*INCLUDE` decks, machine-readable statistics
+(JSON), parameter presets and a batch queue.
 Meshing is done with [gmsh](https://gmsh.info) (OpenCASCADE kernel), the GUI is
 plain tkinter.
 
@@ -55,6 +57,8 @@ python mesh_cli.py part.stp --face-nodeset 7 --face-segset 12
 python mesh_cli.py part.stp --refine-sphere 0:0:0:15:1.5 --face-size 6:2.0
 python mesh_cli.py part.stp --defeature 7 --spc 1 --pressure 6:0.5 \
                             --force 4:z:-500 --implicit-cards --auto-refine
+python mesh_cli.py part.stp --mesh-only -o part_mesh.k   # for *INCLUDE decks
+python mesh_cli.py part.stp --mat --stats-json part_stats.json --title "bracket"
 ```
 
 `python mesh_cli.py -h` lists all options. GUI settings are remembered
@@ -97,6 +101,10 @@ window close).
      assembly decks without ID clashes.
    - Optional `*MAT_ELASTIC` card (E, ν, ρ; defaults are steel in mm-t-s).
      Without it, define your own `*MAT_` with MID = base PID.
+   - *Mesh-only output* — write an `*INCLUDE`-friendly file with only nodes,
+     elements and sets (no `*PART`/`*SECTION`/`*MAT`/control cards); define
+     those in the master deck. Combine with the start node/element/set IDs to
+     merge several meshes without ID clashes.
 4. **Symmetry & face sets tab**
    - Symmetry: tick X/Y/Z planes, set the plane position and which side to
      keep. The geometry is cut by boolean intersection *before* meshing, so
@@ -135,17 +143,24 @@ window close).
    several STEP files (each job snapshots the current settings) and run them
    unattended.
 6. **Generate mesh** — runs in the background; the log shows per-stage
-   timings, element counts, mesh volume/area, mass + COG + inertia (when a
-   material is set), a quality histogram (SICN, 1.0 is a perfect tet), an
+   timings, element counts, mesh volume/area, mass + COG + inertia and an
+   estimated explicit critical timestep dt = Lc/c (when a
+   material is set; Lc is the worst element's characteristic length, c the
+   material wave speed — apply your own TSSFAC), a quality histogram
+   (SICN, 1.0 is a perfect tet), an
    LS-DYNA-style **quality criteria table** (aspect ratio, SICN, warpage,
    min angle; failing elements are written as `*SET_SOLID`/`*SET_SHELL` for
    review in LS-PrePost), shell integrity checks (free edges, non-manifold
    edges, normal orientation — normals are auto-aligned), and the locations
    of badly shaped elements (usually dirty CAD spots — defeature them).
    "Auto-refine bad spots" remeshes up to 2 extra rounds with refinement
-   spheres at the worst locations and keeps the best mesh; note that slivers
-   caused by tangent faces cannot be refined away — defeature instead.
-   "Preview last mesh" opens the interactive Gmsh viewer.
+   spheres at the worst locations and keeps the best mesh (the preview always
+   shows the kept mesh, and a failed refinement round falls back to the best
+   earlier one); note that slivers caused by tangent faces cannot be refined
+   away — defeature instead. "Preview last mesh" opens the interactive Gmsh
+   viewer. On the command line, `--stats-json` writes all of these statistics
+   (counts, quality criteria, mass properties, timestep estimate) to a JSON
+   file for scripted pipelines.
 
 ## Output file contents
 
