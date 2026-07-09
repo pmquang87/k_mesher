@@ -6,13 +6,16 @@ Mesh CAD geometry (STEP / IGES / BREP) or a surface tessellation
 (STL / OBJ / PLY) into solid tetrahedra (TET4/TET10) or shells (TRI3/QUAD4)
 and export an LS-DYNA keyword file (`.k`). Features: symmetry planes
 (half/quarter/eighth models) with separate node-set and boundary-condition
-options (symmetric / anti-symmetric / fixed / custom DOFs), per-body parts,
+options (symmetric / anti-symmetric / fixed / custom DOFs), per-body parts
+with per-body materials, single-surface contact and gravity load cards,
 defeaturing (remove holes/fillets), face sets with BCs and loads
 (SPC / pressure / force), local mesh refinement (regions and per-face sizes),
 LS-DYNA quality criteria with failed-element sets, quality-driven auto-remeshing,
-mass properties with an explicit critical-timestep estimate, shell integrity
-checks, mesh-only output for `*INCLUDE` decks, machine-readable statistics
-(JSON), parameter presets and a batch queue.
+mass properties with an explicit critical-timestep estimate (plus an optional
+`*CONTROL_TIMESTEP` card), shell integrity checks, mesh-only output for
+`*INCLUDE` decks, automatic LONG=Y format when ids overflow the standard
+fields, machine-readable statistics (JSON), parameter presets and a batch
+queue.
 Meshing is done with [gmsh](https://gmsh.info) (OpenCASCADE kernel), the GUI is
 plain tkinter.
 
@@ -59,6 +62,8 @@ python mesh_cli.py part.stp --defeature 7 --spc 1 --pressure 6:0.5 \
                             --force 4:z:-500 --implicit-cards --auto-refine
 python mesh_cli.py part.stp --mesh-only -o part_mesh.k   # for *INCLUDE decks
 python mesh_cli.py part.stp --mat --stats-json part_stats.json --title "bracket"
+python mesh_cli.py asm.stp --glue --mat --part-mat 2:70000:0.33:2.7e-9
+python mesh_cli.py asm.stp --contact 0.15 --tssfac 0.9 --gravity z:9810
 ```
 
 `python mesh_cli.py -h` lists all options. GUI settings are remembered
@@ -100,11 +105,22 @@ window close).
      (the last renumbers node/segment/SPC/element sets) let you merge into
      assembly decks without ID clashes.
    - Optional `*MAT_ELASTIC` card (E, ν, ρ; defaults are steel in mm-t-s).
-     Without it, define your own `*MAT_` with MID = base PID.
+     Without it, define your own `*MAT_` with MID = base PID. Multi-body
+     models can override the material **per body** — those parts get their
+     own MID and `*MAT_ELASTIC` card, and the log reports per-part masses.
    - *Mesh-only output* — write an `*INCLUDE`-friendly file with only nodes,
      elements and sets (no `*PART`/`*SECTION`/`*MAT`/control cards); define
      those in the master deck. Combine with the start node/element/set IDs to
      merge several meshes without ID clashes.
+   - *Contact between parts* — `*CONTACT_AUTOMATIC_SINGLE_SURFACE` over all
+     parts with a friction coefficient, for assemblies whose bodies are not
+     glued (glued bodies share nodes and need no contact).
+   - *`*CONTROL_TIMESTEP`* with a chosen TSSFAC, and *gravity* via
+     `*LOAD_BODY_X/Y/Z` (scaled unit ramp curve; a positive acceleration
+     loads the negative axis, per the LS-DYNA base-acceleration convention).
+   - Node/element ids that overflow the standard 8-character fields switch
+     the file automatically to the LONG=Y keyword format (20-character
+     fields); `--long-format` forces it.
 4. **Symmetry & face sets tab**
    - Symmetry: tick X/Y/Z planes, set the plane position and which side to
      keep. The geometry is cut by boolean intersection *before* meshing, so
@@ -143,10 +159,14 @@ window close).
    several STEP files (each job snapshots the current settings) and run them
    unattended.
 6. **Generate mesh** — runs in the background; the log shows per-stage
-   timings, element counts, mesh volume/area, mass + COG + inertia and an
+   timings, element counts, mesh volume/area, mass + COG + inertia (per part
+   when per-body materials are set) and an
    estimated explicit critical timestep dt = Lc/c (when a
-   material is set; Lc is the worst element's characteristic length, c the
-   material wave speed — apply your own TSSFAC), a quality histogram
+   material is set; Lc is the worst element's characteristic length — tet
+   minimum altitude, or (1+β)·area/longest-edge for shells — and c the
+   material wave speed; apply your own TSSFAC). A dt distribution line
+   (1% / 10% / median) shows whether the critical element is an outlier
+   worth mass-scaling. Then a quality histogram
    (SICN, 1.0 is a perfect tet), an
    LS-DYNA-style **quality criteria table** (aspect ratio, SICN, warpage,
    min angle; failing elements are written as `*SET_SOLID`/`*SET_SHELL` for
@@ -165,11 +185,15 @@ window close).
 ## Output file contents
 
 ```
-*KEYWORD / *TITLE
-*PART                 (one per solid body; SECID = MID = base PID)
+*KEYWORD / *TITLE     (*KEYWORD LONG=Y when ids need 20-char fields)
+*CONTROL_TIMESTEP     (optional; chosen TSSFAC)
+*PART                 (one per solid body; SECID = base PID, MID = base PID
+                       or the body's own PID with per-body materials)
 *SECTION_SOLID /      (chosen ELFORM; SECTION_SHELL carries the thickness)
 *SECTION_SHELL
-*MAT_ELASTIC          (optional)
+*MAT_ELASTIC          (optional; one per referenced MID)
+*CONTACT_AUTOMATIC_SINGLE_SURFACE   (optional; friction on card 2)
+*LOAD_BODY_X/Y/Z      (optional gravity; scaled unit ramp curve)
 *NODE                 (I8 id, 3 x E16.9 coordinates)
 *ELEMENT_SOLID        (TET4: one line, tet as degenerate hex;
                        TET10: two-line format, 10 nodes)
@@ -214,7 +238,7 @@ big meshes:
 | `dyna_writer.py` | LS-DYNA `.k` writer |
 | `preview.py` | standalone Gmsh viewer process |
 | `examples/make_test_step.py` | generates test parts (STEP + IGES/BREP/STL) |
-| `tests/test_headless.py` | end-to-end tests (all element types, formats, symmetry BCs, parts, sets, refinement) |
+| `tests/test_headless.py` | end-to-end tests, pytest-compatible (`pytest tests/ -v` or `python tests/test_headless.py`) |
 | `docs/cad_formats.md` | survey of CAD input formats and what is importable |
 
 ## Notes on element types

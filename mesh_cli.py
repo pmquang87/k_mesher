@@ -14,6 +14,9 @@ Examples:
     python mesh_cli.py part.stp --list-faces
     python mesh_cli.py part.stp --face-nodeset 7 --face-segset 12
     python mesh_cli.py part.stp --refine-sphere 0:0:0:15:1.5 --refine-box 0:0:0:10:10:10:2
+    python mesh_cli.py asm.stp --glue --mat --part-mat 2:70000:0.33:2.7e-9
+    python mesh_cli.py asm.stp --contact 0.15 --tssfac 0.9 --gravity z:9810
+    python mesh_cli.py part.stp --mesh-only --stats-json part_stats.json
 """
 from __future__ import annotations
 
@@ -77,6 +80,34 @@ def parse_mat(text: str) -> dict:
     except ValueError:
         raise argparse.ArgumentTypeError(f"bad material spec {text!r}, "
                                          f"expected E[:nu[:rho]]") from None
+
+
+def parse_part_mat(text: str) -> tuple[int, dict]:
+    """BODY:E[:NU[:RHO]] - per-body *MAT_ELASTIC override; BODY is the
+    1-based body index (missing values default to steel mm-t-s)."""
+    parts = text.split(":")
+    try:
+        body = int(parts[0])
+        if body < 1:
+            raise ValueError
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"part-mat body index must be a positive integer: {text!r}") from None
+    return body, parse_mat(":".join(parts[1:]))
+
+
+def parse_gravity(text: str) -> tuple[str, float]:
+    """AXIS:ACCEL e.g. 'z:-9810' (mm/s^2 in mm-t-s units)."""
+    parts = text.split(":")
+    axis = parts[0].strip().lower()
+    if axis not in ("x", "y", "z") or len(parts) != 2:
+        raise argparse.ArgumentTypeError(
+            f"gravity must be AXIS:ACCEL with axis x/y/z: {text!r}")
+    try:
+        return axis, float(parts[1])
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"bad gravity acceleration in {text!r}") from None
 
 
 def _parse_floats(text: str, n: int, what: str) -> list[float]:
@@ -242,6 +273,27 @@ def build_parser() -> argparse.ArgumentParser:
                    default=None, metavar="E[:NU[:RHO]]",
                    help="write *MAT_ELASTIC (bare --mat = steel in mm-t-s: "
                         "210000:0.3:7.85e-9)")
+    p.add_argument("--part-mat", type=parse_part_mat, action="append",
+                   default=[], metavar="BODY:E[:NU[:RHO]]",
+                   help="per-body *MAT_ELASTIC override for multi-body models "
+                        "(BODY is the 1-based body index), repeatable; bodies "
+                        "without an override use --mat")
+    p.add_argument("--contact", type=float, nargs="?", const=0.0, default=None,
+                   metavar="FS",
+                   help="write *CONTACT_AUTOMATIC_SINGLE_SURFACE over all "
+                        "parts, optionally with friction coefficient FS "
+                        "(for bonded bodies use --glue instead)")
+    p.add_argument("--tssfac", type=float, default=None, metavar="F",
+                   help="write *CONTROL_TIMESTEP with this TSSFAC "
+                        "(e.g. 0.9)")
+    p.add_argument("--gravity", type=parse_gravity, default=None,
+                   metavar="AXIS:ACCEL",
+                   help="body load via *LOAD_BODY_ with the unit ramp curve, "
+                        "e.g. z:9810 (note: LOAD_BODY acts opposite to the "
+                        "axis for positive values)")
+    p.add_argument("--long-format", action="store_true",
+                   help="write LONG=Y keyword format (20-char fields); "
+                        "enabled automatically when ids exceed 8 characters")
     p.add_argument("--preview", action="store_true",
                    help="open the Gmsh viewer on the result")
     return p
@@ -253,6 +305,9 @@ def main(argv=None) -> int:
         print(f"error: input file not found: {args.input}", file=sys.stderr)
         return 2
 
+    if args.tet10 and args.etype != "tet4":
+        print(f"warning: --tet10 (deprecated) overrides --etype {args.etype}; "
+              f"meshing TET10", file=sys.stderr)
     etype = "TET10" if args.tet10 else args.etype.upper()
     defaults = {"TET4": 10, "TET10": 16, "TRI3": 4, "QUAD4": 16}
     allowed = {"TET4": (10, 13), "TET10": (16, 17),
@@ -357,16 +412,18 @@ def main(argv=None) -> int:
         elem_sets.append({"title": "QA quality-criteria failures",
                           "eids": failed + 1})
 
-    mass = dt_est = None
-    if args.mat:
-        scale = args.mat["ro"] * (args.thickness if is_shell else 1.0)
-        mass = scale * result.stats["measure"]
-        c = result.stats.get("cog", (0, 0, 0))
-        print(f"Mass: {mass:.6g}   COG: ({c[0]:.4g}, {c[1]:.4g}, {c[2]:.4g})")
-        dt_est = mesher.critical_timestep(result.stats, etype, args.mat)
-        if dt_est:
-            print(f"Estimated explicit critical timestep: {dt_est:.4g} "
-                  f"(dt = Lc/c, model time units, no TSSFAC)")
+    n_bodies = len(result.part_names)
+    part_mats = {}
+    for body, m in args.part_mat:
+        if body > n_bodies:
+            print(f"warning: --part-mat body {body} ignored - the model has "
+                  f"only {n_bodies} body/bodies", file=sys.stderr)
+            continue
+        part_mats[args.pid + body - 1] = m
+
+    mass, part_masses, dt_est = mesher.mass_and_timestep(
+        result, etype, args.mat, part_mats, args.pid,
+        args.thickness if is_shell else 1.0, log=print)
 
     part_ids = args.pid + result.elem_parts
     part_titles = {args.pid + i: (name or f"body {i + 1}")
@@ -388,7 +445,9 @@ def main(argv=None) -> int:
         comments=tuple(comments), sym_sets=tuple(sym_sets), mat=args.mat,
         part_ids=part_ids, part_titles=part_titles, face_sets=tuple(face_sets),
         elem_sets=tuple(elem_sets), implicit_cards=args.implicit_cards,
-        mesh_only=args.mesh_only,
+        mesh_only=args.mesh_only, part_mats=part_mats,
+        contact_fs=args.contact, tssfac=args.tssfac, body_load=args.gravity,
+        long_format=args.long_format,
     )
     print(f"Wrote {out}")
 
@@ -397,8 +456,10 @@ def main(argv=None) -> int:
             "input": args.input, "output": out,
             "element_type": etype, "elform": elform,
             "n_parts": len(result.part_names), "part_names": result.part_names,
-            "mass": mass, "critical_timestep": dt_est,
-            "material": args.mat, "stats": result.stats,
+            "mass": mass, "part_masses": part_masses,
+            "critical_timestep": dt_est,
+            "material": args.mat, "part_materials": part_mats,
+            "stats": result.stats,
         }
         with open(args.stats_json, "w") as f:
             json.dump(payload, f, indent=2, default=_json_default)

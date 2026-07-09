@@ -18,6 +18,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: pip
 
       - name: Install system libraries for gmsh (Linux)
         if: runner.os == 'Linux'
@@ -27,7 +28,10 @@ jobs:
             libxcursor1 libxft2 libxinerama1 libfontconfig1
 
       - name: Install Python dependencies
-        run: pip install -r requirements.txt
+        run: pip install -r requirements.txt pytest ruff
+
+      - name: Lint (ruff)
+        run: ruff check .
 
       - name: Run end-to-end tests
-        run: python tests/test_headless.py
+        run: pytest tests/test_headless.py -v

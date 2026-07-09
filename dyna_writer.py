@@ -7,6 +7,10 @@ Formats used (standard fixed-width small format):
                    TET10: two-line format - eid,pid (2I8) / n1..n10 (10I8)
   *ELEMENT_SHELL   eid,pid,n1..n4 (6I8), triangles as n1 n2 n3 n3
   *SET_NODE_LIST / *SET_SEGMENT   I10 fields
+
+When a node or element id would overflow the 8-character standard fields the
+file is automatically written as ``*KEYWORD LONG=Y`` with 20-character fields
+throughout (also selectable explicitly via ``long_format=True``).
 """
 from __future__ import annotations
 
@@ -38,6 +42,23 @@ _FIXED_DOFS = (1, 1, 1, 1, 1, 1)
 
 # named constraint kinds usable on a symmetry plane
 SYM_CONSTRAINTS = ("symmetric", "antisymmetric", "fixed", "custom")
+
+# largest id that fits the 8-character *NODE/*ELEMENT fields of the standard
+# keyword format; beyond it LONG=Y (20-character fields) is required
+MAX_STD_ID = 99_999_999
+
+
+class _Widths:
+    """Field widths for the standard or the LONG=Y keyword format."""
+
+    def __init__(self, long_format: bool):
+        self.long = long_format
+        self.f = 20 if long_format else 10   # card / set fields
+        self.n = 20 if long_format else 8    # node & element id fields
+        self.c = 20 if long_format else 16   # node coordinate fields
+
+    def ints(self, *vals) -> str:
+        return "".join(f"{int(v):{self.f}d}" for v in vals)
 
 
 def _resolve_sym_dofs(item: dict) -> tuple[int, ...]:
@@ -94,6 +115,15 @@ def write_k(
     curve_id: int = 1,                 # id of the generated unit ramp curve
     mesh_only: bool = False,           # *INCLUDE-friendly file: skip PART/
                                        # SECTION/MAT and control cards
+    part_mats: dict[int, dict] | None = None,  # pid -> {"e","pr","ro"}: per-part
+                                       # *MAT_ELASTIC (overrides `mat` for that pid)
+    contact_fs: float | None = None,   # write *CONTACT_AUTOMATIC_SINGLE_SURFACE
+                                       # over all parts with this friction coeff.
+    tssfac: float | None = None,       # write *CONTROL_TIMESTEP with this TSSFAC
+    body_load: tuple[str, float] | None = None,  # ("x"|"y"|"z", accel) ->
+                                       # *LOAD_BODY_ with the unit ramp curve
+    long_format: bool = False,         # force LONG=Y 20-char fields (otherwise
+                                       # auto-enabled when ids overflow I8)
 ) -> None:
     n_nodes = len(coords)
     nn = elems.shape[1]
@@ -104,14 +134,22 @@ def write_k(
         part_ids = np.full(len(elems), pid, dtype=np.int64)
     unique_pids = list(dict.fromkeys(int(p) for p in part_ids))
     part_titles = part_titles or {}
+    part_mats = part_mats or {}
+
+    max_id = max(start_nid + n_nodes - 1, start_eid + len(elems) - 1)
+    auto_long = max_id > MAX_STD_ID and not long_format
+    w = _Widths(long_format or max_id > MAX_STD_ID)
 
     with open(path, "w", newline="\n") as f:
-        f.write("*KEYWORD\n")
+        f.write("*KEYWORD LONG=Y\n" if w.long else "*KEYWORD\n")
         f.write("*TITLE\n")
         f.write(f"{title[:80]}\n")
         f.write(f"$ Written by k_mesher on {datetime.now():%Y-%m-%d %H:%M:%S}\n")
         for c in comments:
             f.write(f"$ {c}\n")
+        if auto_long:
+            f.write("$ LONG=Y format enabled automatically: ids exceed the "
+                    "8-character standard fields\n")
 
         if mesh_only:
             f.write(f"$ mesh-only file (for *INCLUDE): define *PART {pid}"
@@ -119,54 +157,70 @@ def write_k(
                     f", *SECTION and *MAT in the master deck.\n")
         else:
             if implicit_cards:
-                _write_implicit_cards(f)
+                _write_implicit_cards(f, w)
+            if tssfac is not None:
+                _write_control_timestep(f, w, tssfac)
 
             # --- PART / SECTION / MAT ---------------------------------------
             for p in unique_pids:
+                mid = p if p in part_mats else pid
                 f.write("*PART\n")
                 f.write(f"{part_titles.get(p, f'part {p}')[:70]}\n")
                 f.write("$#     pid     secid       mid     eosid      hgid"
                         "      grav    adpopt      tmid\n")
-                f.write(f"{p:10d}{pid:10d}{pid:10d}{0:10d}{0:10d}{0:10d}"
-                        f"{0:10d}{0:10d}\n")
-            if mat is None:
-                f.write(f"$ NOTE: define a *MAT_ card with MID = {pid} "
+                f.write(w.ints(p, pid, mid, 0, 0, 0, 0, 0) + "\n")
+
+            # one material card per referenced MID; per-part materials
+            # override the global one for their pid
+            mats_by_mid = {}
+            if mat is not None:
+                mats_by_mid[pid] = mat
+            mats_by_mid.update({p: m for p, m in part_mats.items() if m})
+            mids_used = {p if p in part_mats else pid for p in unique_pids}
+            missing = sorted(mids_used - set(mats_by_mid))
+            if missing:
+                f.write(f"$ NOTE: define *MAT_ card(s) with MID = "
+                        f"{', '.join(str(m) for m in missing)} "
                         f"before running LS-DYNA.\n")
 
             if element_kind == "solid":
                 f.write("*SECTION_SOLID\n")
                 f.write("$#   secid    elform       aet\n")
-                f.write(f"{pid:10d}{elform:10d}{0:10d}\n")
+                f.write(w.ints(pid, elform, 0) + "\n")
             else:
                 f.write("*SECTION_SHELL\n")
                 f.write("$#   secid    elform      shrf       nip     propt"
                         "   qr/irid     icomp     setyp\n")
-                f.write(f"{pid:10d}{elform:10d}{0.8333:10.4f}{5:10d}{1.0:10.1f}"
-                        f"{0:10d}{0:10d}{1:10d}\n")
+                f.write(f"{pid:{w.f}d}{elform:{w.f}d}{0.8333:{w.f}.4f}"
+                        f"{5:{w.f}d}{1.0:{w.f}.1f}{0:{w.f}d}{0:{w.f}d}"
+                        f"{1:{w.f}d}\n")
                 f.write("$#      t1        t2        t3        t4      nloc"
                         "     marea      idof    edgset\n")
-                f.write(f"{thickness:10.4g}{thickness:10.4g}{thickness:10.4g}"
-                        f"{thickness:10.4g}\n")
+                f.write(f"{thickness:{w.f}.4g}" * 4 + "\n")
 
-            if mat is not None:
+            for mid in sorted(mats_by_mid):
+                m = mats_by_mid[mid]
                 f.write("*MAT_ELASTIC\n")
                 f.write("$#     mid        ro         e        pr        da"
                         "        db\n")
-                f.write(f"{pid:10d}{mat['ro']:10.3e}{mat['e']:10.4g}"
-                        f"{mat['pr']:10.4f}{0.0:10.1f}{0.0:10.1f}\n")
+                f.write(f"{mid:{w.f}d}{m['ro']:{w.f}.3e}{m['e']:{w.f}.4g}"
+                        f"{m['pr']:{w.f}.4f}{0.0:{w.f}.1f}{0.0:{w.f}.1f}\n")
+
+            if contact_fs is not None:
+                _write_contact(f, w, contact_fs)
 
         # --- NODES ----------------------------------------------------------
         f.write("*NODE\n")
         f.write("$#   nid               x               y               z\n")
         node_block = np.column_stack((nids.astype(float), coords))
-        np.savetxt(f, node_block, fmt="%8d%16.9e%16.9e%16.9e")
+        np.savetxt(f, node_block, fmt=f"%{w.n}d" + f"%{w.c}.9e" * 3)
 
         # --- ELEMENTS ---------------------------------------------------------
         if element_kind == "shell":
             f.write("*ELEMENT_SHELL\n")
             f.write("$#   eid     pid      n1      n2      n3      n4\n")
             elem_block = np.column_stack((eids, part_ids, elem_nids))
-            np.savetxt(f, elem_block, fmt="%8d" * 6)
+            np.savetxt(f, elem_block, fmt=f"%{w.n}d" * 6)
         elif nn == 4:
             f.write("*ELEMENT_SOLID\n")
             f.write("$#   eid     pid      n1      n2      n3      n4      n5"
@@ -175,27 +229,35 @@ def write_k(
                 (eids, part_ids, elem_nids,
                  elem_nids[:, 3], elem_nids[:, 3], elem_nids[:, 3], elem_nids[:, 3])
             )
-            np.savetxt(f, elem_block, fmt="%8d" * 10)
+            np.savetxt(f, elem_block, fmt=f"%{w.n}d" * 10)
         else:  # TET10, two-line format
             f.write("*ELEMENT_SOLID\n")
             f.write("$#   eid     pid\n")
             f.write("$#    n1      n2      n3      n4      n5      n6      n7"
                     "      n8      n9     n10\n")
             elem_block = np.column_stack((eids, part_ids, elem_nids))
-            np.savetxt(f, elem_block, fmt="%8d%8d\n" + "%8d" * 10)
+            np.savetxt(f, elem_block, fmt=f"%{w.n}d" * 2 + "\n" + f"%{w.n}d" * 10)
 
         # --- SETS (symmetry, then picked faces) -------------------------------
-        need_curve = any(s.get("pressure") is not None
-                         or s.get("force") is not None for s in face_sets)
+        need_curve = (body_load is not None
+                      or any(s.get("pressure") is not None
+                             or s.get("force") is not None for s in face_sets))
         if need_curve:
             f.write("*DEFINE_CURVE_TITLE\n")
             f.write("k_mesher unit ramp (loads are scaled via SF)\n")
             f.write("$#    lcid      sidr       sfa       sfo      offa      offo"
                     "    dattyp     lcint\n")
-            f.write(f"{curve_id:10d}{0:10d}{1.0:10.1f}{1.0:10.1f}"
-                    f"{0.0:10.1f}{0.0:10.1f}{0:10d}{0:10d}\n")
-            f.write(f"{0.0:20.10g}{0.0:20.10g}\n")
-            f.write(f"{1.0:20.10g}{1.0:20.10g}\n")
+            f.write(f"{curve_id:{w.f}d}{0:{w.f}d}{1.0:{w.f}.1f}{1.0:{w.f}.1f}"
+                    f"{0.0:{w.f}.1f}{0.0:{w.f}.1f}{0:{w.f}d}{0:{w.f}d}\n")
+            f.write(f"{0.0:{2 * w.f}.10g}{0.0:{2 * w.f}.10g}\n")
+            f.write(f"{1.0:{2 * w.f}.10g}{1.0:{2 * w.f}.10g}\n")
+
+        if body_load is not None:
+            axis, accel = body_load
+            f.write(f"*LOAD_BODY_{axis.upper()}\n")
+            f.write("$#    lcid        sf    lciddr        xc        yc"
+                    "        zc       cid\n")
+            f.write(f"{curve_id:{w.f}d}{float(accel):{w.f}.4g}\n")
 
         sid = start_sid - 1
         for s in sym_sets:
@@ -203,25 +265,25 @@ def write_k(
             set_nids = np.asarray(s["nodes"], dtype=np.int64) - 1 + start_nid
             constraint = (s.get("constraint") or "symmetric").lower()
             suffix = "" if constraint == "symmetric" else f" ({constraint})"
-            _write_node_set(f, sid, f"SYM_{s['axis'].upper()} plane at "
-                                    f"{s['offset']:g}{suffix}", set_nids)
+            _write_node_set(f, w, sid, f"SYM_{s['axis'].upper()} plane at "
+                                       f"{s['offset']:g}{suffix}", set_nids)
             if s.get("spc", True):
-                _write_spc(f, sid, _resolve_sym_dofs(s))
+                _write_spc(f, w, sid, _resolve_sym_dofs(s))
             if s.get("segset") is not None and len(s["segset"]):
                 sid += 1
                 segs = np.asarray(s["segset"], dtype=np.int64) - 1 + start_nid
-                _write_segment_set(f, sid, f"SYM_{s['axis'].upper()} plane at "
-                                           f"{s['offset']:g} segments", segs)
+                _write_segment_set(f, w, sid, f"SYM_{s['axis'].upper()} plane at "
+                                              f"{s['offset']:g} segments", segs)
 
         for s in face_sets:
             sid += 1
             if s["kind"] == "node":
                 set_nids = np.asarray(s["nodes"], dtype=np.int64) - 1 + start_nid
-                _write_node_set(f, sid, s["title"], set_nids)
+                _write_node_set(f, w, sid, s["title"], set_nids)
                 if s.get("spc_dofs"):
                     dofs = tuple(1 if str(d) in s["spc_dofs"] else 0
                                  for d in range(1, 7))
-                    _write_spc(f, sid, dofs)
+                    _write_spc(f, w, sid, dofs)
                 if s.get("force") is not None:
                     dof_name, total = s["force"]
                     dof = {"x": 1, "y": 2, "z": 3}[dof_name.lower()]
@@ -230,15 +292,16 @@ def write_k(
                             f"over {len(set_nids)} nodes -> {sf:g} per node\n")
                     f.write("*LOAD_NODE_SET\n")
                     f.write("$#    nsid       dof      lcid        sf\n")
-                    f.write(f"{sid:10d}{dof:10d}{curve_id:10d}{sf:10.4g}\n")
+                    f.write(f"{sid:{w.f}d}{dof:{w.f}d}{curve_id:{w.f}d}"
+                            f"{sf:{w.f}.4g}\n")
             else:
                 segs = np.asarray(s["segments"], dtype=np.int64) - 1 + start_nid
-                _write_segment_set(f, sid, s["title"], segs)
+                _write_segment_set(f, w, sid, s["title"], segs)
                 if s.get("pressure") is not None:
                     f.write("*LOAD_SEGMENT_SET\n")
                     f.write("$#    ssid      lcid        sf        at\n")
-                    f.write(f"{sid:10d}{curve_id:10d}"
-                            f"{float(s['pressure']):10.4g}{0.0:10.1f}\n")
+                    f.write(f"{sid:{w.f}d}{curve_id:{w.f}d}"
+                            f"{float(s['pressure']):{w.f}.4g}{0.0:{w.f}.1f}\n")
 
         # --- ELEMENT SETS (quality check failures etc.) -----------------------
         for s in elem_sets:
@@ -248,68 +311,91 @@ def write_k(
                 f.write("*SET_SOLID_TITLE\n")
                 f.write(f"{s['title'][:70]}\n")
                 f.write("$#     sid    solver\n")
-                f.write(f"{sid:10d}{'MECH':<10s}\n")
+                f.write(f"{sid:{w.f}d}{'MECH':<{w.f}s}\n")
             else:
                 f.write("*SET_SHELL_LIST_TITLE\n")
                 f.write(f"{s['title'][:70]}\n")
                 f.write("$#     sid       da1       da2       da3       da4"
                         "    solver\n")
-                f.write(f"{sid:10d}{0.0:10.1f}{0.0:10.1f}{0.0:10.1f}"
-                        f"{0.0:10.1f}{'MECH':>10s}\n")
+                f.write(f"{sid:{w.f}d}" + f"{0.0:{w.f}.1f}" * 4
+                        + f"{'MECH':>{w.f}s}\n")
             for row in range(0, len(set_eids), 8):
                 chunk = set_eids[row:row + 8]
-                f.write("".join(f"{e:10d}" for e in chunk) + "\n")
+                f.write("".join(f"{e:{w.f}d}" for e in chunk) + "\n")
 
         f.write("*END\n")
 
 
-def _write_spc(f, sid: int, dofs) -> None:
+def _write_spc(f, w: _Widths, sid: int, dofs) -> None:
     f.write("*BOUNDARY_SPC_SET\n")
     f.write("$#    nsid       cid      dofx      dofy      dofz"
             "     dofrx     dofry     dofrz\n")
-    f.write(f"{sid:10d}{0:10d}" + "".join(f"{d:10d}" for d in dofs) + "\n")
+    f.write(w.ints(sid, 0, *dofs) + "\n")
 
 
-def _write_implicit_cards(f) -> None:
+def _write_control_timestep(f, w: _Widths, tssfac: float) -> None:
+    f.write("*CONTROL_TIMESTEP\n")
+    f.write("$#  dtinit    tssfac      isdo    tslimt     dt2ms      lctm"
+            "     erode     ms1st\n")
+    f.write(f"{0.0:{w.f}.1f}{float(tssfac):{w.f}.4f}\n")
+
+
+def _write_contact(f, w: _Widths, fs: float) -> None:
+    """Single-surface contact over all parts (SSID 0). Zeros on cards 2/3
+    mean LS-DYNA defaults; only the friction coefficients are set."""
+    f.write("*CONTACT_AUTOMATIC_SINGLE_SURFACE\n")
+    f.write("$#    ssid      msid     sstyp     mstyp    sboxid    mboxid"
+            "       spr       mpr\n")
+    f.write(w.ints(0, 0, 2, 0, 0, 0, 0, 0) + "\n")
+    f.write("$#      fs        fd        dc        vc       vdc    penchk"
+            "        bt        dt\n")
+    f.write(f"{float(fs):{w.f}.4f}{float(fs):{w.f}.4f}"
+            + f"{0.0:{w.f}.1f}" * 6 + "\n")
+    f.write("$#     sfs       sfm       sst       mst      sfst      sfmt"
+            "       fsf       vsf\n")
+    f.write(f"{0.0:{w.f}.1f}" * 8 + "\n")
+
+
+def _write_implicit_cards(f, w: _Widths) -> None:
     """Minimal implicit static setup: 1.0 s of pseudo-time, auto stepping,
     nonlinear solver, d3plot output. Review before production use."""
     f.write("$ --- basic implicit static setup (review before production) ---\n")
     f.write("*CONTROL_TERMINATION\n")
     f.write("$#  endtim    endcyc     dtmin    endeng    endmas\n")
-    f.write(f"{1.0:10.1f}\n")
+    f.write(f"{1.0:{w.f}.1f}\n")
     f.write("*CONTROL_IMPLICIT_GENERAL\n")
     f.write("$#  imflag       dt0    imform      nsbs       igs     cnstn      form\n")
-    f.write(f"{1:10d}{0.1:10.2f}\n")
+    f.write(f"{1:{w.f}d}{0.1:{w.f}.2f}\n")
     f.write("*CONTROL_IMPLICIT_AUTO\n")
     f.write("$#   iauto    iteopt    itewin     dtmin     dtmax\n")
-    f.write(f"{1:10d}\n")
+    f.write(f"{1:{w.f}d}\n")
     f.write("*CONTROL_IMPLICIT_SOLUTION\n")
     f.write("$#  nsolvr    ilimit    maxref     dctol     ectol\n")
-    f.write(f"{12:10d}\n")
+    f.write(f"{12:{w.f}d}\n")
     f.write("*DATABASE_BINARY_D3PLOT\n")
     f.write("$#      dt\n")
-    f.write(f"{0.1:10.2f}\n")
+    f.write(f"{0.1:{w.f}.2f}\n")
     f.write("*DATABASE_GLSTAT\n")
     f.write("$#      dt    binary\n")
-    f.write(f"{0.01:10.3f}\n")
+    f.write(f"{0.01:{w.f}.3f}\n")
 
 
-def _write_node_set(f, sid: int, title: str, nids: np.ndarray) -> None:
+def _write_node_set(f, w: _Widths, sid: int, title: str, nids: np.ndarray) -> None:
     f.write("*SET_NODE_LIST_TITLE\n")
     f.write(f"{title[:70]}\n")
     f.write("$#     sid       da1       da2       da3       da4    solver\n")
-    f.write(f"{sid:10d}{0.0:10.1f}{0.0:10.1f}{0.0:10.1f}{0.0:10.1f}{'MECH':>10s}\n")
+    f.write(f"{sid:{w.f}d}" + f"{0.0:{w.f}.1f}" * 4 + f"{'MECH':>{w.f}s}\n")
     for row in range(0, len(nids), 8):
         chunk = nids[row:row + 8]
-        f.write("".join(f"{n:10d}" for n in chunk) + "\n")
+        f.write("".join(f"{n:{w.f}d}" for n in chunk) + "\n")
 
 
-def _write_segment_set(f, sid: int, title: str, segs: np.ndarray) -> None:
+def _write_segment_set(f, w: _Widths, sid: int, title: str, segs: np.ndarray) -> None:
     """segs: (S, 4) segment corner node ids (already offset); triangles have
     the 4th node repeated."""
     f.write("*SET_SEGMENT_TITLE\n")
     f.write(f"{title[:70]}\n")
     f.write("$#     sid       da1       da2       da3       da4    solver\n")
-    f.write(f"{sid:10d}{0.0:10.1f}{0.0:10.1f}{0.0:10.1f}{0.0:10.1f}{'MECH':>10s}\n")
+    f.write(f"{sid:{w.f}d}" + f"{0.0:{w.f}.1f}" * 4 + f"{'MECH':>{w.f}s}\n")
     f.write("$#      n1        n2        n3        n4\n")
-    np.savetxt(f, segs, fmt="%10d" * 4)
+    np.savetxt(f, segs, fmt=f"%{w.f}d" * 4)
