@@ -13,7 +13,8 @@ defeaturing (remove holes/fillets), face sets with BCs and loads
 LS-DYNA quality criteria with failed-element sets, quality-driven auto-remeshing,
 mass properties with an explicit critical-timestep estimate (plus an optional
 `*CONTROL_TIMESTEP` card), shell integrity checks, mesh-only output for
-`*INCLUDE` decks, automatic LONG=Y format when ids overflow the standard
+`*INCLUDE` decks, per-part file export (one standalone `.k` per body),
+automatic LONG=Y format when ids overflow the standard
 fields, machine-readable statistics (JSON), parameter presets and a batch
 queue.
 Meshing is done with [gmsh](https://gmsh.info) (OpenCASCADE kernel), the GUI is
@@ -64,6 +65,7 @@ python mesh_cli.py part.stp --mesh-only -o part_mesh.k   # for *INCLUDE decks
 python mesh_cli.py part.stp --mat --stats-json part_stats.json --title "bracket"
 python mesh_cli.py asm.stp --glue --mat --part-mat 2:70000:0.33:2.7e-9
 python mesh_cli.py asm.stp --contact 0.15 --tssfac 0.9 --gravity z:9810
+python mesh_cli.py asm.stp --split-parts        # + one standalone .k per body
 ```
 
 `python mesh_cli.py -h` lists all options. GUI settings are remembered
@@ -112,6 +114,13 @@ window close).
      elements and sets (no `*PART`/`*SECTION`/`*MAT`/control cards); define
      those in the master deck. Combine with the start node/element/set IDs to
      merge several meshes without ID clashes.
+   - *One .k file per body* — additionally export each body as its own
+     standalone file (`<output>_p<PID>[_<name>].k`) with compactly renumbered
+     nodes, that body's material, and the node/segment/element sets filtered
+     to the part (empty sets are dropped; contact cards are skipped since
+     contact acts between parts). Note the files are standalone, not
+     `*INCLUDE` fragments of the assembly — a face force's total is re-spread
+     over each file's own face nodes.
    - *Contact between parts* — `*CONTACT_AUTOMATIC_SINGLE_SURFACE` over all
      parts with a friction coefficient, for assemblies whose bodies are not
      glued (glued bodies share nodes and need no contact).
