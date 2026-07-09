@@ -14,6 +14,7 @@ throughout (also selectable explicitly via ``long_format=True``).
 """
 from __future__ import annotations
 
+import os
 from datetime import datetime
 
 import numpy as np
@@ -324,6 +325,108 @@ def write_k(
                 f.write("".join(f"{e:{w.f}d}" for e in chunk) + "\n")
 
         f.write("*END\n")
+
+
+def write_k_split(
+    path: str,
+    coords: np.ndarray,
+    elems: np.ndarray,
+    *,
+    part_ids: np.ndarray,              # (M,) per-element part id
+    part_titles: dict[int, str] | None = None,
+    sym_sets: tuple[dict, ...] = (),
+    face_sets: tuple[dict, ...] = (),
+    elem_sets: tuple[dict, ...] = (),
+    part_mats: dict[int, dict] | None = None,
+    contact_fs: float | None = None,   # accepted for signature parity but
+                                       # skipped - contact acts BETWEEN parts
+    title: str = "k_mesher mesh",
+    **kw,                              # remaining write_k keyword arguments
+) -> list[tuple[int, str]]:
+    """Write one standalone .k file per part: ``<path stem>_p<PID>[_<name>].k``.
+
+    Each file contains only that part's elements with the nodes it uses,
+    compactly renumbered from ``start_nid`` - the files are self-contained
+    (they do NOT combine into an assembly; use the single-file output with
+    start IDs for that). Node/segment/element sets are filtered to the part
+    and renumbered; sets that end up empty are omitted. The part's own
+    material (``part_mats`` falling back to ``mat``) is written with
+    SECID = MID = PID. Contact cards are skipped - contact acts between
+    parts. Returns [(pid, file path), ...] in part order.
+    """
+    part_ids = np.asarray(part_ids, dtype=np.int64)
+    part_titles = part_titles or {}
+    part_mats = part_mats or {}
+    base, ext = os.path.splitext(path)
+    written = []
+    for p in dict.fromkeys(int(v) for v in part_ids):
+        emask = part_ids == p
+        pelems = elems[emask]
+
+        # compact node renumbering: old 1-based id -> new 1-based id (0 = absent)
+        used = np.zeros(len(coords) + 1, dtype=bool)
+        used[pelems.ravel()] = True
+        remap = np.zeros(len(coords) + 1, dtype=np.int64)
+        remap[used] = np.arange(1, int(used.sum()) + 1)
+        pcoords = coords[used[1:]]
+        new_elems = remap[pelems]
+
+        def map_nodes(ids):
+            mapped = remap[np.asarray(ids, dtype=np.int64)]
+            return mapped[mapped > 0]
+
+        def map_segs(segs):
+            mapped = remap[np.asarray(segs, dtype=np.int64)]
+            return mapped[(mapped > 0).all(axis=1)]
+
+        psym = []
+        for s in sym_sets:
+            item = dict(s)
+            item["nodes"] = map_nodes(s["nodes"])
+            if len(item["nodes"]) == 0:
+                continue
+            if s.get("segset") is not None and len(s["segset"]):
+                segs = map_segs(s["segset"])
+                item["segset"] = segs if len(segs) else None
+            psym.append(item)
+
+        pface = []
+        for s in face_sets:
+            item = dict(s)
+            if s["kind"] == "node":
+                item["nodes"] = map_nodes(s["nodes"])
+                if len(item["nodes"]) == 0:
+                    continue
+            else:
+                item["segments"] = map_segs(s["segments"])
+                if len(item["segments"]) == 0:
+                    continue
+            pface.append(item)
+
+        # element sets hold 1-based rows into `elems`; renumber to part rows
+        row_map = np.zeros(len(elems) + 1, dtype=np.int64)
+        old_rows = np.flatnonzero(emask)
+        row_map[old_rows + 1] = np.arange(1, len(old_rows) + 1)
+        pelem_sets = []
+        for s in elem_sets:
+            eids = row_map[np.asarray(s["eids"], dtype=np.int64)]
+            eids = eids[eids > 0]
+            if len(eids):
+                pelem_sets.append({**s, "eids": eids})
+
+        name = part_titles.get(p, "")
+        safe = "".join(ch if ch.isalnum() or ch in "-_" else "_"
+                       for ch in name).strip("_")[:30]
+        ppath = f"{base}_p{p}{'_' + safe if safe else ''}{ext or '.k'}"
+        write_k(ppath, pcoords, new_elems, pid=p,
+                part_titles={p: name or f"part {p}"},
+                title=f"{title} - {name or f'part {p}'}"[:80],
+                sym_sets=tuple(psym), face_sets=tuple(pface),
+                elem_sets=tuple(pelem_sets),
+                part_mats={p: part_mats[p]} if p in part_mats else {},
+                **kw)
+        written.append((p, ppath))
+    return written
 
 
 def _write_spc(f, w: _Widths, sid: int, dofs) -> None:

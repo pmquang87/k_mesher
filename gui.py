@@ -290,6 +290,10 @@ class KMesherGUI:
         ttk.Checkbutton(dyna, text="Mesh-only output for *INCLUDE (no PART / "
                                    "SECTION / MAT / control cards)",
                         variable=self.var_mesh_only).grid(row=7, column=0, columnspan=4, sticky="w")
+        self.var_split = tk.BooleanVar(value=False)
+        ttk.Checkbutton(dyna, text="Also write one .k file per body "
+                                   "(<output>_p<PID>[_<name>].k, standalone)",
+                        variable=self.var_split).grid(row=11, column=0, columnspan=4, sticky="w")
 
         self.var_contact = tk.BooleanVar(value=False)
         ttk.Checkbutton(dyna, text="Contact between parts (*CONTACT_AUTOMATIC_"
@@ -969,6 +973,7 @@ class KMesherGUI:
             "implicit_cards": self.var_implicit.get(),
             "qa_sets": self.var_qa.get(),
             "mesh_only": self.var_mesh_only.get(),
+            "split_parts": self.var_split.get(),
             "contact_fs": contact_fs,
             "tssfac": tssfac,
             "gravity": gravity,
@@ -1119,6 +1124,23 @@ class KMesherGUI:
             contact_fs=kopts["contact_fs"], tssfac=kopts["tssfac"],
             body_load=kopts["gravity"],
         )
+        if kopts["split_parts"]:
+            split_files = dyna_writer.write_k_split(
+                out, result.coords, result.elems,
+                part_ids=part_ids, part_titles=part_titles,
+                element_kind=kopts["element_kind"], elform=kopts["elform"],
+                thickness=kopts["thickness"], start_nid=kopts["start_nid"],
+                start_eid=kopts["start_eid"], start_sid=kopts["start_sid"],
+                title=os.path.splitext(os.path.basename(out))[0],
+                comments=tuple(comments), sym_sets=tuple(sym_sets),
+                mat=kopts["mat"], part_mats=kopts["part_mats"],
+                face_sets=tuple(face_sets), elem_sets=tuple(elem_sets),
+                implicit_cards=kopts["implicit_cards"],
+                mesh_only=kopts["mesh_only"], tssfac=kopts["tssfac"],
+                body_load=kopts["gravity"],
+            )
+            for p, fpath in split_files:
+                log(f"Wrote per-part file: {fpath} (PID {p})")
         log(f"Done in {time.perf_counter() - t_start:.1f} s. "
             f"{result.stats['n_nodes']} nodes / "
             f"{result.stats['n_elems']} {settings.element_type} "
@@ -1153,7 +1175,7 @@ class KMesherGUI:
             "preview": self.var_preview,
             "face_nodes": self.var_face_nodes, "face_segs": self.var_face_segs,
             "implicit": self.var_implicit, "qa": self.var_qa,
-            "mesh_only": self.var_mesh_only,
+            "mesh_only": self.var_mesh_only, "split": self.var_split,
             "contact": self.var_contact, "contact_fs": self.var_contact_fs,
             "ctrl_dt": self.var_ctrl_dt, "tssfac": self.var_tssfac,
             "grav": self.var_grav, "grav_axis": self.var_grav_axis,

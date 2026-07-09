@@ -294,6 +294,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--long-format", action="store_true",
                    help="write LONG=Y keyword format (20-char fields); "
                         "enabled automatically when ids exceed 8 characters")
+    p.add_argument("--split-parts", action="store_true",
+                   help="additionally write one standalone .k per body "
+                        "(<output>_p<PID>[_<name>].k) with that body's "
+                        "elements, nodes and material; sets are filtered per "
+                        "part, contact cards are skipped, and a face force's "
+                        "total is re-spread over each file's own face nodes")
     p.add_argument("--preview", action="store_true",
                    help="open the Gmsh viewer on the result")
     return p
@@ -451,6 +457,25 @@ def main(argv=None) -> int:
     )
     print(f"Wrote {out}")
 
+    split_files = []
+    if args.split_parts:
+        split_files = dyna_writer.write_k_split(
+            out, result.coords, result.elems,
+            part_ids=part_ids, part_titles=part_titles,
+            element_kind="shell" if is_shell else "solid",
+            elform=elform, thickness=args.thickness,
+            start_nid=args.start_nid, start_eid=args.start_eid,
+            start_sid=args.start_sid,
+            title=args.title or os.path.splitext(os.path.basename(out))[0],
+            comments=tuple(comments), sym_sets=tuple(sym_sets), mat=args.mat,
+            part_mats=part_mats, face_sets=tuple(face_sets),
+            elem_sets=tuple(elem_sets), implicit_cards=args.implicit_cards,
+            mesh_only=args.mesh_only, tssfac=args.tssfac,
+            body_load=args.gravity, long_format=args.long_format,
+        )
+        for p, f in split_files:
+            print(f"Wrote {f} (PID {p})")
+
     if args.stats_json:
         payload = {
             "input": args.input, "output": out,
@@ -459,6 +484,7 @@ def main(argv=None) -> int:
             "mass": mass, "part_masses": part_masses,
             "critical_timestep": dt_est,
             "material": args.mat, "part_materials": part_mats,
+            "split_files": {p: f for p, f in split_files},
             "stats": result.stats,
         }
         with open(args.stats_json, "w") as f:

@@ -784,6 +784,57 @@ def test_part_mats_and_contact_cards():
     print("OK: per-part MIDs/MAT cards, contact card, missing-MAT note")
 
 
+def test_split_parts():
+    print("=== per-part .k files (write_k_split) ===")
+    res = res_two_glued()
+    k = os.path.join(OUT_DIR, "split.k")
+    all_nodes = np.arange(1, res.stats["n_nodes"] + 1)
+    files = dyna_writer.write_k_split(
+        k, res.coords, res.elems, part_ids=10 + res.elem_parts,
+        part_titles={10: "left box", 11: "right box"},
+        mat=dict(STEEL), part_mats={11: dict(ALU)}, contact_fs=0.5,
+        face_sets=({"kind": "node", "title": "ALL", "nodes": all_nodes},),
+        elem_sets=({"title": "QA", "eids": np.arange(1, len(res.elems) + 1)},))
+    assert [p for p, _ in files] == [10, 11]
+    paths = dict(files)
+    assert paths[10].endswith("split_p10_left_box.k")
+    assert paths[11].endswith("split_p11_right_box.k")
+
+    n_nodes_sum = n_elems_sum = vol_sum = 0.0
+    for p, fpath in files:
+        nodes, elems, _, kws = parse_k(fpath)
+        assert part_cards(fpath) == [(p, p, p)], "standalone PART/SECID/MID"
+        assert kws.count("*PART") == 1 and kws.count("*MAT_ELASTIC") == 1
+        assert "*CONTACT_AUTOMATIC_SINGLE_SURFACE" not in kws, \
+            "contact acts between parts and must be skipped"
+        assert mat_mids(fpath) == [p]
+        v = tet_volumes(nodes, elems)
+        assert (v > 0).all()
+        # node ids must be compact 1..N
+        assert min(nodes) == 1 and max(nodes) == len(nodes)
+        # the filtered ALL-nodes set must match this file's node count
+        lines = open(fpath).read().splitlines()
+        i = next(j for j, ln in enumerate(lines)
+                 if ln.startswith("*SET_NODE_LIST_TITLE"))
+        set_ids = []
+        for ln in lines[i + 4:]:
+            if ln.startswith("*") or ln.startswith("$"):
+                break
+            set_ids += [int(ln[c:c + 10]) for c in range(0, len(ln.rstrip()), 10)]
+        assert len(set_ids) == len(nodes)
+        n_nodes_sum += len(nodes)
+        n_elems_sum += len(elems)
+        vol_sum += v.sum()
+    # every element exactly once; interface nodes duplicated across the files
+    assert n_elems_sum == res.stats["n_elems"]
+    assert n_nodes_sum > res.stats["n_nodes"]
+    assert abs(vol_sum - res.stats["measure"]) / res.stats["measure"] < 1e-9
+    # material routing: alu E in the p11 file only
+    assert "7e+04" in open(paths[11]).read()
+    assert "7e+04" not in open(paths[10]).read()
+    print(f"OK: {len(files)} standalone files, volumes/elements add up")
+
+
 def test_control_timestep_and_gravity_cards():
     print("=== *CONTROL_TIMESTEP + *LOAD_BODY (gravity) ===")
     res = res_full()
@@ -872,7 +923,8 @@ def test_cli_assembly_options():
     rc = mesh_cli.main([STEP2, "-o", k_cli, "--size-max", "6", "--glue",
                         "--mat", "--part-mat", "2:70000:0.33:2.7e-9",
                         "--contact", "0.15", "--tssfac", "0.9",
-                        "--gravity", "z:9810", "--stats-json", js_cli])
+                        "--gravity", "z:9810", "--split-parts",
+                        "--stats-json", js_cli])
     assert rc == 0
     _, _, _, kws = parse_k(k_cli)
     assert "*CONTACT_AUTOMATIC_SINGLE_SURFACE" in kws
@@ -884,7 +936,16 @@ def test_cli_assembly_options():
         payload = json.load(f)
     assert len(payload["part_masses"]) == 2
     assert payload["mass"] > 0 and payload["critical_timestep"] > 0
-    print("OK: assembly cards + per-part masses in the stats JSON")
+    # --split-parts: one standalone file per body, listed in the JSON
+    assert len(payload["split_files"]) == 2
+    for p, fpath in payload["split_files"].items():
+        assert os.path.isfile(fpath)
+        _, _, _, pkws = parse_k(fpath)
+        assert pkws.count("*PART") == 1
+        assert "*CONTACT_AUTOMATIC_SINGLE_SURFACE" not in pkws
+        assert "*CONTROL_TIMESTEP" in pkws, "control cards carry over"
+        assert part_cards(fpath) == [(int(p),) * 3]
+    print("OK: assembly cards, per-part masses, split files written")
 
 
 def main():
