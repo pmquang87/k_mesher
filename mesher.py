@@ -180,7 +180,8 @@ def mesh_step(settings: MeshSettings, log=print, preview_path: str | None = None
             coords, settings.symmetry, sym_nodes, tag_map, settings.element_type)
         face_nodes, face_segs = _collect_face_data(
             settings.collect_faces, tag_map, settings.element_type, log)
-        stats = _collect_stats(coords, elems, settings.element_type, bbox)
+        stats = _collect_stats(coords, elems, settings.element_type, bbox,
+                               elem_parts)
         stats.update(shell_checks)
         stats["duplicate_nodes"] = _count_duplicate_nodes(coords)
         _log_stats(stats, sym_nodes, log)
@@ -314,7 +315,7 @@ def _load_geometry(settings: MeshSettings, log):
     log(f"Importing {fmt}: {settings.step_file}")
     try:
         gmsh.model.occ.importShapes(settings.step_file)
-    except Exception as e:
+    except Exception:
         # Some formats (notably IGES) reject the OpenCASCADE target-unit
         # override; retry once in the file's own units so the import succeeds.
         if settings.occ_unit:
@@ -524,6 +525,22 @@ def _tessellation_to_solid(settings: MeshSettings, fmt: str,
         t0 = time.perf_counter()
         gmsh.model.mesh.setOrder(2)
         log(f"  second order (TET10): {time.perf_counter() - t0:.1f} s")
+        _fix_curved_elements(log)
+
+
+def _fix_curved_elements(log) -> None:
+    """After setOrder(2): detect inverted curved elements and run the
+    high-order optimizer on them (shared by the CAD and tessellation paths)."""
+    try:
+        etags, _ = gmsh.model.mesh.getElementsByType(TET_TYPE[2][0])
+        q = np.asarray(gmsh.model.mesh.getElementQualities(etags, "minSICN"))
+        n_bad = int((q < 0).sum())
+        if n_bad:
+            log(f"  {n_bad} invalid curved elements - running high-order "
+                f"optimizer ...")
+            gmsh.model.mesh.optimize("HighOrderFastCurving")
+    except Exception as e:
+        log(f"  high-order check skipped: {e}")
 
 
 def _defeature(face_tags: list[int], log) -> None:
@@ -705,16 +722,7 @@ def _generate_mesh(settings: MeshSettings, log) -> None:
         t0 = time.perf_counter()
         gmsh.model.mesh.setOrder(2)
         log(f"  second order (TET10): {time.perf_counter() - t0:.1f} s")
-        try:
-            etags, _ = gmsh.model.mesh.getElementsByType(TET_TYPE[2][0])
-            q = np.asarray(gmsh.model.mesh.getElementQualities(etags, "minSICN"))
-            n_bad = int((q < 0).sum())
-            if n_bad:
-                log(f"  {n_bad} invalid curved elements - running high-order "
-                    f"optimizer ...")
-                gmsh.model.mesh.optimize("HighOrderFastCurving")
-        except Exception as e:
-            log(f"  high-order check skipped: {e}")
+        _fix_curved_elements(log)
     log("Mesh generation finished")
 
 
@@ -993,7 +1001,8 @@ def _poly_angles(p: np.ndarray) -> np.ndarray:
 
 def _quality_criteria(coords, elems, element_type, sicn):
     """Evaluate LS-DYNA-style quality criteria.
-    Returns (criteria list, failed element row indices)."""
+    Returns (criteria list, failed element row indices, per-element
+    timestep-critical characteristic lengths)."""
     family = ETYPES[element_type]["family"]
     limits = QUALITY_LIMITS[family]
     crit, fail_masks = [], []
@@ -1029,8 +1038,8 @@ def _quality_criteria(coords, elems, element_type, sicn):
             np.cross(p[:, b] - p[:, a], p[:, c] - p[:, a]), axis=1)
             for a, b, c in faces], axis=1)
         # min altitude = timestep-critical characteristic length for tets
-        add("min altitude (dt)", 3.0 * v / np.maximum(fa.max(1), 1e-300),
-            info_only=True)
+        char_len = 3.0 * v / np.maximum(fa.max(1), 1e-300)
+        add("min altitude (dt)", char_len, info_only=True)
         add("min edge", el.min(1), info_only=True)
     else:
         p = coords[elems - 1]                     # (M, 4, 3)
@@ -1053,13 +1062,22 @@ def _quality_criteria(coords, elems, element_type, sicn):
         ang4 = _poly_angles(p)
         ang_min = np.where(is_tri, _poly_angles(p[:, :3]).min(1), ang4.min(1))
         add("min angle [deg]", ang_min)
+        # LS-DYNA shell characteristic length: (1+beta) * area / longest edge
+        # with beta = 0 for quads and 1 for triangles
+        a1 = 0.5 * np.linalg.norm(
+            np.cross(p[:, 1] - p[:, 0], p[:, 2] - p[:, 0]), axis=1)
+        a2 = 0.5 * np.linalg.norm(
+            np.cross(p[:, 2] - p[:, 0], p[:, 3] - p[:, 0]), axis=1)
+        char_len = ((1.0 + is_tri) * (a1 + a2)
+                    / np.maximum(el4.max(1), 1e-300))
+        add("char length (dt)", char_len, info_only=True)
         add("min edge", emin, info_only=True)
 
     if fail_masks:
         failed = np.flatnonzero(np.logical_or.reduce(fail_masks))
     else:
         failed = np.zeros(0, dtype=np.int64)
-    return crit, failed
+    return crit, failed, char_len
 
 
 def _mass_properties(coords, elems, element_type):
@@ -1119,8 +1137,54 @@ def critical_timestep(stats: dict, element_type: str, mat: dict) -> float | None
     return float(lc) / c
 
 
+def mass_and_timestep(result: MeshResult, element_type: str,
+                      mat: dict | None, part_mats: dict[int, dict] | None,
+                      pid0: int, thickness_scale: float = 1.0, log=print):
+    """Log and return (total mass, per-part masses {pid: mass}, dt estimate).
+
+    Per-part materials override the global ``mat``; if any part ends up with
+    no material the total mass is unknown (None). The timestep estimate is
+    conservative: the global minimum characteristic length combined with the
+    stiffest (fastest) material. ``thickness_scale`` is the shell thickness
+    for shells, 1.0 for solids."""
+    part_mats = part_mats or {}
+    stats = result.stats
+    pm = stats.get("part_measures") or [stats.get("measure", 0.0)]
+    masses, total, have_all = {}, 0.0, True
+    for i, meas in enumerate(pm):
+        p = pid0 + i
+        m = part_mats.get(p, mat)
+        if not m:
+            have_all = False
+            continue
+        masses[p] = m["ro"] * thickness_scale * meas
+        total += masses[p]
+    mass = total if (have_all and masses) else None
+    if part_mats and len(pm) > 1:
+        for p in sorted(masses):
+            log(f"  PID {p} mass: {masses[p]:.6g}")
+    if mass is not None:
+        c = stats.get("cog", (0, 0, 0))
+        log(f"Mass: {mass:.6g}   COG: ({c[0]:.4g}, {c[1]:.4g}, {c[2]:.4g})")
+    mats = list(part_mats.values()) + ([mat] if mat else [])
+    dts = [critical_timestep(stats, element_type, m) for m in mats]
+    dts = [d for d in dts if d]
+    dt_est = min(dts) if dts else None
+    if dt_est:
+        log(f"Estimated explicit critical timestep: {dt_est:.4g} "
+            f"(dt = Lc/c, model time units, no TSSFAC)")
+        pct = stats.get("char_length_pctiles")
+        lc = stats.get("char_length")
+        if pct and lc:
+            log(f"  dt distribution: 1% of elements below "
+                f"{dt_est * pct['p1'] / lc:.4g}, 10% below "
+                f"{dt_est * pct['p10'] / lc:.4g}, median "
+                f"{dt_est * pct['p50'] / lc:.4g} (mass-scaling guide)")
+    return mass, masses, dt_est
+
+
 def _collect_stats(coords: np.ndarray, elems: np.ndarray, element_type: str,
-                   bbox) -> dict:
+                   bbox, elem_parts: np.ndarray | None = None) -> dict:
     family = ETYPES[element_type]["family"]
     p = coords[elems[:, :4] - 1]
     if family == "solid":
@@ -1147,6 +1211,10 @@ def _collect_stats(coords: np.ndarray, elems: np.ndarray, element_type: str,
         "measure_label": label,
         "bbox": tuple(bbox),
     }
+    if elem_parts is not None and len(elem_parts):
+        stats["part_measures"] = [
+            float(measure[elem_parts == i].sum())
+            for i in range(int(elem_parts.max()) + 1)]
 
     cog, inertia = _mass_properties(coords, elems, element_type)
     stats["cog"] = tuple(float(x) for x in cog)
@@ -1169,14 +1237,18 @@ def _collect_stats(coords: np.ndarray, elems: np.ndarray, element_type: str,
         pass
 
     try:
-        crit, failed = _quality_criteria(coords, elems, element_type, q)
+        crit, failed, char_len = _quality_criteria(coords, elems,
+                                                   element_type, q)
         stats["criteria"] = crit
         stats["failed_elems"] = failed        # 0-based element rows
-        # timestep-critical characteristic length of the worst element
-        lc_name = "min altitude (dt)" if family == "solid" else "min edge"
-        for cr in crit:
-            if cr["name"] == lc_name:
-                stats["char_length"] = cr["worst"]
+        # timestep-critical characteristic lengths: worst element and the
+        # distribution (a mass-scaling guide - how localized is the worst?)
+        stats["char_length"] = float(char_len.min())
+        stats["char_length_pctiles"] = {
+            "p1": float(np.percentile(char_len, 1)),
+            "p10": float(np.percentile(char_len, 10)),
+            "p50": float(np.percentile(char_len, 50)),
+        }
     except Exception:
         pass
 
@@ -1239,3 +1311,7 @@ def _log_stats(stats: dict, sym_nodes: dict, log) -> None:
             "offending faces (defeature) or fixing the CAD is the best remedy.")
     for axis, ids in sym_nodes.items():
         log(f"Nodes on {axis.upper()}-symmetry plane: {len(ids)}")
+        if len(ids) == 0:
+            log(f"WARNING: no nodes found on the {axis.upper()}-symmetry "
+                f"plane - the node set (and any SPC referencing it) will be "
+                f"empty. Check the plane position.")

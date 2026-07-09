@@ -1,7 +1,10 @@
-"""Headless end-to-end test: STEP -> TET4/TET10/TRI3/QUAD4 -> .k
+"""Headless end-to-end tests: STEP/IGES/BREP/STL -> TET4/TET10/TRI3/QUAD4 -> .k
 
-Run:  python tests/test_headless.py
+Run with pytest (pytest tests/test_headless.py -v) or directly
+(python tests/test_headless.py). Expensive meshes are cached in-process and
+shared between test functions, so the file stays fast either way.
 """
+import json
 import os
 import sys
 
@@ -12,11 +15,97 @@ sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "examples"))
 
 import dyna_writer
+import mesh_cli
 import mesher
 from make_test_step import make, make_two_bodies, make_shell, make_formats
 
-QUIET = lambda m: None
+EX = os.path.join(ROOT, "examples")
+OUT_DIR = os.path.join(ROOT, "tests", "out")
+STEP = os.path.join(EX, "test_part.step")
+STEP2 = os.path.join(EX, "test_two_bodies.step")
+STEP_SH = os.path.join(EX, "test_shell.step")
+FORMAT_BASE = os.path.join(EX, "test_part")
 
+STEEL = {"e": 210000.0, "pr": 0.3, "ro": 7.85e-9}
+ALU = {"e": 70000.0, "pr": 0.33, "ro": 2.7e-9}
+
+_cache: dict = {}
+
+
+def QUIET(_msg):
+    pass
+
+
+# --------------------------------------------------------------------------
+# shared fixtures (plain functions with an in-process cache, so the file
+# also runs without pytest)
+# --------------------------------------------------------------------------
+
+def _ensure_geometry():
+    os.makedirs(OUT_DIR, exist_ok=True)
+    if not os.path.isfile(STEP):
+        make(STEP)
+    if not os.path.isfile(STEP2):
+        make_two_bodies(STEP2)
+    if not os.path.isfile(STEP_SH):
+        make_shell(STEP_SH)
+
+
+def _cached(key, factory):
+    if key not in _cache:
+        _ensure_geometry()
+        _cache[key] = factory()
+    return _cache[key]
+
+
+def _mesh(key, **kw):
+    return _cached(key, lambda: mesher.mesh_step(
+        mesher.MeshSettings(**kw), log=QUIET))
+
+
+def res_full():
+    return _mesh("full", step_file=STEP, size_max=8.0, size_min=2.0)
+
+
+def res_half_x():
+    return _mesh("half_x", step_file=STEP, size_max=8.0, size_min=2.0,
+                 symmetry=[mesher.SymmetryPlane("x", 0.0, "+")])
+
+
+def res_coarse():
+    return _mesh("coarse", step_file=STEP, size_max=8.0)
+
+
+def res_shell_tri3():
+    return _mesh("shell_tri3", step_file=STEP_SH, element_type="TRI3",
+                 size_max=5.0)
+
+
+def res_two_glued():
+    return _mesh("two_glued", step_file=STEP2, size_max=6.0, glue=True)
+
+
+def faces_step():
+    return _cached("faces", lambda: mesher.list_faces(
+        mesher.MeshSettings(step_file=STEP), log=QUIET))
+
+
+def xmax_tag():
+    """The x = +50 face of the test part (area 1250)."""
+    return next(f["tag"] for f in faces_step()
+                if abs(f["centroid"][0] - 50.0) < 1e-3
+                and abs(f["area"] - 1250.0) < 1.0)
+
+
+def res_xmax_face():
+    return _cached("xmax_face", lambda: mesher.mesh_step(mesher.MeshSettings(
+        step_file=STEP, size_max=8.0, size_min=2.0,
+        collect_faces=[xmax_tag()]), log=QUIET))
+
+
+# --------------------------------------------------------------------------
+# .k parsing helpers
+# --------------------------------------------------------------------------
 
 def spc_dofs(text):
     """Return the 6 DOF flags [dofx..dofrz] of the first *BOUNDARY_SPC_SET."""
@@ -31,7 +120,8 @@ def spc_dofs(text):
 
 def parse_k(path):
     """Minimal .k reader: *NODE, *ELEMENT_SOLID (one- and two-line formats)
-    and *ELEMENT_SHELL. Returns (nodes {nid: xyz}, elems, shells, keywords)."""
+    and *ELEMENT_SHELL. Returns (nodes {nid: xyz}, elems, shells, keywords).
+    Standard (8/16-char) format only - long-format tests parse manually."""
     nodes, elems, shells, keywords = {}, [], [], []
     section = None
     pending = None  # (eid, pid) awaiting the node line (two-line format)
@@ -65,6 +155,24 @@ def parse_k(path):
     return nodes, elems, shells, keywords
 
 
+def part_cards(path):
+    """[(pid, secid, mid)] from the *PART cards of a standard-format file."""
+    lines = open(path).read().splitlines()
+    out = []
+    for i, ln in enumerate(lines):
+        if ln.strip().upper() == "*PART":
+            vals = lines[i + 3]
+            out.append((int(vals[0:10]), int(vals[10:20]), int(vals[20:30])))
+    return out
+
+
+def mat_mids(path):
+    """MIDs of all *MAT_ELASTIC cards in a standard-format file."""
+    lines = open(path).read().splitlines()
+    return sorted(int(lines[i + 2][0:10]) for i, ln in enumerate(lines)
+                  if ln.strip().upper() == "*MAT_ELASTIC")
+
+
 def tet_volumes(nodes, elems):
     v = []
     for e in elems:
@@ -82,25 +190,13 @@ def shell_areas(nodes, shells):
     return np.array(a)
 
 
-def main():
-    ex = os.path.join(ROOT, "examples")
-    step = os.path.join(ex, "test_part.step")
-    step2 = os.path.join(ex, "test_two_bodies.step")
-    step_sh = os.path.join(ex, "test_shell.step")
-    if not os.path.isfile(step):
-        make(step)
-    if not os.path.isfile(step2):
-        make_two_bodies(step2)
-    if not os.path.isfile(step_sh):
-        make_shell(step_sh)
+# --------------------------------------------------------------------------
+# tests
+# --------------------------------------------------------------------------
 
-    out_dir = os.path.join(ROOT, "tests", "out")
-    os.makedirs(out_dir, exist_ok=True)
-
-    # ---- 1. full model, TET4 ------------------------------------------------
+def test_full_tet4():
     print("=== full model (TET4) ===")
-    settings = mesher.MeshSettings(step_file=step, size_max=8.0, size_min=2.0)
-    res = mesher.mesh_step(settings, log=QUIET)
+    res = res_full()
     assert res.stats["n_elems"] > 100
     # part volume: 100*50*25 - pi*10^2*25 = 117146
     assert abs(res.stats["measure"] - 117146.0) / 117146.0 < 0.02
@@ -114,8 +210,12 @@ def main():
     assert all(abs(v) < 0.5 for v in cog), f"COG should be ~origin: {cog}"
     inertia = np.array(res.stats["inertia_unit_density"])
     assert (np.diag(inertia) > 0).all() and np.allclose(inertia, inertia.T)
+    # characteristic length statistics for the timestep estimate
+    assert 0 < res.stats["char_length"] <= res.stats["char_length_pctiles"]["p1"]
+    pct = res.stats["char_length_pctiles"]
+    assert pct["p1"] <= pct["p10"] <= pct["p50"]
 
-    k_full = os.path.join(out_dir, "full.k")
+    k_full = os.path.join(OUT_DIR, "full.k")
     dyna_writer.write_k(k_full, res.coords, res.elems)
     nodes, elems, _, keywords = parse_k(k_full)
     assert len(nodes) == res.stats["n_nodes"]
@@ -124,22 +224,20 @@ def main():
     assert (tet_volumes(nodes, elems) > 0).all()
     print(f"OK: {len(nodes)} nodes, {len(elems)} tets")
 
-    # ---- 2. half model, X symmetry, with sets and start IDs -----------------
+
+def test_half_model_symmetry_sets_ids():
     print("=== half model (X symmetry, keep +) ===")
-    settings = mesher.MeshSettings(
-        step_file=step, size_max=8.0, size_min=2.0,
-        symmetry=[mesher.SymmetryPlane(axis="x", offset=0.0, keep="+")])
-    res = mesher.mesh_step(settings, log=QUIET)
+    res = res_half_x()
     assert res.coords[:, 0].min() >= -1e-6
     assert abs(res.stats["measure"] - 117146.0 / 2) / (117146.0 / 2) < 0.02
     n_sym = len(res.sym_nodes["x"])
     assert n_sym > 10
 
-    k_half = os.path.join(out_dir, "half_x.k")
-    sym_sets = ({"axis": "x", "offset": 0.0, "nodes": res.sym_nodes["x"], "spc": True},)
+    k_half = os.path.join(OUT_DIR, "half_x.k")
+    sym_sets = ({"axis": "x", "offset": 0.0, "nodes": res.sym_nodes["x"],
+                 "spc": True},)
     dyna_writer.write_k(k_half, res.coords, res.elems, sym_sets=sym_sets,
-                        start_nid=1000, start_eid=5000,
-                        mat={"e": 210000.0, "pr": 0.3, "ro": 7.85e-9})
+                        start_nid=1000, start_eid=5000, mat=dict(STEEL))
     nodes, elems, _, keywords = parse_k(k_half)
     assert min(nodes) == 1000 and elems[0][0] == 5000
     assert "*SET_NODE_LIST_TITLE" in keywords
@@ -150,24 +248,24 @@ def main():
     assert all(abs(nodes[nid][0]) < 1e-6 for nid in sym_nids)
     print(f"OK: {len(nodes)} nodes, {n_sym} in SYM_X set, MAT card present")
 
-    # ---- 3. quarter model ----------------------------------------------------
+
+def test_quarter_model():
     print("=== quarter model (X keep +, Y keep -) ===")
-    settings = mesher.MeshSettings(
-        step_file=step, size_max=8.0, size_min=2.0,
+    res = mesher.mesh_step(mesher.MeshSettings(
+        step_file=STEP, size_max=8.0, size_min=2.0,
         symmetry=[mesher.SymmetryPlane("x", 0.0, "+"),
-                  mesher.SymmetryPlane("y", 0.0, "-")])
-    res = mesher.mesh_step(settings, log=QUIET)
+                  mesher.SymmetryPlane("y", 0.0, "-")]), log=QUIET)
     assert res.coords[:, 0].min() >= -1e-6
     assert res.coords[:, 1].max() <= 1e-6
     assert abs(res.stats["measure"] - 117146.0 / 4) / (117146.0 / 4) < 0.02
     print(f"OK: volume {res.stats['measure']:.0f}")
 
-    # ---- 4. TET10 -------------------------------------------------------------
+
+def test_tet10():
     print("=== TET10 half model ===")
-    settings = mesher.MeshSettings(
-        step_file=step, element_type="TET10", size_max=8.0, size_min=2.0,
-        symmetry=[mesher.SymmetryPlane("x", 0.0, "+")])
-    res = mesher.mesh_step(settings, log=QUIET)
+    res = mesher.mesh_step(mesher.MeshSettings(
+        step_file=STEP, element_type="TET10", size_max=8.0, size_min=2.0,
+        symmetry=[mesher.SymmetryPlane("x", 0.0, "+")]), log=QUIET)
     assert res.elems.shape[1] == 10
     assert abs(res.stats["measure"] - 117146.0 / 2) / (117146.0 / 2) < 0.02
     # mid-edge nodes must sit near the midpoint of their corner pair
@@ -182,7 +280,7 @@ def main():
     on_plane = np.flatnonzero(np.abs(res.coords[:, 0]) < 1e-6) + 1
     assert set(on_plane.tolist()) == sym_ids
 
-    k_t10 = os.path.join(out_dir, "half_x_tet10.k")
+    k_t10 = os.path.join(OUT_DIR, "half_x_tet10.k")
     dyna_writer.write_k(k_t10, res.coords, res.elems, elform=16)
     nodes, elems, _, keywords = parse_k(k_t10)
     assert len(elems) == res.stats["n_elems"]
@@ -190,42 +288,41 @@ def main():
     assert (tet_volumes(nodes, elems) > 0).all()
     print(f"OK: {res.stats['n_elems']} TET10, two-line format, mid nodes verified")
 
-    # ---- 5. two bodies, glued -> two PIDs -------------------------------------
+
+def test_two_bodies_glue_pids():
     print("=== two bodies, glue, per-body PIDs ===")
-    settings = mesher.MeshSettings(step_file=step2, size_max=6.0, glue=True)
-    res = mesher.mesh_step(settings, log=QUIET)
+    res = res_two_glued()
     assert len(res.part_names) == 2
     assert set(np.unique(res.elem_parts)) == {0, 1}
     assert abs(res.stats["measure"] - 16000.0) / 16000.0 < 0.01
+    # per-part measures back the per-part mass reporting
+    pm = res.stats["part_measures"]
+    assert len(pm) == 2 and abs(sum(pm) - res.stats["measure"]) < 1e-6
+    assert all(abs(v - 8000.0) / 8000.0 < 0.01 for v in pm)
     iface = res.coords[np.abs(res.coords[:, 0] - 20.0) < 1e-6]
     assert len(iface) == len(np.unique(np.round(iface, 6), axis=0))
 
-    k_two = os.path.join(out_dir, "two_bodies.k")
+    k_two = os.path.join(OUT_DIR, "two_bodies.k")
     dyna_writer.write_k(k_two, res.coords, res.elems, pid=10,
                         part_ids=10 + res.elem_parts,
                         part_titles={10: "left box", 11: "right box"})
     nodes, elems, _, keywords = parse_k(k_two)
     assert keywords.count("*PART") == 2
     assert set(e[1] for e in elems) == {10, 11}
-    print("OK: 2 PIDs, shared interface nodes")
+    print("OK: 2 PIDs, shared interface nodes, per-part measures")
 
-    # ---- 6. face sets ----------------------------------------------------------
+
+def test_face_sets():
     print("=== face sets (node + segment) ===")
-    faces = mesher.list_faces(mesher.MeshSettings(step_file=step), log=QUIET)
-    assert len(faces) >= 7
-    xmax_face = next(f for f in faces
-                     if abs(f["centroid"][0] - 50.0) < 1e-3
-                     and abs(f["area"] - 1250.0) < 1.0)
-    tag = xmax_face["tag"]
-    settings = mesher.MeshSettings(step_file=step, size_max=8.0, size_min=2.0,
-                                   collect_faces=[tag])
-    res = mesher.mesh_step(settings, log=QUIET)
+    assert len(faces_step()) >= 7
+    tag = xmax_tag()
+    res = res_xmax_face()
     fn, fs = res.face_nodes[tag], res.face_segs[tag]
     assert len(fn) > 5 and len(fs) > 5 and fs.shape[1] == 4
     assert np.allclose(res.coords[fn - 1][:, 0], 50.0, atol=1e-6)
     assert set(fs.ravel().tolist()) <= set(fn.tolist())
 
-    k_face = os.path.join(out_dir, "face_sets.k")
+    k_face = os.path.join(OUT_DIR, "face_sets.k")
     dyna_writer.write_k(k_face, res.coords, res.elems, face_sets=(
         {"kind": "node", "title": f"FACE_{tag}", "nodes": fn},
         {"kind": "segment", "title": f"FACE_{tag}", "segments": fs},
@@ -235,12 +332,11 @@ def main():
     assert "*SET_SEGMENT_TITLE" in keywords
     print(f"OK: face {tag}: {len(fn)} nodes, {len(fs)} segments")
 
-    # ---- 7. local refinement ---------------------------------------------------
+
+def test_refinement_sphere():
     print("=== local refinement (sphere) ===")
-    res_base = mesher.mesh_step(
-        mesher.MeshSettings(step_file=step, size_max=8.0), log=QUIET)
     res_ref = mesher.mesh_step(mesher.MeshSettings(
-        step_file=step, size_max=8.0,
+        step_file=STEP, size_max=8.0,
         refinements=[{"kind": "sphere", "params": [40.0, 0.0, 0.0, 15.0],
                       "size": 2.0}]), log=QUIET)
 
@@ -248,15 +344,14 @@ def main():
         d = np.linalg.norm(res.coords - np.array([40.0, 0.0, 0.0]), axis=1)
         return int((d < 15.0).sum())
 
-    n_base, n_ref = nodes_in_sphere(res_base), nodes_in_sphere(res_ref)
+    n_base, n_ref = nodes_in_sphere(res_coarse()), nodes_in_sphere(res_ref)
     assert n_ref > 3 * n_base
     print(f"OK: nodes inside sphere {n_base} -> {n_ref}")
 
-    # ---- 8. TRI3 shells on a surface-only model --------------------------------
+
+def test_tri3_shells():
     print("=== TRI3 shells (surface-only STEP) ===")
-    settings = mesher.MeshSettings(step_file=step_sh, element_type="TRI3",
-                                   size_max=5.0)
-    res = mesher.mesh_step(settings, log=QUIET)
+    res = res_shell_tri3()
     assert res.elems.shape[1] == 4
     assert (res.elems[:, 2] == res.elems[:, 3]).all(), "TRI3 must be degenerate quads"
     assert res.stats["measure_label"] == "area"
@@ -264,7 +359,7 @@ def main():
     assert res.stats["free_edges"] == 0, "closed box shell must be watertight"
     assert res.stats["nonmanifold_edges"] == 0
 
-    k_tri = os.path.join(out_dir, "shell_tri3.k")
+    k_tri = os.path.join(OUT_DIR, "shell_tri3.k")
     dyna_writer.write_k(k_tri, res.coords, res.elems, element_kind="shell",
                         elform=4, thickness=1.5)
     nodes, elems, shells, keywords = parse_k(k_tri)
@@ -277,47 +372,45 @@ def main():
     assert "       1.5       1.5       1.5       1.5" in content, "thickness card"
     print(f"OK: {len(shells)} TRI3 shells, area 6200, thickness card written")
 
-    # ---- 9. TRI3 shells with symmetry -------------------------------------------
+
+def test_tri3_shells_symmetry():
     print("=== TRI3 shells with X symmetry ===")
-    settings = mesher.MeshSettings(
-        step_file=step_sh, element_type="TRI3", size_max=5.0,
-        symmetry=[mesher.SymmetryPlane("x", 25.0, "-")])
-    res = mesher.mesh_step(settings, log=QUIET)
+    res = mesher.mesh_step(mesher.MeshSettings(
+        step_file=STEP_SH, element_type="TRI3", size_max=5.0,
+        symmetry=[mesher.SymmetryPlane("x", 25.0, "-")]), log=QUIET)
     assert res.coords[:, 0].max() <= 25.0 + 1e-6
     # remaining area: x=0 face 600 + halves of the four side faces = 3100
     assert abs(res.stats["measure"] - 3100.0) / 3100.0 < 0.02
     assert len(res.sym_nodes["x"]) > 5
     assert res.stats["free_edges"] > 0, "cut shell must have free edges"
     print(f"OK: area {res.stats['measure']:.0f}, "
-          f"{len(res.sym_nodes['x'])} nodes on the cut plane, "
-          f"{res.stats['free_edges']} free edges")
+          f"{len(res.sym_nodes['x'])} nodes on the cut plane")
 
-    # ---- 10. QUAD4 shells on a solid's boundary ---------------------------------
+
+def test_quad4_shells():
     print("=== QUAD4 shells (quad-dominant, solid boundary) ===")
-    settings = mesher.MeshSettings(step_file=step, element_type="QUAD4",
-                                   size_max=6.0)
-    res = mesher.mesh_step(settings, log=QUIET)
+    res = mesher.mesh_step(mesher.MeshSettings(
+        step_file=STEP, element_type="QUAD4", size_max=6.0), log=QUIET)
     n_quads = int((res.elems[:, 2] != res.elems[:, 3]).sum())
     frac = n_quads / len(res.elems)
     assert frac > 0.5, f"only {frac:.0%} quads"
     # boundary area of box-with-hole: 17500 - 2*pi*100 + 2*pi*10*25 = 18442.5
     assert abs(res.stats["measure"] - 18442.5) / 18442.5 < 0.01
 
-    k_quad = os.path.join(out_dir, "shell_quad4.k")
+    k_quad = os.path.join(OUT_DIR, "shell_quad4.k")
     dyna_writer.write_k(k_quad, res.coords, res.elems, element_kind="shell",
                         elform=16, thickness=2.0)
     nodes, _, shells, keywords = parse_k(k_quad)
     assert len(shells) == res.stats["n_elems"]
     assert abs(shell_areas(nodes, shells).sum() - 18442.5) / 18442.5 < 0.01
-    print(f"OK: {len(shells)} shells, {frac:.0%} quads, area "
-          f"{res.stats['measure']:.0f}")
+    print(f"OK: {len(shells)} shells, {frac:.0%} quads")
 
-    # ---- 11. defeaturing: remove the hole ---------------------------------------
+
+def test_defeature():
     print("=== defeature (remove cylindrical hole) ===")
-    faces = mesher.list_faces(mesher.MeshSettings(step_file=step), log=QUIET)
-    cyl = [f["tag"] for f in faces if f["type"] == "Cylinder"]
+    cyl = [f["tag"] for f in faces_step() if f["type"] == "Cylinder"]
     assert len(cyl) == 1
-    settings = mesher.MeshSettings(step_file=step, size_max=8.0,
+    settings = mesher.MeshSettings(step_file=STEP, size_max=8.0,
                                    defeature_faces=cyl)
     res = mesher.mesh_step(settings, log=QUIET)
     assert abs(res.stats["measure"] - 125000.0) / 125000.0 < 0.005, \
@@ -328,19 +421,15 @@ def main():
     print(f"OK: volume {res.stats['measure']:.0f} (solid block), "
           f"{len(faces2)} faces after defeature")
 
-    # ---- 12. loads, SPC, QA sets, implicit cards ---------------------------------
+
+def test_bc_loads_qa_implicit():
     print("=== BC/load cards, QA element set, implicit template ===")
-    xmax = next(f["tag"] for f in faces
-                if abs(f["centroid"][0] - 50.0) < 1e-3
-                and abs(f["area"] - 1250.0) < 1.0)
-    settings = mesher.MeshSettings(step_file=step, size_max=8.0, size_min=2.0,
-                                   collect_faces=[xmax])
-    res = mesher.mesh_step(settings, log=QUIET)
-    fn, fs = res.face_nodes[xmax], res.face_segs[xmax]
-    k_bc = os.path.join(out_dir, "bc_loads.k")
+    tag = xmax_tag()
+    res = res_xmax_face()
+    fn, fs = res.face_nodes[tag], res.face_segs[tag]
+    k_bc = os.path.join(OUT_DIR, "bc_loads.k")
     dyna_writer.write_k(
-        k_bc, res.coords, res.elems, implicit_cards=True,
-        mat={"e": 210000.0, "pr": 0.3, "ro": 7.85e-9},
+        k_bc, res.coords, res.elems, implicit_cards=True, mat=dict(STEEL),
         face_sets=(
             {"kind": "node", "title": "SPC_FACE", "nodes": fn, "spc_dofs": "123"},
             {"kind": "segment", "title": "PRES_FACE", "segments": fs,
@@ -361,24 +450,24 @@ def main():
     assert "$ total force -500" in content
     print("OK: all BC/load/implicit/QA keywords present")
 
-    # ---- 13. per-face mesh size ---------------------------------------------------
+
+def test_face_size():
     print("=== local mesh size on a face ===")
-    res_base = mesher.mesh_step(
-        mesher.MeshSettings(step_file=step, size_max=8.0), log=QUIET)
-    res_fs = mesher.mesh_step(
-        mesher.MeshSettings(step_file=step, size_max=8.0,
-                            face_sizes={xmax: 2.0}), log=QUIET)
+    tag = xmax_tag()
+    res_fs = mesher.mesh_step(mesher.MeshSettings(
+        step_file=STEP, size_max=8.0, face_sizes={tag: 2.0}), log=QUIET)
 
     def nodes_on_xmax(res):
         return int((np.abs(res.coords[:, 0] - 50.0) < 1e-6).sum())
 
-    n0, n1 = nodes_on_xmax(res_base), nodes_on_xmax(res_fs)
+    n0, n1 = nodes_on_xmax(res_coarse()), nodes_on_xmax(res_fs)
     assert n1 > 2 * n0, f"face size had no effect: {n0} -> {n1}"
     print(f"OK: nodes on the sized face {n0} -> {n1}")
 
-    # ---- 14. auto-refine wrapper ---------------------------------------------------
+
+def test_auto_refine_wrapper():
     print("=== auto-refine wrapper (returns the best mesh) ===")
-    settings = mesher.MeshSettings(step_file=step2, size_max=6.0,
+    settings = mesher.MeshSettings(step_file=STEP2, size_max=6.0,
                                    auto_refine=True, auto_refine_rounds=1,
                                    auto_refine_threshold=0.99)
     res = mesher.mesh_step_auto(settings, log=QUIET)
@@ -386,10 +475,11 @@ def main():
     print(f"OK: returned {res.stats['n_elems']} elements, "
           f"min quality {res.stats['quality_min']:.3f}")
 
-    # ---- 15. error case -----------------------------------------------------------
+
+def test_error_empty_cut():
     print("=== error handling (cut outside part) ===")
     settings = mesher.MeshSettings(
-        step_file=step, size_max=8.0,
+        step_file=STEP, size_max=8.0,
         symmetry=[mesher.SymmetryPlane("x", 1000.0, "+")])
     try:
         mesher.mesh_step(settings, log=QUIET)
@@ -397,16 +487,14 @@ def main():
     except RuntimeError as e:
         print(f"OK: got expected error: {e}")
 
-    # ---- 16. symmetry BC options: node-set-only, anti-sym, fixed, custom -------
+
+def test_symmetry_bc_options():
     print("=== symmetry BC options (node set / SPC / anti-sym / custom) ===")
-    settings = mesher.MeshSettings(
-        step_file=step, size_max=8.0, size_min=2.0,
-        symmetry=[mesher.SymmetryPlane("x", 0.0, "+")])
-    res = mesher.mesh_step(settings, log=QUIET)
+    res = res_half_x()
     nodes_x = res.sym_nodes["x"]
 
     # (a) node set only, no boundary condition
-    k = os.path.join(out_dir, "sym_nodeset_only.k")
+    k = os.path.join(OUT_DIR, "sym_nodeset_only.k")
     dyna_writer.write_k(k, res.coords, res.elems, sym_sets=(
         {"axis": "x", "offset": 0.0, "nodes": nodes_x, "spc": False},))
     _, _, _, kws = parse_k(k)
@@ -414,13 +502,13 @@ def main():
     assert "*BOUNDARY_SPC_SET" not in kws, "no SPC when spc=False"
 
     # (b) default symmetric -> constrain X translation + in-plane rotations
-    k = os.path.join(out_dir, "sym_symmetric.k")
+    k = os.path.join(OUT_DIR, "sym_symmetric.k")
     dyna_writer.write_k(k, res.coords, res.elems, sym_sets=(
         {"axis": "x", "offset": 0.0, "nodes": nodes_x, "spc": True},))
     assert spc_dofs(open(k).read()) == [1, 0, 0, 0, 1, 1]
 
     # (c) anti-symmetric -> the complement
-    k = os.path.join(out_dir, "sym_antisym.k")
+    k = os.path.join(OUT_DIR, "sym_antisym.k")
     dyna_writer.write_k(k, res.coords, res.elems, sym_sets=(
         {"axis": "x", "offset": 0.0, "nodes": nodes_x, "spc": True,
          "constraint": "antisymmetric"},))
@@ -429,27 +517,29 @@ def main():
     assert "(antisymmetric)" in txt, "title should note the constraint kind"
 
     # (d) fixed -> all six DOFs
-    k = os.path.join(out_dir, "sym_fixed.k")
+    k = os.path.join(OUT_DIR, "sym_fixed.k")
     dyna_writer.write_k(k, res.coords, res.elems, sym_sets=(
         {"axis": "x", "offset": 0.0, "nodes": nodes_x, "spc": True,
          "constraint": "fixed"},))
     assert spc_dofs(open(k).read()) == [1, 1, 1, 1, 1, 1]
 
     # (e) custom DOFs "13" -> dofx, dofz
-    k = os.path.join(out_dir, "sym_custom.k")
+    k = os.path.join(OUT_DIR, "sym_custom.k")
     dyna_writer.write_k(k, res.coords, res.elems, sym_sets=(
         {"axis": "x", "offset": 0.0, "nodes": nodes_x, "spc": True,
          "dofs": "13"},))
     assert spc_dofs(open(k).read()) == [1, 0, 1, 0, 0, 0]
 
     # (f) start_sid offsets every set id (merge-friendly; parallels start_nid)
-    k = os.path.join(out_dir, "sym_startsid.k")
+    k = os.path.join(OUT_DIR, "sym_startsid.k")
     dyna_writer.write_k(k, res.coords, res.elems, start_sid=100, sym_sets=(
         {"axis": "x", "offset": 0.0, "nodes": nodes_x, "spc": True},))
     lines = open(k).read().splitlines()
-    i = next(j for j, l in enumerate(lines) if l.startswith("*SET_NODE_LIST_TITLE"))
+    i = next(j for j, ln in enumerate(lines)
+             if ln.startswith("*SET_NODE_LIST_TITLE"))
     assert int(lines[i + 3][0:10]) == 100, "node set SID must start at start_sid"
-    s = next(j for j, l in enumerate(lines) if l.startswith("*BOUNDARY_SPC_SET"))
+    s = next(j for j, ln in enumerate(lines)
+             if ln.startswith("*BOUNDARY_SPC_SET"))
     assert int(lines[s + 2][0:10]) == 100, "SPC must reference the offset set id"
 
     # (g) symmetry-plane segment set: boundary faces on the plane, all corners
@@ -459,7 +549,7 @@ def main():
     assert len(seg) > 5 and seg.shape[1] == 4
     assert all(int(c) in on_plane for c in seg[:, :3].ravel())
     assert (seg[:, 2] == seg[:, 3]).all(), "tets -> triangle segments padded to quad"
-    k = os.path.join(out_dir, "sym_segset.k")
+    k = os.path.join(OUT_DIR, "sym_segset.k")
     dyna_writer.write_k(k, res.coords, res.elems, sym_sets=(
         {"axis": "x", "offset": 0.0, "nodes": nodes_x, "spc": True,
          "segset": seg},))
@@ -468,55 +558,60 @@ def main():
     print("OK: node-set-only, symmetric, anti-symmetric, fixed, custom, "
           "start_sid, plane segset verified")
 
-    # ---- 17. multi-format input: BREP / IGES / STL ----------------------------
+
+def test_multi_format_input():
     print("=== multi-format input (BREP / IGES / STL) ===")
-    base = os.path.join(ex, "test_part")
-    if not all(os.path.isfile(base + e) for e in (".iges", ".brep", ".stl")):
-        make_formats(base)
+    _ensure_geometry()
+    if not all(os.path.isfile(FORMAT_BASE + e)
+               for e in (".iges", ".brep", ".stl")):
+        make_formats(FORMAT_BASE)
 
     # BREP solid reproduces the STEP volume exactly (same OCC kernel)
     rb = mesher.mesh_step(mesher.MeshSettings(
-        step_file=base + ".brep", size_max=8.0, size_min=2.0), log=QUIET)
+        step_file=FORMAT_BASE + ".brep", size_max=8.0, size_min=2.0), log=QUIET)
     assert abs(rb.stats["measure"] - 117146.0) / 117146.0 < 0.02
 
     # IGES imports as surfaces and is sewn into a solid
     ri = mesher.mesh_step(mesher.MeshSettings(
-        step_file=base + ".iges", size_max=8.0, size_min=2.0), log=QUIET)
+        step_file=FORMAT_BASE + ".iges", size_max=8.0, size_min=2.0), log=QUIET)
     assert abs(ri.stats["measure"] - 117146.0) / 117146.0 < 0.02
 
     # IGES rejects the OCC target-unit override -> import must fall back to
     # file units instead of crashing
     riu = mesher.mesh_step(mesher.MeshSettings(
-        step_file=base + ".iges", size_max=8.0, size_min=2.0,
+        step_file=FORMAT_BASE + ".iges", size_max=8.0, size_min=2.0,
         occ_unit="MM"), log=QUIET)
     assert abs(riu.stats["measure"] - 117146.0) / 117146.0 < 0.02
 
     # IGES shell: sewing makes it watertight
     ris = mesher.mesh_step(mesher.MeshSettings(
-        step_file=base + ".iges", element_type="TRI3", size_max=8.0), log=QUIET)
+        step_file=FORMAT_BASE + ".iges", element_type="TRI3",
+        size_max=8.0), log=QUIET)
     assert ris.stats["free_edges"] == 0, \
         f"IGES shell not watertight: {ris.stats['free_edges']} free edges"
 
     # STL shell: tessellation used as-is, coincident nodes welded -> watertight
     rs = mesher.mesh_step(mesher.MeshSettings(
-        step_file=base + ".stl", element_type="TRI3"), log=QUIET)
+        step_file=FORMAT_BASE + ".stl", element_type="TRI3"), log=QUIET)
     assert rs.elems.shape[1] == 4 and (rs.elems[:, 2] == rs.elems[:, 3]).all()
     assert rs.stats["free_edges"] == 0, \
         f"STL shell not watertight: {rs.stats['free_edges']} free edges"
 
     # STL -> solid: reconstruct the volume from the watertight surface (TET4)
     rss = mesher.mesh_step(mesher.MeshSettings(
-        step_file=base + ".stl", element_type="TET4", size_max=8.0), log=QUIET)
+        step_file=FORMAT_BASE + ".stl", element_type="TET4",
+        size_max=8.0), log=QUIET)
     assert rss.elems.shape[1] == 4
     assert abs(rss.stats["measure"] - 117146.0) / 117146.0 < 0.02, \
         f"STL solid volume off: {rss.stats['measure']}"
-    k_stl_solid = os.path.join(out_dir, "stl_solid.k")
+    k_stl_solid = os.path.join(OUT_DIR, "stl_solid.k")
     dyna_writer.write_k(k_stl_solid, rss.coords, rss.elems)
     nodes, elems, _, _ = parse_k(k_stl_solid)
     assert (tet_volumes(nodes, elems) > 0).all(), "STL tets must be positive-volume"
     # STL -> TET10 solid
     rst = mesher.mesh_step(mesher.MeshSettings(
-        step_file=base + ".stl", element_type="TET10", size_max=8.0), log=QUIET)
+        step_file=FORMAT_BASE + ".stl", element_type="TET10",
+        size_max=8.0), log=QUIET)
     assert rst.elems.shape[1] == 10
 
     # STL guards: symmetry, defeature and face scanning still rejected (no B-rep)
@@ -524,19 +619,20 @@ def main():
                      symmetry=[mesher.SymmetryPlane("x", 0.0, "+")]),
                 dict(element_type="TRI3", defeature_faces=[1])):
         try:
-            mesher.mesh_step(mesher.MeshSettings(step_file=base + ".stl", **bad),
-                             log=QUIET)
+            mesher.mesh_step(mesher.MeshSettings(
+                step_file=FORMAT_BASE + ".stl", **bad), log=QUIET)
             raise AssertionError(f"STL should reject {bad}")
         except RuntimeError:
             pass
     try:
-        mesher.list_faces(mesher.MeshSettings(step_file=base + ".stl"), log=QUIET)
+        mesher.list_faces(mesher.MeshSettings(step_file=FORMAT_BASE + ".stl"),
+                          log=QUIET)
         raise AssertionError("list_faces should reject STL")
     except RuntimeError:
         pass
 
     # an open (non-watertight) tessellation cannot be tetrahedralized
-    open_stl = os.path.join(out_dir, "open.stl")
+    open_stl = os.path.join(OUT_DIR, "open.stl")
     with open(open_stl, "w") as fh:
         fh.write("solid t\nfacet normal 0 0 0\n outer loop\n"
                  "  vertex 0 0 0\n  vertex 1 0 0\n  vertex 0 1 0\n"
@@ -547,23 +643,22 @@ def main():
         raise AssertionError("open STL should be rejected for solid meshing")
     except RuntimeError:
         pass
-    print(f"OK: BREP vol {rb.stats['measure']:.0f}, IGES vol "
-          f"{ri.stats['measure']:.0f}, IGES/STL shells watertight, STL solid "
-          f"vol {rss.stats['measure']:.0f}, guards fire")
+    print("OK: BREP/IGES/STL import, sewing, STL solids, guards fire")
 
-    # ---- 18. auto-refine: threshold > 0.05 retries, best mesh + preview kept ----
+
+def test_auto_refine_threshold_preview_resilience():
     print("=== auto-refine threshold / best-mesh preview / failure resilience ===")
     logmsgs = []
-    pv = os.path.join(out_dir, "autoref_preview.msh")
-    settings = mesher.MeshSettings(step_file=step, size_max=8.0, size_min=2.0,
+    pv = os.path.join(OUT_DIR, "autoref_preview.msh")
+    settings = mesher.MeshSettings(step_file=STEP, size_max=8.0, size_min=2.0,
                                    auto_refine=True, auto_refine_rounds=1,
                                    auto_refine_threshold=0.99)
     res = mesher.mesh_step_auto(settings, log=lambda m: logmsgs.append(str(m)),
                                 preview_path=pv)
-    retries = [m for m in logmsgs if str(m).startswith("Auto-refine: min quality")]
+    retries = [m for m in logmsgs if m.startswith("Auto-refine: min quality")]
     assert retries, "threshold 0.99 must trigger an auto-refine retry"
     assert os.path.isfile(pv), "preview of the kept mesh must exist"
-    assert not [p for p in os.listdir(out_dir) if "autoref_preview.round" in p], \
+    assert not [p for p in os.listdir(OUT_DIR) if "autoref_preview.round" in p], \
         "per-round preview files must be cleaned up"
     # the preview must show the KEPT mesh, not simply the last round's
     import gmsh as _gmsh
@@ -573,6 +668,7 @@ def main():
     _gmsh.finalize()
     assert n_prev == res.stats["n_elems"], \
         f"preview mesh ({n_prev}) != kept mesh ({res.stats['n_elems']})"
+
     # a failing refinement round must not throw away the good first mesh
     orig_mesh_step, calls = mesher.mesh_step, {"n": 0}
 
@@ -592,56 +688,162 @@ def main():
     print(f"OK: retry fired, preview matches kept mesh ({n_prev} tets), "
           f"failed round kept {res2.stats['n_elems']} elements")
 
-    # ---- 19. mesh-only (*INCLUDE) output -----------------------------------------
+
+def test_mesh_only_output():
     print("=== mesh-only output (for *INCLUDE) ===")
-    settings = mesher.MeshSettings(step_file=step, size_max=8.0, size_min=2.0,
-                                   symmetry=[mesher.SymmetryPlane("x", 0.0, "+")])
-    res = mesher.mesh_step(settings, log=QUIET)
-    k_inc = os.path.join(out_dir, "mesh_only.k")
+    res = res_half_x()
+    k_inc = os.path.join(OUT_DIR, "mesh_only.k")
     dyna_writer.write_k(
         k_inc, res.coords, res.elems, mesh_only=True, implicit_cards=True,
-        mat={"e": 210000.0, "pr": 0.3, "ro": 7.85e-9},
+        mat=dict(STEEL), contact_fs=0.1, tssfac=0.9,
         sym_sets=({"axis": "x", "offset": 0.0, "nodes": res.sym_nodes["x"],
                    "spc": True},))
     nodes, elems, _, kws = parse_k(k_inc)
     for kw in ("*PART", "*SECTION_SOLID", "*MAT_ELASTIC",
-               "*CONTROL_TERMINATION", "*CONTROL_IMPLICIT_GENERAL"):
+               "*CONTROL_TERMINATION", "*CONTROL_IMPLICIT_GENERAL",
+               "*CONTROL_TIMESTEP", "*CONTACT_AUTOMATIC_SINGLE_SURFACE"):
         assert kw not in kws, f"mesh-only file must not contain {kw}"
     for kw in ("*NODE", "*ELEMENT_SOLID", "*SET_NODE_LIST_TITLE",
                "*BOUNDARY_SPC_SET", "*END"):
         assert kw in kws, f"mesh-only file must contain {kw}"
     assert len(nodes) == res.stats["n_nodes"] and len(elems) == res.stats["n_elems"]
-    print(f"OK: {len(nodes)} nodes / {len(elems)} elements, no PART/SECTION/MAT/"
-          f"control cards")
+    print(f"OK: {len(nodes)} nodes / {len(elems)} elements, cards suppressed")
 
-    # ---- 20. critical timestep estimate --------------------------------------------
+
+def test_critical_timestep():
     print("=== explicit critical timestep estimate ===")
-    mat = {"e": 210000.0, "pr": 0.3, "ro": 7.85e-9}   # steel, mm-t-s
+    res = res_half_x()
     lc = res.stats["char_length"]
     assert lc > 0, "solid stats must expose the characteristic length"
-    dt = mesher.critical_timestep(res.stats, "TET4", mat)
+    dt = mesher.critical_timestep(res.stats, "TET4", STEEL)
     c_solid = (210000.0 * 0.7 / (1.3 * 0.4 * 7.85e-9)) ** 0.5
     assert abs(dt - lc / c_solid) < 1e-12 * dt, "solid dt must be Lc/c (bulk c)"
-    # shells: plane-stress wave speed on the min edge
-    res_sh = mesher.mesh_step(mesher.MeshSettings(
-        step_file=step_sh, element_type="TRI3", size_max=5.0), log=QUIET)
-    dt_sh = mesher.critical_timestep(res_sh.stats, "TRI3", mat)
+    # shells: plane-stress wave speed on the LS-DYNA characteristic length
+    res_sh = res_shell_tri3()
+    dt_sh = mesher.critical_timestep(res_sh.stats, "TRI3", STEEL)
     c_shell = (210000.0 / (7.85e-9 * (1 - 0.09))) ** 0.5
     assert abs(dt_sh - res_sh.stats["char_length"] / c_shell) < 1e-12 * dt_sh
+    # shell char length = (1+beta) * area / longest edge; for the triangles
+    # here it must be below the min edge length times 2/sqrt(3) (equilateral)
+    assert res_sh.stats["char_length"] > 0
     # invalid input -> None, not a crash
     assert mesher.critical_timestep(res.stats, "TET4", None) is None
-    assert mesher.critical_timestep({}, "TET4", mat) is None
-    assert mesher.critical_timestep(res.stats, "TET4",
-                                    {"e": 210000.0, "pr": 0.5, "ro": 7.85e-9}) is None
+    assert mesher.critical_timestep({}, "TET4", STEEL) is None
+    assert mesher.critical_timestep(
+        res.stats, "TET4", {"e": 210000.0, "pr": 0.5, "ro": 7.85e-9}) is None
     print(f"OK: solid dt {dt:.4g} s, shell dt {dt_sh:.4g} s, guards fire")
 
-    # ---- 21. CLI: --mesh-only / --title / --stats-json ------------------------------
+
+def test_mass_and_timestep_reporting():
+    print("=== per-part mass + dt reporting helper ===")
+    res = res_two_glued()
+    logmsgs = []
+    mass, masses, dt = mesher.mass_and_timestep(
+        res, "TET4", STEEL, {11: ALU}, 10, log=lambda m: logmsgs.append(str(m)))
+    # 8000 mm^3 per box: steel 6.28e-5 t, alu 2.16e-5 t
+    assert abs(masses[10] - 8000 * 7.85e-9) / (8000 * 7.85e-9) < 0.01
+    assert abs(masses[11] - 8000 * 2.7e-9) / (8000 * 2.7e-9) < 0.01
+    assert abs(mass - masses[10] - masses[11]) < 1e-12
+    assert dt and dt > 0
+    # the estimate must use the stiffest (fastest) material -> min dt
+    dt_steel = mesher.critical_timestep(res.stats, "TET4", STEEL)
+    dt_alu = mesher.critical_timestep(res.stats, "TET4", ALU)
+    assert abs(dt - min(dt_steel, dt_alu)) < 1e-15
+    assert any("PID 10 mass" in m for m in logmsgs)
+    assert any("dt distribution" in m for m in logmsgs)
+    # a part without any material -> unknown total
+    mass2, masses2, _ = mesher.mass_and_timestep(
+        res, "TET4", None, {11: ALU}, 10, log=QUIET)
+    assert mass2 is None and list(masses2) == [11]
+    print(f"OK: total {mass:.4g} t, per-part masses, dt {dt:.4g} s")
+
+
+def test_part_mats_and_contact_cards():
+    print("=== per-part *MAT cards + single-surface contact ===")
+    res = res_two_glued()
+    k = os.path.join(OUT_DIR, "part_mats.k")
+    dyna_writer.write_k(k, res.coords, res.elems, pid=10,
+                        part_ids=10 + res.elem_parts, mat=dict(STEEL),
+                        part_mats={11: dict(ALU)}, contact_fs=0.15)
+    _, elems, _, kws = parse_k(k)
+    assert kws.count("*MAT_ELASTIC") == 2
+    assert "*CONTACT_AUTOMATIC_SINGLE_SURFACE" in kws
+    assert part_cards(k) == [(10, 10, 10), (11, 10, 11)], \
+        "part 11 must reference its own MID, part 10 the global one"
+    assert mat_mids(k) == [10, 11]
+    txt = open(k).read()
+    assert "0.1500" in txt, "friction coefficient must be on the contact card"
+    assert "7e+04" in txt, "the alu E-modulus must be in the file"
+    # no NOTE about missing materials - everything is defined
+    assert "$ NOTE: define" not in txt
+    # missing materials are pointed out per MID
+    k2 = os.path.join(OUT_DIR, "part_mats_missing.k")
+    dyna_writer.write_k(k2, res.coords, res.elems, pid=10,
+                        part_ids=10 + res.elem_parts, part_mats={11: dict(ALU)})
+    assert "MID = 10" in open(k2).read()
+    print("OK: per-part MIDs/MAT cards, contact card, missing-MAT note")
+
+
+def test_control_timestep_and_gravity_cards():
+    print("=== *CONTROL_TIMESTEP + *LOAD_BODY (gravity) ===")
+    res = res_full()
+    k = os.path.join(OUT_DIR, "ctrl_grav.k")
+    dyna_writer.write_k(k, res.coords, res.elems, tssfac=0.9,
+                        body_load=("z", 9810.0))
+    _, _, _, kws = parse_k(k)
+    assert "*CONTROL_TIMESTEP" in kws
+    assert "*LOAD_BODY_Z" in kws
+    assert "*DEFINE_CURVE_TITLE" in kws, "gravity alone must emit the ramp curve"
+    lines = open(k).read().splitlines()
+    i = next(j for j, ln in enumerate(lines)
+             if ln.startswith("*CONTROL_TIMESTEP"))
+    assert abs(float(lines[i + 2][10:20]) - 0.9) < 1e-12, "TSSFAC on the card"
+    i = next(j for j, ln in enumerate(lines) if ln.startswith("*LOAD_BODY_Z"))
+    assert int(lines[i + 2][0:10]) == 1, "body load must reference the curve"
+    assert abs(float(lines[i + 2][10:20]) - 9810.0) < 1e-9
+    print("OK: control-timestep and body-load cards written")
+
+
+def test_long_format():
+    print("=== LONG=Y format (id overflow) ===")
+    coords = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0],
+                       [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+    elems = np.array([[1, 2, 3, 4]], dtype=np.int64)
+
+    # ids beyond 8 characters -> automatic LONG=Y
+    k = os.path.join(OUT_DIR, "long_auto.k")
+    dyna_writer.write_k(k, coords, elems, start_nid=99_999_998)
+    lines = open(k).read().splitlines()
+    assert lines[0] == "*KEYWORD LONG=Y"
+    assert any("LONG=Y format enabled automatically" in ln for ln in lines)
+    i = lines.index("*NODE")
+    node_line = lines[i + 2]
+    assert int(node_line[0:20]) == 99_999_998, "node id in a 20-char field"
+    assert len(node_line) == 20 + 3 * 20, "20-char coordinate fields"
+    j = lines.index("*ELEMENT_SOLID")
+    el = lines[j + 2]
+    assert int(el[0:20]) == 1 and int(el[40:60]) == 99_999_998
+
+    # explicit opt-in without large ids
+    k2 = os.path.join(OUT_DIR, "long_forced.k")
+    dyna_writer.write_k(k2, coords, elems, long_format=True)
+    with open(k2) as fh:
+        assert fh.readline().strip() == "*KEYWORD LONG=Y"
+
+    # and the default stays the standard format
+    k3 = os.path.join(OUT_DIR, "std_fmt.k")
+    dyna_writer.write_k(k3, coords, elems)
+    with open(k3) as fh:
+        assert fh.readline().strip() == "*KEYWORD"
+    print("OK: automatic + forced LONG=Y, standard by default")
+
+
+def test_cli_output_options():
     print("=== CLI: --mesh-only, --title, --stats-json ===")
-    import json
-    import mesh_cli
-    k_cli = os.path.join(out_dir, "cli_meshonly.k")
-    js_cli = os.path.join(out_dir, "cli_stats.json")
-    rc = mesh_cli.main([step, "-o", k_cli, "--size-max", "8", "--size-min", "2",
+    _ensure_geometry()
+    k_cli = os.path.join(OUT_DIR, "cli_meshonly.k")
+    js_cli = os.path.join(OUT_DIR, "cli_stats.json")
+    rc = mesh_cli.main([STEP, "-o", k_cli, "--size-max", "8", "--size-min", "2",
                         "--mesh-only", "--title", "CLI TITLE TEST",
                         "--stats-json", js_cli, "--mat"])
     assert rc == 0
@@ -658,10 +860,39 @@ def main():
     assert payload["mass"] > 0 and payload["critical_timestep"] > 0
     assert payload["stats"]["quality_min"] > 0
     assert isinstance(payload["stats"]["failed_elems"], list)
-    print(f"OK: title + mesh-only written, stats JSON has {payload['stats']['n_elems']} "
-          f"elements, mass {payload['mass']:.4g}, dt {payload['critical_timestep']:.4g}")
+    print(f"OK: title + mesh-only written, stats JSON has "
+          f"{payload['stats']['n_elems']} elements")
 
-    print("\nALL TESTS PASSED")
+
+def test_cli_assembly_options():
+    print("=== CLI: --part-mat, --contact, --tssfac, --gravity ===")
+    _ensure_geometry()
+    k_cli = os.path.join(OUT_DIR, "cli_assembly.k")
+    js_cli = os.path.join(OUT_DIR, "cli_assembly.json")
+    rc = mesh_cli.main([STEP2, "-o", k_cli, "--size-max", "6", "--glue",
+                        "--mat", "--part-mat", "2:70000:0.33:2.7e-9",
+                        "--contact", "0.15", "--tssfac", "0.9",
+                        "--gravity", "z:9810", "--stats-json", js_cli])
+    assert rc == 0
+    _, _, _, kws = parse_k(k_cli)
+    assert "*CONTACT_AUTOMATIC_SINGLE_SURFACE" in kws
+    assert "*CONTROL_TIMESTEP" in kws
+    assert "*LOAD_BODY_Z" in kws
+    assert kws.count("*MAT_ELASTIC") == 2, "steel default + alu override"
+    assert part_cards(k_cli) == [(1, 1, 1), (2, 1, 2)]
+    with open(js_cli) as f:
+        payload = json.load(f)
+    assert len(payload["part_masses"]) == 2
+    assert payload["mass"] > 0 and payload["critical_timestep"] > 0
+    print("OK: assembly cards + per-part masses in the stats JSON")
+
+
+def main():
+    tests = [(name, fn) for name, fn in sorted(globals().items())
+             if name.startswith("test_") and callable(fn)]
+    for _name, fn in tests:
+        fn()
+    print(f"\nALL TESTS PASSED ({len(tests)} test functions)")
 
 
 if __name__ == "__main__":

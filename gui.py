@@ -80,6 +80,7 @@ class KMesherGUI:
         self.worker: threading.Thread | None = None
         self.last_preview: str | None = None
         self.refinements: list[dict] = []
+        self.part_mats: list[dict] = []    # {"body","e","pr","ro"}
         self.face_roles: list[dict] = []   # {"tag","role","value","dofs"}
         self.faces_by_tag: dict[int, dict] = {}
         self.face_scan_sig: str | None = None
@@ -135,6 +136,7 @@ class KMesherGUI:
         self.btn_preview = ttk.Button(actions, text="Preview last mesh",
                                       command=self._open_preview, state="disabled")
         self.btn_preview.pack(side="left")
+        self.progress = ttk.Progressbar(actions, mode="indeterminate", length=140)
 
         # -------------------------------------------------------- log -----
         logf = ttk.LabelFrame(body, text="Log", padding=4)
@@ -288,6 +290,64 @@ class KMesherGUI:
         ttk.Checkbutton(dyna, text="Mesh-only output for *INCLUDE (no PART / "
                                    "SECTION / MAT / control cards)",
                         variable=self.var_mesh_only).grid(row=7, column=0, columnspan=4, sticky="w")
+
+        self.var_contact = tk.BooleanVar(value=False)
+        ttk.Checkbutton(dyna, text="Contact between parts (*CONTACT_AUTOMATIC_"
+                                   "SINGLE_SURFACE), friction:",
+                        variable=self.var_contact).grid(row=8, column=0,
+                                                        columnspan=2, sticky="w")
+        self.var_contact_fs = tk.StringVar(value="0.1")
+        ttk.Entry(dyna, textvariable=self.var_contact_fs, width=8
+                  ).grid(row=8, column=2, sticky="w", padx=4)
+        ttk.Label(dyna, text="(bonded bodies: use Glue instead)",
+                  foreground="gray").grid(row=8, column=3, sticky="w")
+
+        self.var_ctrl_dt = tk.BooleanVar(value=False)
+        ttk.Checkbutton(dyna, text="Write *CONTROL_TIMESTEP,  TSSFAC:",
+                        variable=self.var_ctrl_dt).grid(row=9, column=0, sticky="w")
+        self.var_tssfac = tk.StringVar(value="0.9")
+        ttk.Entry(dyna, textvariable=self.var_tssfac, width=8
+                  ).grid(row=9, column=1, sticky="w", padx=4)
+
+        self.var_grav = tk.BooleanVar(value=False)
+        ttk.Checkbutton(dyna, text="Gravity (*LOAD_BODY_):",
+                        variable=self.var_grav).grid(row=10, column=0, sticky="w")
+        gravrow = ttk.Frame(dyna)
+        gravrow.grid(row=10, column=1, columnspan=3, sticky="w")
+        ttk.Label(gravrow, text="axis:").pack(side="left")
+        self.var_grav_axis = tk.StringVar(value="Z")
+        ttk.Combobox(gravrow, textvariable=self.var_grav_axis, state="readonly",
+                     width=3, values=["X", "Y", "Z"]).pack(side="left", padx=4)
+        ttk.Label(gravrow, text="acceleration:").pack(side="left")
+        self.var_grav_a = tk.StringVar(value="9810")
+        ttk.Entry(gravrow, textvariable=self.var_grav_a, width=10).pack(side="left", padx=4)
+        ttk.Label(gravrow, text="(9810 = g in mm-t-s; positive loads -axis)",
+                  foreground="gray").pack(side="left")
+
+        pmat = ttk.LabelFrame(
+            tab, text="Per-body materials (multi-body models; overrides the "
+                      "global *MAT for that body)", padding=6)
+        pmat.grid(row=1, column=0, sticky="ew", **pad)
+        pmat.columnconfigure(0, weight=1)
+        pmrow = ttk.Frame(pmat)
+        pmrow.grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(pmrow, text="Body #:").pack(side="left")
+        self.var_pm_body = tk.StringVar(value="1")
+        ttk.Entry(pmrow, textvariable=self.var_pm_body, width=5).pack(side="left", padx=2)
+        ttk.Label(pmrow, text="E:").pack(side="left", padx=(8, 0))
+        self.var_pm_e = tk.StringVar(value="210000")
+        ttk.Entry(pmrow, textvariable=self.var_pm_e, width=10).pack(side="left", padx=2)
+        ttk.Label(pmrow, text="ν:").pack(side="left", padx=(8, 0))
+        self.var_pm_nu = tk.StringVar(value="0.3")
+        ttk.Entry(pmrow, textvariable=self.var_pm_nu, width=7).pack(side="left", padx=2)
+        ttk.Label(pmrow, text="ρ:").pack(side="left", padx=(8, 0))
+        self.var_pm_ro = tk.StringVar(value="7.85e-9")
+        ttk.Entry(pmrow, textvariable=self.var_pm_ro, width=10).pack(side="left", padx=2)
+        ttk.Button(pmrow, text="Add", command=self._add_part_mat).pack(side="left", padx=8)
+        self.lst_pmat = tk.Listbox(pmat, height=3)
+        self.lst_pmat.grid(row=1, column=0, sticky="ew", pady=3)
+        ttk.Button(pmat, text="Remove", command=self._remove_part_mat
+                   ).grid(row=1, column=1, sticky="n", pady=3)
 
     # ----------------------------------------- tab: symmetry & face sets --
     def _build_sym_tab(self, tab, pad):
@@ -528,6 +588,38 @@ class KMesherGUI:
         if sel:
             del self.face_roles[sel[0]]
             self._refresh_roles_list()
+
+    # ---------------------------------------------- per-body materials ----
+    def _add_part_mat(self):
+        try:
+            body = int(self.var_pm_body.get())
+            mat = {"e": float(self.var_pm_e.get()),
+                   "pr": float(self.var_pm_nu.get()),
+                   "ro": float(self.var_pm_ro.get())}
+        except ValueError:
+            messagebox.showerror("Invalid input", "Per-body material needs a "
+                                                  "body number and numeric E, ν, ρ.")
+            return
+        if body < 1 or mat["e"] <= 0 or mat["ro"] <= 0 or not 0 < mat["pr"] < 0.5:
+            messagebox.showerror("Invalid input", "Body # must be ≥ 1, E and ρ "
+                                                  "> 0, and 0 < ν < 0.5.")
+            return
+        self.part_mats = [pm for pm in self.part_mats if pm["body"] != body]
+        self.part_mats.append({"body": body, **mat})
+        self.part_mats.sort(key=lambda pm: pm["body"])
+        self._refresh_pmat_list()
+
+    def _remove_part_mat(self):
+        sel = self.lst_pmat.curselection()
+        if sel:
+            del self.part_mats[sel[0]]
+            self._refresh_pmat_list()
+
+    def _refresh_pmat_list(self):
+        self.lst_pmat.delete(0, "end")
+        for pm in self.part_mats:
+            self.lst_pmat.insert("end", f"Body {pm['body']}: E={pm['e']:g}  "
+                                        f"ν={pm['pr']:g}  ρ={pm['ro']:g}")
 
     def _refresh_roles_list(self):
         self.lst_roles.delete(0, "end")
@@ -837,8 +929,26 @@ class KMesherGUI:
             if thickness <= 0:
                 raise ValueError("Shell thickness must be > 0.")
 
+        contact_fs = None
+        if self.var_contact.get():
+            contact_fs = num(self.var_contact_fs, "Contact friction", minval=0.0)
+        tssfac = None
+        if self.var_ctrl_dt.get():
+            tssfac = num(self.var_tssfac, "TSSFAC")
+            if not 0 < tssfac <= 1.0:
+                raise ValueError("TSSFAC must be in (0, 1].")
+        gravity = None
+        if self.var_grav.get():
+            gravity = (self.var_grav_axis.get().lower(),
+                       num(self.var_grav_a, "Gravity acceleration"))
+
+        pid0 = integer(self.var_pid, "Part ID")
+        part_mats = {pid0 + pm["body"] - 1:
+                     {"e": pm["e"], "pr": pm["pr"], "ro": pm["ro"]}
+                     for pm in self.part_mats}
+
         kopts = {
-            "pid": integer(self.var_pid, "Part ID"),
+            "pid": pid0,
             "elform": ELFORMS_ALL[self.var_elform.get()],
             "element_kind": "shell" if is_shell else "solid",
             "thickness": thickness,
@@ -859,6 +969,10 @@ class KMesherGUI:
             "implicit_cards": self.var_implicit.get(),
             "qa_sets": self.var_qa.get(),
             "mesh_only": self.var_mesh_only.get(),
+            "contact_fs": contact_fs,
+            "tssfac": tssfac,
+            "gravity": gravity,
+            "part_mats": part_mats,
         }
         return settings, out, kopts
 
@@ -870,6 +984,11 @@ class KMesherGUI:
         self.btn_batch.config(state=state)
         if busy:
             self.btn_preview.config(state="disabled")
+            self.progress.pack(side="left", padx=12)
+            self.progress.start(12)
+        else:
+            self.progress.stop()
+            self.progress.pack_forget()
 
     def _start_run(self) -> None:
         if self.worker and self.worker.is_alive():
@@ -966,20 +1085,17 @@ class KMesherGUI:
             for p, t in part_titles.items():
                 log(f"  PID {p}: {t}")
 
-        if kopts["mat"]:
-            scale = kopts["mat"]["ro"] * (kopts["thickness"]
-                                          if kopts["element_kind"] == "shell" else 1.0)
-            mass = scale * result.stats["measure"]
-            c = result.stats.get("cog", (0, 0, 0))
+        thickness_scale = (kopts["thickness"]
+                           if kopts["element_kind"] == "shell" else 1.0)
+        mesher.mass_and_timestep(result, settings.element_type, kopts["mat"],
+                                 kopts["part_mats"], pid0, thickness_scale,
+                                 log=log)
+        if kopts["mat"] and not kopts["part_mats"]:
+            # inertia scaling only well-defined for a homogeneous material
+            scale = kopts["mat"]["ro"] * thickness_scale
             inertia = np.array(result.stats["inertia_unit_density"]) * scale
-            log(f"Mass: {mass:.6g}   COG: ({c[0]:.4g}, {c[1]:.4g}, {c[2]:.4g})")
             log(f"Inertia about COG (Ixx, Iyy, Izz): "
                 f"{inertia[0, 0]:.6g}, {inertia[1, 1]:.6g}, {inertia[2, 2]:.6g}")
-            dt_est = mesher.critical_timestep(result.stats,
-                                              settings.element_type, kopts["mat"])
-            if dt_est:
-                log(f"Estimated explicit critical timestep: {dt_est:.4g} "
-                    f"(dt = Lc/c, model time units, no TSSFAC)")
 
         comments = [f"Source geometry: {settings.step_file}",
                     f"Element size: {settings.size_min:g} .. {settings.size_max:g}"]
@@ -999,7 +1115,9 @@ class KMesherGUI:
             mat=kopts["mat"], part_ids=part_ids, part_titles=part_titles,
             face_sets=tuple(face_sets), elem_sets=tuple(elem_sets),
             implicit_cards=kopts["implicit_cards"],
-            mesh_only=kopts["mesh_only"],
+            mesh_only=kopts["mesh_only"], part_mats=kopts["part_mats"],
+            contact_fs=kopts["contact_fs"], tssfac=kopts["tssfac"],
+            body_load=kopts["gravity"],
         )
         log(f"Done in {time.perf_counter() - t_start:.1f} s. "
             f"{result.stats['n_nodes']} nodes / "
@@ -1036,6 +1154,10 @@ class KMesherGUI:
             "face_nodes": self.var_face_nodes, "face_segs": self.var_face_segs,
             "implicit": self.var_implicit, "qa": self.var_qa,
             "mesh_only": self.var_mesh_only,
+            "contact": self.var_contact, "contact_fs": self.var_contact_fs,
+            "ctrl_dt": self.var_ctrl_dt, "tssfac": self.var_tssfac,
+            "grav": self.var_grav, "grav_axis": self.var_grav_axis,
+            "grav_a": self.var_grav_a,
         }
         for axis, (enabled, offset, keep) in self.sym_rows.items():
             d[f"sym_{axis}"] = enabled
@@ -1046,6 +1168,7 @@ class KMesherGUI:
     def _collect_settings_data(self) -> dict:
         data = {k: v.get() for k, v in self._settings_vars().items()}
         data["refinements"] = self.refinements
+        data["part_mats"] = self.part_mats
         return data
 
     def _apply_settings_data(self, data: dict) -> None:
@@ -1061,6 +1184,11 @@ class KMesherGUI:
                                 if isinstance(r, dict)
                                 and r.get("kind") in ("sphere", "box")]
             self._refresh_ref_list()
+        pms = data.get("part_mats", [])
+        if isinstance(pms, list):
+            self.part_mats = [pm for pm in pms if isinstance(pm, dict)
+                              and {"body", "e", "pr", "ro"} <= set(pm)]
+            self._refresh_pmat_list()
 
     def _save_settings(self) -> None:
         try:
