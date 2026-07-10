@@ -672,11 +672,12 @@ def test_auto_refine_threshold_preview_resilience():
     # a failing refinement round must not throw away the good first mesh
     orig_mesh_step, calls = mesher.mesh_step, {"n": 0}
 
-    def flaky(s, log=print, preview_path=None):
+    def flaky(s, log=print, preview_path=None, export_paths=()):
         calls["n"] += 1
         if calls["n"] > 1:
             raise RuntimeError("simulated PLC error")
-        return orig_mesh_step(s, log=log, preview_path=preview_path)
+        return orig_mesh_step(s, log=log, preview_path=preview_path,
+                              export_paths=export_paths)
 
     mesher.mesh_step = flaky
     try:
@@ -833,6 +834,234 @@ def test_split_parts():
     assert "7e+04" in open(paths[11]).read()
     assert "7e+04" not in open(paths[10]).read()
     print(f"OK: {len(files)} standalone files, volumes/elements add up")
+
+
+def test_select_nodes():
+    print("=== coordinate node selection (plane / box / sphere) ===")
+    res = res_full()
+    ids = mesher.select_nodes(res.coords, "plane", ("x", 50.0))
+    assert len(ids) > 5
+    assert np.allclose(res.coords[ids - 1][:, 0], 50.0, atol=1e-6)
+    expected = np.flatnonzero(np.abs(res.coords[:, 0] - 50.0) <= 1e-4) + 1
+    assert set(ids.tolist()) == set(expected.tolist())
+    ids_box = mesher.select_nodes(res.coords, "box",
+                                  [0.0, -25.0, -12.5, 50.0, 25.0, 12.5])
+    assert (res.coords[ids_box - 1][:, 0] >= -1e-6).all()
+    assert 0 < len(ids_box) < res.stats["n_nodes"]
+    ids_sph = mesher.select_nodes(res.coords, "sphere", [0.0, 0.0, 0.0, 15.0])
+    d = np.linalg.norm(res.coords[ids_sph - 1], axis=1)
+    assert (d <= 15.0 + 1e-3).all() and len(ids_sph) > 0
+    try:
+        mesher.select_nodes(res.coords, "cylinder", [0, 0, 0, 1])
+        raise AssertionError("unknown kind must raise")
+    except ValueError:
+        pass
+    print(f"OK: plane {len(ids)}, box {len(ids_box)}, sphere {len(ids_sph)} nodes")
+
+
+def test_mat_rigid():
+    print("=== rigid parts (*MAT_RIGID) ===")
+    res = res_two_glued()
+    rigid = {**STEEL, "rigid": True}
+    k = os.path.join(OUT_DIR, "rigid.k")
+    dyna_writer.write_k(k, res.coords, res.elems, pid=10,
+                        part_ids=10 + res.elem_parts, mat=dict(STEEL),
+                        part_mats={11: rigid})
+    _, _, _, kws = parse_k(k)
+    assert "*MAT_RIGID" in kws and "*MAT_ELASTIC" in kws
+    assert part_cards(k) == [(10, 10, 10), (11, 10, 11)]
+    # a rigid part must not control the timestep estimate: make the rigid
+    # material much stiffer - the dt must still be the elastic steel's
+    stiff_rigid = {"e": 2.1e9, "pr": 0.3, "ro": 7.85e-9, "rigid": True}
+    _, _, dt = mesher.mass_and_timestep(res, "TET4", STEEL,
+                                        {11: stiff_rigid}, 10, log=QUIET)
+    dt_steel = mesher.critical_timestep(res.stats, "TET4", STEEL)
+    assert abs(dt - dt_steel) < 1e-15, "rigid mat must be excluded from dt"
+    print("OK: MAT_RIGID card written, rigid part excluded from dt")
+
+
+def test_write_k_include():
+    print("=== *INCLUDE assembly (write_k_include) ===")
+    res = res_two_glued()
+    k = os.path.join(OUT_DIR, "incl.k")
+    files = dyna_writer.write_k_include(
+        k, res.coords, res.elems, pid=10,
+        part_ids=10 + res.elem_parts,
+        part_titles={10: "left box", 11: "right box"},
+        mat=dict(STEEL), part_mats={11: dict(ALU)}, contact_fs=0.1)
+    assert [p for p, _ in files] == [10, 11]
+
+    # master: all modeling cards + *INCLUDE lines, but no mesh blocks
+    _, _, _, kws = parse_k(k)
+    assert kws.count("*INCLUDE") == 2
+    assert kws.count("*PART") == 2 and kws.count("*MAT_ELASTIC") == 2
+    assert "*CONTACT_AUTOMATIC_SINGLE_SURFACE" in kws
+    assert "*NODE" not in kws and "*ELEMENT_SOLID" not in kws
+    master = open(k).read()
+    for _, fpath in files:
+        assert os.path.basename(fpath) in master, "*INCLUDE must name the fragment"
+
+    # fragments: global numbering, disjoint node ownership, full coverage
+    all_nodes, all_elems = {}, []
+    per_frag_nodes = []
+    for p, fpath in files:
+        nodes, elems, _, fkws = parse_k(fpath)
+        assert "*PART" not in fkws, "fragments are mesh-only"
+        assert all(e[1] == p for e in elems), "fragment carries its own PID"
+        per_frag_nodes.append(set(nodes))
+        all_nodes.update(nodes)
+        all_elems += elems
+    assert not (per_frag_nodes[0] & per_frag_nodes[1]), \
+        "interface nodes must be defined in exactly one fragment"
+    assert len(all_nodes) == res.stats["n_nodes"], "all nodes covered once"
+    assert len(all_elems) == res.stats["n_elems"]
+    assert sorted(e[0] for e in all_elems) == list(range(1, len(all_elems) + 1)), \
+        "global element ids"
+    # the combined fragments rebuild the full mesh
+    v = tet_volumes(all_nodes, all_elems)
+    assert (v > 0).all()
+    assert abs(v.sum() - res.stats["measure"]) / res.stats["measure"] < 1e-9
+    print(f"OK: master + {len(files)} fragments rebuild the assembly exactly")
+
+
+def test_export_paths():
+    print("=== mesh export (.vtk) + auto-refine round handling ===")
+    vtk = os.path.join(OUT_DIR, "export.vtk")
+    settings = mesher.MeshSettings(step_file=STEP, size_max=8.0, size_min=2.0,
+                                   auto_refine=True, auto_refine_rounds=1,
+                                   auto_refine_threshold=0.99)
+    mesher.mesh_step_auto(settings, log=QUIET, export_paths=(vtk,))
+    assert os.path.isfile(vtk) and os.path.getsize(vtk) > 1000
+    assert not [p for p in os.listdir(OUT_DIR) if "export.round" in p], \
+        "per-round export files must be cleaned up"
+    print("OK: VTK exported, round files cleaned")
+
+
+def test_job_runner():
+    print("=== job_runner (GUI-independent job execution) ===")
+    import job_runner
+    _ensure_geometry()
+    kopts = {
+        "pid": 10, "elform": 10, "element_kind": "solid", "thickness": 1.0,
+        "start_nid": 1, "start_eid": 1, "start_sid": 1,
+        "sym_nodeset": True, "sym_spc": True, "sym_constraint": "symmetric",
+        "sym_dofs": "", "sym_segset": False,
+        "mat": dict(STEEL), "part_mats": {11: dict(ALU)},
+        "face_nodesets": False, "face_segsets": False, "face_roles": [],
+        "plain_faces": [], "face_titles": {},
+        "coord_sets": [{"kind": "plane", "params": ("x", 0.0), "role": "spc",
+                        "dofs": "123"}],
+        "implicit_cards": False, "qa_sets": True, "mesh_only": False,
+        "split_mode": "include", "contact_fs": 0.1, "tssfac": 0.9,
+        "gravity": ("z", 9810.0),
+    }
+    settings = mesher.MeshSettings(step_file=STEP2, size_max=6.0, glue=True)
+    out = os.path.join(OUT_DIR, "runner.k")
+    logmsgs = []
+    preview = job_runner.run_job(settings, out, kopts,
+                                 log=lambda m: logmsgs.append(str(m)))
+    assert preview.endswith("_preview.msh") and os.path.isfile(preview)
+    _, _, _, kws = parse_k(out)
+    assert kws.count("*INCLUDE") == 2, "split_mode=include -> master deck"
+    assert "*CONTROL_TIMESTEP" in kws and "*LOAD_BODY_Z" in kws
+    assert "*SET_NODE_LIST_TITLE" in kws and "*BOUNDARY_SPC_SET" in kws
+    assert any("Coordinate set" in m for m in logmsgs)
+    # captured variant for the parallel batch queue
+    label, ok_flag, text, prev2 = job_runner.run_job_captured(
+        ("job-1", settings, out, {**kopts, "split_mode": None}))
+    assert label == "job-1" and ok_flag and "Done in" in text and prev2
+    bad = mesher.MeshSettings(step_file="missing.step")
+    _, ok_flag, text, _ = job_runner.run_job_captured(("job-2", bad, out, kopts))
+    assert not ok_flag and "ERROR" in text
+    print("OK: run_job + captured variant, include mode, coord set applied")
+
+
+def test_parallel_batch_workers():
+    print("=== parallel batch (worker processes) ===")
+    import multiprocessing
+
+    import job_runner
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    _ensure_geometry()
+    kopts = {
+        "pid": 1, "elform": 10, "element_kind": "solid", "thickness": 1.0,
+        "start_nid": 1, "start_eid": 1, "start_sid": 1,
+        "sym_nodeset": False, "sym_spc": False, "sym_constraint": "symmetric",
+        "sym_dofs": "", "sym_segset": False,
+        "mat": None, "part_mats": {},
+        "face_nodesets": False, "face_segsets": False, "face_roles": [],
+        "plain_faces": [], "face_titles": {}, "coord_sets": [],
+        "implicit_cards": False, "qa_sets": False, "mesh_only": False,
+        "split_mode": None, "contact_fs": None, "tssfac": None,
+        "gravity": None,
+    }
+    jobs = [("par-1", mesher.MeshSettings(step_file=STEP, size_max=10.0),
+             os.path.join(OUT_DIR, "par1.k"), kopts),
+            ("par-2", mesher.MeshSettings(step_file=STEP2, size_max=8.0),
+             os.path.join(OUT_DIR, "par2.k"), kopts)]
+    results = {}
+    # spawn, not fork: forked children of a gmsh/OpenMP parent deadlock
+    with ProcessPoolExecutor(
+            max_workers=2,
+            mp_context=multiprocessing.get_context("spawn")) as pool:
+        futures = [pool.submit(job_runner.run_job_captured, j) for j in jobs]
+        for fut in as_completed(futures):
+            label, ok_flag, text, preview = fut.result()
+            results[label] = (ok_flag, text)
+    assert set(results) == {"par-1", "par-2"}
+    for label, (ok_flag, text) in results.items():
+        assert ok_flag, f"{label} failed:\n{text}"
+        assert "Done in" in text
+    assert os.path.isfile(os.path.join(OUT_DIR, "par1.k"))
+    assert os.path.isfile(os.path.join(OUT_DIR, "par2.k"))
+    print("OK: two jobs meshed in parallel worker processes")
+
+
+def test_cli_nset_stl_and_export():
+    print("=== CLI: --nset on STL input, --export, --target-dt ===")
+    _ensure_geometry()
+    if not os.path.isfile(FORMAT_BASE + ".stl"):
+        make_formats(FORMAT_BASE)
+    k_cli = os.path.join(OUT_DIR, "cli_stl_nset.k")
+    vtk = os.path.join(OUT_DIR, "cli_export.vtk")
+    rc = mesh_cli.main([FORMAT_BASE + ".stl", "--etype", "tet4",
+                        "-o", k_cli, "--size-max", "8", "--mat",
+                        "--nset", "plane,z,12.5,spc=123,title=TOP_FIX",
+                        "--nset", "sphere,0,0,0,15,force=z:-500",
+                        "--nset", "box,999,999,999,1000,1000,1000",
+                        "--export", vtk, "--target-dt", "1"])
+    assert rc == 0
+    _, _, _, kws = parse_k(k_cli)
+    assert "*SET_NODE_LIST_TITLE" in kws
+    assert "*BOUNDARY_SPC_SET" in kws, "nset spc= role must write the SPC"
+    assert "*LOAD_NODE_SET" in kws, "nset force= role must write the load"
+    txt = open(k_cli).read()
+    assert "TOP_FIX" in txt, "nset title= must name the set"
+    assert os.path.isfile(vtk), "--export must write the VTK file"
+    print("OK: BCs/loads on STL via coordinate sets, VTK exported")
+
+
+def test_cli_split_include():
+    print("=== CLI: --split-include (+ mutex with --split-parts) ===")
+    _ensure_geometry()
+    k_cli = os.path.join(OUT_DIR, "cli_include.k")
+    js_cli = os.path.join(OUT_DIR, "cli_include.json")
+    rc = mesh_cli.main([STEP2, "-o", k_cli, "--size-max", "6", "--glue",
+                        "--mat", "--part-rigid", "2", "--split-include",
+                        "--stats-json", js_cli])
+    assert rc == 0
+    _, _, _, kws = parse_k(k_cli)
+    assert kws.count("*INCLUDE") == 2 and "*NODE" not in kws
+    assert "*MAT_RIGID" in kws, "--part-rigid must write the rigid card"
+    with open(js_cli) as f:
+        payload = json.load(f)
+    assert len(payload["split_files"]) == 2
+    for fpath in payload["split_files"].values():
+        assert os.path.isfile(fpath)
+    # the two split modes are mutually exclusive
+    rc2 = mesh_cli.main([STEP2, "-o", k_cli, "--split-parts", "--split-include"])
+    assert rc2 == 2
+    print("OK: master + fragments via CLI, rigid card, mutex enforced")
 
 
 def test_control_timestep_and_gravity_cards():
