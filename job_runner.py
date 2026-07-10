@@ -11,6 +11,12 @@ tested headlessly.
     mat, part_mats, face_nodesets, face_segsets, face_roles, plain_faces,
     face_titles, coord_sets, implicit_cards, qa_sets, mesh_only, split_mode
     (None | "parts" | "include"), contact_fs, tssfac, gravity
+
+Optional LS-DYNA control / load cards (all read with a safe default, so a
+caller that omits them still works):
+    endtim, mass_scale, hourglass, control_energy, databases,
+    initial_velocity, contacts, define_curves, prescribed_motion,
+    rigidwalls, spotwelds
 """
 from __future__ import annotations
 
@@ -139,14 +145,27 @@ def run_job(settings, out: str, kopts: dict, log=print) -> str:
         face_sets=tuple(face_sets), elem_sets=tuple(elem_sets),
         implicit_cards=kopts["implicit_cards"], mesh_only=kopts["mesh_only"],
         tssfac=kopts["tssfac"], body_load=kopts["gravity"],
+        # optional LS-DYNA control / load cards (default: no-op)
+        endtim=kopts.get("endtim"), mass_scale=kopts.get("mass_scale"),
+        hourglass=kopts.get("hourglass"),
+        control_energy=kopts.get("control_energy", False),
+        initial_velocity=kopts.get("initial_velocity"),
+        define_curves=tuple(kopts.get("define_curves") or ()),
+        prescribed_motion=tuple(kopts.get("prescribed_motion") or ()),
+        rigidwalls=tuple(kopts.get("rigidwalls") or ()),
+        spotwelds=tuple(kopts.get("spotwelds") or ()),
     )
+    databases = kopts.get("databases")
+    if databases:
+        common["databases"] = databases
+    contacts = tuple(kopts.get("contacts") or ())
     split_mode = kopts.get("split_mode")
     log(f"Writing LS-DYNA keyword file: {out}")
     if split_mode == "include":
         files = dyna_writer.write_k_include(
             out, result.coords, result.elems, pid=pid0,
             part_ids=part_ids, part_titles=part_titles, title=title,
-            contact_fs=kopts["contact_fs"], **common)
+            contact_fs=kopts["contact_fs"], contacts=contacts, **common)
         for p, fpath in files:
             log(f"Wrote mesh fragment: {fpath} (PID {p})")
         log(f"Master deck with *INCLUDE cards: {out}")
@@ -154,7 +173,7 @@ def run_job(settings, out: str, kopts: dict, log=print) -> str:
         dyna_writer.write_k(
             out, result.coords, result.elems, pid=pid0,
             part_ids=part_ids, part_titles=part_titles, title=title,
-            contact_fs=kopts["contact_fs"], **common)
+            contact_fs=kopts["contact_fs"], contacts=contacts, **common)
         if split_mode == "parts":
             files = dyna_writer.write_k_split(
                 out, result.coords, result.elems,

@@ -1177,6 +1177,82 @@ def test_cli_assembly_options():
     print("OK: assembly cards, per-part masses, split files written")
 
 
+def test_cli_version():
+    print("=== CLI: --version flag / _version import ===")
+    import _version
+    assert _version.__version__, "package must expose a version string"
+    try:
+        mesh_cli.build_parser().parse_args(["x", "--version"])
+        raise AssertionError("--version must exit")
+    except SystemExit as e:
+        assert e.code == 0, "--version must exit cleanly"
+    print(f"OK: --version exits, version {_version.__version__}")
+
+
+def test_cli_dyna_control_cards():
+    print("=== CLI: LS-DYNA control / load flags ===")
+    _ensure_geometry()
+    k_cli = os.path.join(OUT_DIR, "cli_control.k")
+    rc = mesh_cli.main([
+        STEP, "-o", k_cli, "--size-max", "10", "--mat",
+        "--endtim", "0.01", "--mass-scale=-1e-6",
+        "--hourglass", "5:0.05", "--control-energy",
+        "--d3plot-dt", "1e-4", "--database", "GLSTAT:1e-5",
+        "--init-velocity", "0:0:-5000",
+        "--contact", "0.1", "--contact-type", "tied_surface_to_surface",
+        "--rigidwall", "0:0:-50:0:0:1:0.2", "--spotweld", "1:2",
+        "--define-curve", "99:0,0;1,1",
+        "--prescribed-motion", "1:3:0:99:1.0"])
+    assert rc == 0
+    _, _, _, kws = parse_k(k_cli)
+    for kw in ("*CONTROL_TERMINATION", "*CONTROL_TIMESTEP", "*CONTROL_ENERGY",
+               "*HOURGLASS", "*DATABASE_BINARY_D3PLOT", "*DATABASE_GLSTAT",
+               "*INITIAL_VELOCITY_GENERATION", "*CONTACT_TIED_SURFACE_TO_SURFACE",
+               "*RIGIDWALL_PLANAR", "*CONSTRAINED_SPOTWELD",
+               "*BOUNDARY_PRESCRIBED_MOTION_SET"):
+        assert kw in kws, f"missing {kw}"
+    # --contact-type routes contact through the general list, not single-surface
+    assert "*CONTACT_AUTOMATIC_SINGLE_SURFACE" not in kws
+    txt = open(k_cli).read()
+    assert "-1e-06" in txt, "DT2MS mass-scale value must be on *CONTROL_TIMESTEP"
+    print("OK: all new control/load cards emitted via the CLI")
+
+
+def test_job_runner_control_cards():
+    print("=== job_runner: new LS-DYNA control/load kopts ===")
+    import job_runner
+    _ensure_geometry()
+    kopts = {
+        "pid": 1, "elform": 10, "element_kind": "solid", "thickness": 1.0,
+        "start_nid": 1, "start_eid": 1, "start_sid": 1,
+        "sym_nodeset": False, "sym_spc": False, "sym_constraint": "symmetric",
+        "sym_dofs": "", "sym_segset": False,
+        "mat": dict(STEEL), "part_mats": {},
+        "face_nodesets": False, "face_segsets": False, "face_roles": [],
+        "plain_faces": [], "face_titles": {}, "coord_sets": [],
+        "implicit_cards": False, "qa_sets": False, "mesh_only": False,
+        "split_mode": None, "contact_fs": None, "tssfac": 0.9,
+        "gravity": None,
+        # the GUI-shared contract subset
+        "endtim": 0.02, "mass_scale": -1e-6,
+        "hourglass": {"ihq": 5, "qm": 0.1}, "control_energy": True,
+        "databases": {"d3plot_dt": 1e-4, "ascii": {"GLSTAT": 1e-5}},
+        "initial_velocity": {"vx": 0.0, "vy": 0.0, "vz": -1000.0},
+        "contacts": ({"type": "automatic_surface_to_surface", "fs": 0.2},),
+    }
+    settings = mesher.MeshSettings(step_file=STEP, size_max=10.0)
+    out = os.path.join(OUT_DIR, "runner_control.k")
+    job_runner.run_job(settings, out, kopts, log=QUIET)
+    _, _, _, kws = parse_k(out)
+    for kw in ("*CONTROL_TERMINATION", "*CONTROL_TIMESTEP", "*CONTROL_ENERGY",
+               "*HOURGLASS", "*DATABASE_BINARY_D3PLOT", "*DATABASE_GLSTAT",
+               "*INITIAL_VELOCITY_GENERATION",
+               "*CONTACT_AUTOMATIC_SURFACE_TO_SURFACE"):
+        assert kw in kws, f"missing {kw}"
+    assert "-1e-06" in open(out).read(), "DT2MS mass-scale value must appear"
+    print("OK: control/load cards land through run_job kopts")
+
+
 def main():
     tests = [(name, fn) for name, fn in sorted(globals().items())
              if name.startswith("test_") and callable(fn)]
