@@ -99,6 +99,14 @@ GMSH2DYNA_TET10 = [0, 1, 2, 3, 4, 5, 6, 7, 9, 8]
 # in LS-DYNA ordering
 NEGFIX = {4: [0, 2, 1, 3], 10: [0, 2, 1, 3, 6, 5, 4, 7, 9, 8]}
 
+# Plate detection for midsurface extraction. A thin, roughly constant-thickness
+# plate (the sheet-metal case) has two dominant boundary faces that are nearly
+# parallel and of nearly equal area, separated by a small gap - the wall
+# thickness - relative to the in-plane extent sqrt(area).
+_PLATE_AREA_RATIO = 0.5        # min (second / first) dominant-face area ratio
+_PLATE_PARALLEL = 0.9          # min |dot| of the two dominant-face unit normals
+_PLATE_THICKNESS_RATIO = 0.25  # max thickness / sqrt(in-plane area)
+
 # quality criteria limits (LS-DYNA practice)
 QUALITY_LIMITS = {
     "solid": {"aspect ratio": ("max", 8.0), "SICN": ("min", 0.2)},
@@ -345,6 +353,181 @@ def list_faces(settings: MeshSettings, log=print) -> list[dict]:
                      "centroid": tuple(float(c) for c in com)})
             log(f"Found {len(faces)} faces")
             return faces
+        finally:
+            gmsh.finalize()
+
+
+# --------------------------------------------------------------------------
+# midsurface (shell) extraction for thin plate-like solids
+# --------------------------------------------------------------------------
+
+def _face_props(tag: int):
+    """(area, center-of-mass (3,), unit normal (3,) or None) of a model face.
+
+    The normal is sampled at the parametric midpoint - exact for planar faces,
+    which is all plate detection relies on."""
+    area = gmsh.model.occ.getMass(2, tag)
+    com = np.array(gmsh.model.occ.getCenterOfMass(2, tag), dtype=float)
+    normal = None
+    try:
+        pmin, pmax = gmsh.model.getParametrizationBounds(2, tag)
+        uv = [0.5 * (pmin[0] + pmax[0]), 0.5 * (pmin[1] + pmax[1])]
+        n = np.array(gmsh.model.getNormal(tag, uv)[:3], dtype=float)
+        ln = float(np.linalg.norm(n))
+        if ln > 0:
+            normal = n / ln
+    except Exception:
+        normal = None
+    return float(area), com, normal
+
+
+def _detect_plate(vol: int):
+    """Decide whether solid ``vol`` is a thin, roughly constant-thickness plate.
+
+    Returns ``{"dominant": face_tag, "thickness": t, "mid_move": (3,)}`` for a
+    plate (``mid_move`` translates the dominant face to the mid-plane), or None.
+
+    Heuristic: the two largest boundary faces must be nearly parallel, of nearly
+    equal area, and separated by a gap (the wall thickness) that is small
+    relative to the in-plane extent sqrt(area). Limits: a single dominant face
+    per side (a face split into patches is not recognised) and near-planar,
+    roughly constant-thickness plates only - no medial-axis midsurfacing of
+    general solids."""
+    faces = [t for _, t in gmsh.model.getBoundary([(3, vol)], oriented=False)]
+    if len(faces) < 2:
+        return None
+    props = {t: _face_props(t) for t in faces}
+    ordered = sorted(faces, key=lambda t: props[t][0], reverse=True)
+    t0, t1 = ordered[0], ordered[1]
+    a0, c0, n0 = props[t0]
+    a1, c1, n1 = props[t1]
+    if a0 <= 0 or n0 is None or n1 is None:
+        return None
+    if a1 / a0 < _PLATE_AREA_RATIO:                 # areas not nearly equal
+        return None
+    if abs(float(np.dot(n0, n1))) < _PLATE_PARALLEL:  # faces not parallel
+        return None
+    signed = float(np.dot(c1 - c0, n0))
+    thickness = abs(signed)
+    inplane = float(np.sqrt(a0))
+    if thickness <= 0 or inplane <= 0:
+        return None
+    if thickness / inplane > _PLATE_THICKNESS_RATIO:  # too thick to be a plate
+        return None
+    mid_move = n0 * (np.sign(signed) * 0.5 * thickness)
+    return {"dominant": t0, "thickness": thickness, "mid_move": mid_move}
+
+
+def midsurface_shell(settings: MeshSettings, log=print,
+                     preview_path: str | None = None,
+                     export_paths: tuple[str, ...] = ()) -> MeshResult:
+    """Extract a midsurface shell mesh from thin, plate-like solids of roughly
+    constant thickness (the common sheet-metal case) and set the shell
+    thickness from the measured wall thickness.
+
+    For every solid body the plate detector looks for two dominant boundary
+    faces that are nearly parallel and of nearly equal area, a small gap apart;
+    that gap is the wall thickness. One dominant face is translated to the
+    mid-plane and meshed with shells. Bodies that are not plate-like are skipped
+    with a warning; if no body is plate-like a RuntimeError is raised.
+
+    The measured thickness is reported as ``stats["midsurface_thickness"]`` (the
+    mean) and ``stats["midsurface_thicknesses"]`` (per plate body) - feed it to
+    ``dyna_writer.write_k(..., element_kind="shell", thickness=...)``.
+
+    Approximation / limits: constant-thickness, near-planar plates only (no
+    medial-axis midsurfacing of general solids); each plate must present a
+    single dominant face per side (a face split into patches, tapered or
+    strongly curved plates are not handled). The shell sits on the mid-plane of
+    the two dominant faces, so for a genuinely constant-thickness plate it is
+    the true midsurface; the reported thickness is the measured wall gap.
+
+    ``settings.element_type`` selects the shell element when it is a shell type
+    (TRI3/QUAD4); otherwise TRI3 is used. Symmetry/refinement/defeature options
+    are honoured on import but not on the extracted shell."""
+    if input_kind(settings.step_file) == "mesh":
+        raise RuntimeError(
+            "Midsurface extraction needs CAD solids (STEP/IGES/BREP), not a "
+            "tessellated mesh (STL/OBJ/PLY), which carries no solid geometry.")
+    shell_type = (settings.element_type
+                  if ETYPES.get(settings.element_type, {}).get("family") == "shell"
+                  else "TRI3")
+
+    # _GMSH_LOCK serializes the whole init..finalize block (see mesh_step).
+    with _GMSH_LOCK:
+        if not gmsh.isInitialized():
+            gmsh.initialize(interruptible=False)
+        try:
+            # import as a solid so the plate bodies and their faces are present
+            bbox, _ = _load_geometry(replace(settings, element_type="TET4"), log)
+            occ = gmsh.model.occ
+            vols = [t for _, t in gmsh.model.getEntities(3)]
+
+            plates = []
+            for v in vols:
+                det = _detect_plate(v)
+                if det is None:
+                    log(f"WARNING: solid {v} is not plate-like (no pair of "
+                        f"large, nearly parallel faces of equal area a small "
+                        f"gap apart) - skipped for midsurface extraction")
+                else:
+                    plates.append(det)
+                    log(f"Plate solid {v}: wall thickness {det['thickness']:.4g}")
+            if not plates:
+                raise RuntimeError(
+                    "No plate-like solid found. Midsurface extraction handles "
+                    "only thin solids of roughly constant thickness - two "
+                    "large, nearly parallel faces a small gap apart (the "
+                    "sheet-metal case). This model looks like a general/blocky "
+                    "solid. Mesh it with solids or boundary shells instead, or "
+                    "export the midsurface from CAD.")
+
+            # drop the volumes (keeping their faces), then keep only one
+            # dominant face per plate and move it to the mid-plane
+            if vols:
+                occ.remove([(3, v) for v in vols], recursive=False)
+                occ.synchronize()
+            keep = {det["dominant"] for det in plates}
+            drop = [(2, t) for _, t in gmsh.model.getEntities(2) if t not in keep]
+            if drop:
+                try:
+                    occ.remove(drop, recursive=True)
+                except Exception:
+                    occ.remove(drop, recursive=False)
+                occ.synchronize()
+            for det in plates:
+                mv = det["mid_move"]
+                if float(np.linalg.norm(mv)) > 0:
+                    occ.translate([(2, det["dominant"])],
+                                  float(mv[0]), float(mv[1]), float(mv[2]))
+            occ.synchronize()
+            bbox = gmsh.model.getBoundingBox(-1, -1)
+
+            mesh_settings = replace(settings, element_type=shell_type,
+                                    symmetry=[], refinements=[], face_sizes={},
+                                    defeature_faces=[], collect_faces=[])
+            _generate_mesh(mesh_settings, log)
+
+            coords, elems, elem_parts, part_names, _, checks = _extract_shells(log)
+            sym_nodes: dict = {}
+            stats = _collect_stats(coords, elems, shell_type, bbox, elem_parts)
+            stats.update(checks)
+            stats["duplicate_nodes"] = _count_duplicate_nodes(coords)
+            thicknesses = [float(d["thickness"]) for d in plates]
+            stats["midsurface_thicknesses"] = thicknesses
+            stats["midsurface_thickness"] = float(np.mean(thicknesses))
+            _log_stats(stats, sym_nodes, log)
+            log(f"Midsurface shell from {len(plates)} plate body(ies); "
+                f"thickness {stats['midsurface_thickness']:.4g} (per body: "
+                f"{', '.join(f'{t:.4g}' for t in thicknesses)})")
+
+            for out_path in (([preview_path] if preview_path else [])
+                             + list(export_paths)):
+                gmsh.write(out_path)
+            return MeshResult(
+                coords=coords, elems=elems, elem_parts=elem_parts,
+                part_names=part_names, sym_nodes=sym_nodes,
+                face_nodes={}, face_segs={}, stats=stats)
         finally:
             gmsh.finalize()
 
