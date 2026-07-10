@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.join(ROOT, "examples"))
 
 tk = pytest.importorskip("tkinter", reason="tkinter not available")
 
-import gui  # noqa: E402
+from k_mesher import gui  # noqa: E402
 from make_test_step import make, make_two_bodies  # noqa: E402
 
 STEP = os.path.join(ROOT, "examples", "test_part.step")
@@ -240,3 +240,67 @@ def test_control_output_settings_round_trip(app):
     assert app.var_hourglass.get() is True
     assert app.var_db.get() is True
     assert app.var_contact_type.get() == "Automatic surface to surface"
+
+
+def test_connections_defaults_off(app):
+    _ensure_geometry()
+    _, _, kopts = app._collect_inputs(need_out=False)
+    assert kopts["midsurface"] is False
+    assert kopts["auto_connect"] is None
+
+
+def test_midsurface_wiring(app):
+    _ensure_geometry()
+    app.var_midsurface.set(True)
+    _, _, kopts = app._collect_inputs(need_out=False)
+    assert kopts["midsurface"] is True
+
+
+def test_auto_connect_spotweld(app):
+    _ensure_geometry()
+    app.var_connect_mode.set("Spotweld (*CONSTRAINED_SPOTWELD)")
+    app.var_connect_tol.set("0.5")
+    app.var_connect_spacing.set("10")
+    _, _, kopts = app._collect_inputs(need_out=False)
+    assert kopts["auto_connect"] == {"mode": "spotweld", "tol": 0.5,
+                                     "spacing": 10.0, "fs": 0.0}
+
+
+def test_auto_connect_tied_blank_numerics(app):
+    _ensure_geometry()
+    app.var_connect_mode.set("Tied contact")
+    app.var_connect_tol.set("")       # blank -> None
+    app.var_connect_spacing.set("")   # blank -> None
+    app.var_connect_fs.set("0.15")
+    _, _, kopts = app._collect_inputs(need_out=False)
+    assert kopts["auto_connect"] == {"mode": "tied", "tol": None,
+                                     "spacing": None, "fs": 0.15}
+
+
+def test_connect_tol_validation(app):
+    _ensure_geometry()
+    app.var_connect_mode.set("Spotweld (*CONSTRAINED_SPOTWELD)")
+    app.var_connect_tol.set("-1")
+    with pytest.raises(ValueError):
+        app._collect_inputs(need_out=False)
+
+
+def test_connections_settings_round_trip(app):
+    _ensure_geometry()
+    app.var_midsurface.set(True)
+    app.var_connect_mode.set("Tied contact")
+    app.var_connect_tol.set("0.25")
+    app.var_connect_fs.set("0.2")
+    data = app._collect_settings_data()
+    for key in ("midsurface", "connect_mode", "connect_tol",
+                "connect_spacing", "connect_fs"):
+        assert key in data
+    app.var_midsurface.set(False)
+    app.var_connect_mode.set(next(iter(gui.CONNECT_MODES)))
+    app.var_connect_tol.set("")
+    app.var_connect_fs.set("0.0")
+    app._apply_settings_data(data)
+    assert app.var_midsurface.get() is True
+    assert app.var_connect_mode.get() == "Tied contact"
+    assert app.var_connect_tol.get() == "0.25"
+    assert app.var_connect_fs.get() == "0.2"

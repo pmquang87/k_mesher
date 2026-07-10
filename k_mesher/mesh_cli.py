@@ -32,9 +32,13 @@ import sys
 
 import numpy as np
 
-import _version
-import dyna_writer
-import mesher
+from k_mesher import _version
+from k_mesher import connections
+from k_mesher import dyna_writer
+from k_mesher import mesher
+
+# sentinel: --auto-spotweld given with no SPACING value (welds at every node)
+_SPOTWELD_ON = object()
 
 
 def _json_default(o):
@@ -575,19 +579,59 @@ def build_parser() -> argparse.ArgumentParser:
                    metavar="NSID:DOF:VAD:LCID[:SF]",
                    help="*BOUNDARY_PRESCRIBED_MOTION_SET (vad 0 vel / 1 accel "
                         "/ 2 disp), repeatable")
+
+    c = p.add_argument_group("mesh-time connections / midsurface")
+    c.add_argument("--midsurface", action="store_true",
+                   help="mesh thin, constant-thickness plate solids as a "
+                        "midsurface shell (CAD B-rep only); forces a shell "
+                        "element type and takes the *SECTION_SHELL thickness "
+                        "from the detected wall thickness (an explicit "
+                        "--thickness wins)")
+    c.add_argument("--auto-spotweld", type=float, nargs="?",
+                   const=_SPOTWELD_ON, default=None, metavar="SPACING",
+                   help="detect the interfaces of a multi-body model and weld "
+                        "them with *CONSTRAINED_SPOTWELD node pairs; the "
+                        "optional SPACING thins the pattern to that minimum "
+                        "spot spacing (see --connect-tol)")
+    c.add_argument("--tied-contact", action="store_true",
+                   help="detect the interfaces of a multi-body model and tie "
+                        "them with *CONTACT_TIED_SURFACE_TO_SURFACE over the "
+                        "interface segment sets (see --connect-tol)")
+    c.add_argument("--connect-tol", type=float, default=None, metavar="TOL",
+                   help="node-matching tolerance shared by --auto-spotweld and "
+                        "--tied-contact (default: 1e-3 of the bounding-box "
+                        "diagonal)")
     return p
 
 
 def main(argv=None) -> int:
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
     args = build_parser().parse_args(argv)
     if not os.path.isfile(args.input):
         print(f"error: input file not found: {args.input}", file=sys.stderr)
         return 2
+    # did the user pass --thickness explicitly? (default 1.0 stays otherwise)
+    user_thickness = any(a == "--thickness" or a.startswith("--thickness=")
+                         for a in raw_argv)
 
     if args.tet10 and args.etype != "tet4":
         print(f"warning: --tet10 (deprecated) overrides --etype {args.etype}; "
               f"meshing TET10", file=sys.stderr)
     etype = "TET10" if args.tet10 else args.etype.upper()
+    if args.midsurface:
+        if mesher.input_kind(args.input) == "mesh":
+            print("error: --midsurface needs CAD solids (STEP/IGES/BREP); a "
+                  "tessellated mesh (STL/OBJ/PLY) carries no solid geometry",
+                  file=sys.stderr)
+            return 2
+        # midsurface always writes shells: keep a shell --etype, else default
+        # to TRI3 (a solid --etype is just the "no shell type given" case)
+        shell_etype = etype if mesher.ETYPES[etype]["family"] == "shell" \
+            else "TRI3"
+        if shell_etype != etype:
+            print(f"note: --midsurface writes shells; using {shell_etype} "
+                  f"(pass --etype tri3/quad4 to choose)", file=sys.stderr)
+        etype = shell_etype
     defaults = {"TET4": 10, "TET10": 16, "TRI3": 4, "QUAD4": 16}
     allowed = {"TET4": (10, 13), "TET10": (16, 17),
                "TRI3": (4, 17), "QUAD4": (2, 16)}
@@ -647,8 +691,9 @@ def main(argv=None) -> int:
 
     out = args.output or os.path.splitext(args.input)[0] + ".k"
     preview_path = os.path.splitext(out)[0] + "_preview.msh"
+    mesh_fn = mesher.midsurface_shell if args.midsurface else mesher.mesh_step_auto
     try:
-        result = mesher.mesh_step_auto(
+        result = mesh_fn(
             settings, log=print,
             preview_path=preview_path if args.preview else None,
             export_paths=tuple(args.export))
@@ -657,6 +702,15 @@ def main(argv=None) -> int:
         return 1
     for path in args.export:
         print(f"Wrote {path}")
+
+    # shell thickness: the CLI value, unless midsurface detected one and the
+    # user did not pass --thickness explicitly (then the detected value wins)
+    thickness = args.thickness
+    if args.midsurface:
+        detected = result.stats["midsurface_thickness"]
+        print(f"Detected midsurface thickness: {detected:.4g}")
+        if not user_thickness:
+            thickness = detected
 
     sym_sets = []
     if not args.no_sym_sets:
@@ -710,6 +764,32 @@ def main(argv=None) -> int:
         face_sets.append(item)
         print(f"Coordinate set {label}: {len(ids)} nodes")
 
+    # automatic connection detection between touching bodies (spotwelds are
+    # written by write_k/write_k_include only, like contact - not the split
+    # files); tied-contact segment sets are merged into face_sets
+    auto_spotwelds = ()
+    auto_contacts = ()
+    if args.auto_spotweld is not None:
+        spacing = (None if args.auto_spotweld is _SPOTWELD_ON
+                   else args.auto_spotweld)
+        auto_spotwelds = tuple(connections.spotweld_pairs(
+            result, tol=args.connect_tol, spacing=spacing))
+        if auto_spotwelds:
+            print(f"Auto-spotweld: {len(auto_spotwelds)} weld(s) on the "
+                  f"detected interfaces")
+        else:
+            print("warning: --auto-spotweld found no interfaces (single body "
+                  "or no bodies within tolerance)", file=sys.stderr)
+    if args.tied_contact:
+        tie_sets, auto_contacts = connections.tied_contact(
+            result, tol=args.connect_tol)
+        if tie_sets:
+            face_sets.extend(tie_sets)
+            print(f"Tied contact: {len(tie_sets)} interface segment set(s)")
+        else:
+            print("warning: --tied-contact found no interfaces (single body "
+                  "or no bodies within tolerance)", file=sys.stderr)
+
     elem_sets = []
     failed = result.stats.get("failed_elems", ())
     if not args.no_qa_sets and len(failed):
@@ -729,7 +809,7 @@ def main(argv=None) -> int:
 
     mass, part_masses, dt_est = mesher.mass_and_timestep(
         result, etype, args.mat, part_mats, args.pid,
-        args.thickness if is_shell else 1.0, log=print)
+        thickness if is_shell else 1.0, log=print)
 
     if args.target_dt and dt_est:
         lc = result.stats.get("char_length", 0.0)
@@ -766,6 +846,9 @@ def main(argv=None) -> int:
         fs = args.contact if args.contact is not None else 0.0
         contacts = ({"type": args.contact_type, "fs": fs},)
         contact_fs = None
+    # auto tied-contact appends to whatever contact the user requested
+    contacts = tuple(contacts) + tuple(auto_contacts)
+    spotwelds = tuple(args.spotweld) + tuple(auto_spotwelds)
 
     databases = {}
     if args.d3plot_dt is not None:
@@ -775,7 +858,7 @@ def main(argv=None) -> int:
 
     common = dict(
         element_kind="shell" if is_shell else "solid",
-        elform=elform, thickness=args.thickness,
+        elform=elform, thickness=thickness,
         start_nid=args.start_nid, start_eid=args.start_eid,
         start_sid=args.start_sid,
         title=args.title or os.path.splitext(os.path.basename(out))[0],
@@ -789,7 +872,7 @@ def main(argv=None) -> int:
         initial_velocity=args.init_velocity,
         define_curves=tuple(args.define_curve),
         prescribed_motion=tuple(args.prescribed_motion),
-        rigidwalls=tuple(args.rigidwall), spotwelds=tuple(args.spotweld),
+        rigidwalls=tuple(args.rigidwall),
     )
     if databases:
         common["databases"] = databases
@@ -798,7 +881,8 @@ def main(argv=None) -> int:
         split_files = dyna_writer.write_k_include(
             out, result.coords, result.elems, pid=args.pid,
             part_ids=part_ids, part_titles=part_titles,
-            contact_fs=contact_fs, contacts=contacts, **common)
+            contact_fs=contact_fs, contacts=contacts,
+            spotwelds=spotwelds, **common)
         for p, f in split_files:
             print(f"Wrote {f} (mesh fragment, PID {p})")
         print(f"Wrote {out} (master deck with *INCLUDE cards)")
@@ -806,7 +890,8 @@ def main(argv=None) -> int:
         dyna_writer.write_k(
             out, result.coords, result.elems, pid=args.pid,
             part_ids=part_ids, part_titles=part_titles,
-            contact_fs=contact_fs, contacts=contacts, **common)
+            contact_fs=contact_fs, contacts=contacts,
+            spotwelds=spotwelds, **common)
         print(f"Wrote {out}")
         if args.split_parts:
             split_files = dyna_writer.write_k_split(

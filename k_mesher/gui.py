@@ -13,8 +13,8 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from tkinter.scrolledtext import ScrolledText
 
-import job_runner
-import mesher
+from k_mesher import job_runner
+from k_mesher import mesher
 
 ELEMENT_TYPES = {
     "TET4 (linear tetrahedron)": "TET4",
@@ -69,6 +69,14 @@ CONTACT_TYPES = {
     "Automatic surface to surface": "automatic_surface_to_surface",
     "Tied surface to surface": "tied_surface_to_surface",
     "Tied nodes to surface": "tied_nodes_to_surface",
+}
+# auto-connect modes (label -> job_runner auto_connect "mode" id). "None" leaves
+# kopts["auto_connect"] as None (no interface detection); the others auto-detect
+# body interfaces after meshing and write spotwelds or a tied contact.
+CONNECT_MODES = {
+    "None (no auto-detect)": "none",
+    "Spotweld (*CONSTRAINED_SPOTWELD)": "spotweld",
+    "Tied contact": "tied",
 }
 # coordinate node-set kinds (label -> (mesher.select_nodes kind, params hint))
 COORD_KINDS = {
@@ -170,6 +178,7 @@ class KMesherGUI:
         self._load_settings()
         self._sync_elforms()
         self._sync_sym_bc()
+        self._sync_connect()
         self._refresh_presets()
         root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._poll_log()
@@ -458,6 +467,52 @@ class KMesherGUI:
         ttk.Label(ctrl, text="(uses the contact friction set above)",
                   foreground="gray").grid(row=7, column=3, sticky="w")
 
+        conn = ttk.LabelFrame(tab, text="Connections & midsurface", padding=6)
+        conn.grid(row=3, column=0, sticky="ew", **pad)
+        for c in (1, 3):
+            conn.columnconfigure(c, weight=1)
+
+        self.var_midsurface = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            conn, text="Midsurface shell (thin plates) - meshes thin plate "
+                       "solids as a mid-surface SHELL; the element type and "
+                       "shell thickness above are overridden automatically",
+            variable=self.var_midsurface).grid(
+            row=0, column=0, columnspan=4, sticky="w")
+
+        ttk.Label(conn, text="Auto-connect bodies:").grid(row=1, column=0, sticky="w")
+        self.var_connect_mode = tk.StringVar(value=next(iter(CONNECT_MODES)))
+        cmb_conn = ttk.Combobox(conn, textvariable=self.var_connect_mode,
+                                state="readonly", width=32,
+                                values=list(CONNECT_MODES))
+        cmb_conn.grid(row=1, column=1, sticky="w", padx=4)
+        cmb_conn.bind("<<ComboboxSelected>>", lambda e: self._sync_connect())
+        ttk.Label(conn, text="(detects body interfaces after meshing)",
+                  foreground="gray").grid(row=1, column=2, columnspan=2, sticky="w")
+
+        ttk.Label(conn, text="Tolerance:").grid(row=2, column=0, sticky="w")
+        self.var_connect_tol = tk.StringVar(value="")
+        ttk.Entry(conn, textvariable=self.var_connect_tol, width=10).grid(
+            row=2, column=1, sticky="w", padx=4)
+        ttk.Label(conn, text="(gap search distance; blank = auto)",
+                  foreground="gray").grid(row=2, column=2, columnspan=2, sticky="w")
+
+        ttk.Label(conn, text="Spotweld spacing:").grid(row=3, column=0, sticky="w")
+        self.var_connect_spacing = tk.StringVar(value="")
+        self.ent_connect_spacing = ttk.Entry(
+            conn, textvariable=self.var_connect_spacing, width=10)
+        self.ent_connect_spacing.grid(row=3, column=1, sticky="w", padx=4)
+        ttk.Label(conn, text="(spotweld only; blank = auto)",
+                  foreground="gray").grid(row=3, column=2, columnspan=2, sticky="w")
+
+        ttk.Label(conn, text="Tied friction:").grid(row=4, column=0, sticky="w")
+        self.var_connect_fs = tk.StringVar(value="0.0")
+        self.ent_connect_fs = ttk.Entry(
+            conn, textvariable=self.var_connect_fs, width=10)
+        self.ent_connect_fs.grid(row=4, column=1, sticky="w", padx=4)
+        ttk.Label(conn, text="(tied contact only; blank = 0)",
+                  foreground="gray").grid(row=4, column=2, columnspan=2, sticky="w")
+
     # ----------------------------------------- tab: symmetry & face sets --
     def _build_sym_tab(self, tab, pad):
         sym = ttk.LabelFrame(
@@ -667,6 +722,15 @@ class KMesherGUI:
         custom = SYM_CONSTRAINTS.get(self.var_sym_constraint.get()) == "custom"
         self.ent_sym_dofs.config(state="normal" if (spc_on and custom)
                                  else "disabled")
+
+    def _sync_connect(self):
+        """Enable the spacing entry only for spotweld mode and the friction
+        entry only for tied mode (both ignored when mode is 'none')."""
+        mode = CONNECT_MODES.get(self.var_connect_mode.get(), "none")
+        self.ent_connect_spacing.config(
+            state="normal" if mode == "spotweld" else "disabled")
+        self.ent_connect_fs.config(
+            state="normal" if mode == "tied" else "disabled")
 
     # -------------------------------------------------- refinements -------
     def _add_refinement(self):
@@ -940,6 +1004,7 @@ class KMesherGUI:
             self._apply_settings_data(presets[name])
             self._sync_elforms()
             self._sync_sym_bc()
+            self._sync_connect()
             self._log_write(f"Applied preset '{name}'")
 
     def _delete_preset(self):
@@ -1203,6 +1268,23 @@ class KMesherGUI:
                 contact_fs = fs
             else:
                 contacts = ({"type": ctype, "fs": fs},)
+
+        # --- midsurface + auto-connect (job_runner reads these with .get
+        # defaults; leaving both at their defaults keeps the old behaviour) ---
+        midsurface = self.var_midsurface.get()
+        connect_mode = CONNECT_MODES.get(self.var_connect_mode.get(), "none")
+        auto_connect = None
+        if connect_mode != "none":
+            auto_connect = {
+                "mode": connect_mode,
+                "tol": opt_num(self.var_connect_tol, "Connection tolerance",
+                               minval=0.0),
+                "spacing": opt_num(self.var_connect_spacing, "Spotweld spacing",
+                                   minval=0.0),
+                "fs": opt_num(self.var_connect_fs, "Tied contact friction",
+                              minval=0.0) or 0.0,
+            }
+
         tssfac = None
         if self.var_ctrl_dt.get():
             tssfac = num(self.var_tssfac, "TSSFAC")
@@ -1283,6 +1365,8 @@ class KMesherGUI:
             "split_mode": SPLIT_MODES.get(self.var_split_mode.get()),
             "contact_fs": contact_fs,
             "contacts": contacts,
+            "midsurface": midsurface,
+            "auto_connect": auto_connect,
             "tssfac": tssfac,
             "gravity": gravity,
             "endtim": endtim,
@@ -1374,6 +1458,11 @@ class KMesherGUI:
             "mesh_only": self.var_mesh_only, "split_mode": self.var_split_mode,
             "contact": self.var_contact, "contact_fs": self.var_contact_fs,
             "contact_type": self.var_contact_type,
+            "midsurface": self.var_midsurface,
+            "connect_mode": self.var_connect_mode,
+            "connect_tol": self.var_connect_tol,
+            "connect_spacing": self.var_connect_spacing,
+            "connect_fs": self.var_connect_fs,
             "ctrl_dt": self.var_ctrl_dt, "tssfac": self.var_tssfac,
             "grav": self.var_grav, "grav_axis": self.var_grav_axis,
             "grav_a": self.var_grav_a,

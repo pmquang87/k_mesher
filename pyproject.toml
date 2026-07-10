@@ -43,23 +43,25 @@ Homepage = "https://github.com/pmquang87/k_mesher"
 Repository = "https://github.com/pmquang87/k_mesher"
 "Bug Tracker" = "https://github.com/pmquang87/k_mesher/issues"
 
+[project.optional-dependencies]
+# FE-format bridge (Nastran / Abaqus / VTK ...): k_mesher.mesh_io
+io = ["meshio>=5"]
+# d3plot / binout post-processing: k_mesher.post
+post = ["lasso-python>=2"]
+# faster connection detection (KD-tree) and convergence plots
+extras = ["scipy>=1.10", "matplotlib>=3.6"]
+all = ["meshio>=5", "lasso-python>=2", "scipy>=1.10", "matplotlib>=3.6"]
+
 [project.scripts]
-k-mesher = "mesh_cli:cli_entry"
+k-mesher = "k_mesher.mesh_cli:cli_entry"
+k-mesher-doe = "k_mesher.doe:main"
+k-mesher-convert = "k_mesher.mesh_io:main"
 
 [project.gui-scripts]
-k-mesher-gui = "gui:main"
+k-mesher-gui = "k_mesher.gui:main"
 
 [tool.setuptools]
-py-modules = [
-    "_version",
-    "dyna_writer",
-    "gui",
-    "job_runner",
-    "k_reader",
-    "mesh_cli",
-    "mesher",
-    "preview",
-]
+packages = ["k_mesher"]
 
 [tool.setuptools.dynamic]
-version = { attr = "_version.__version__" }
+version = { attr = "k_mesher._version.__version__" }

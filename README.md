@@ -43,62 +43,112 @@ pip install -r requirements.txt
 python main.py
 ```
 
-Or install as a package — this puts `k-mesher` (CLI) and `k-mesher-gui`
-on your PATH:
+Or install as a package — this puts the console scripts `k-mesher` (CLI),
+`k-mesher-gui` (GUI), `k-mesher-doe` (mesh-convergence sweep) and
+`k-mesher-convert` (FE-format conversion) on your PATH:
 
 ```
 pip install .
 k-mesher part.stp --size-max 8
 k-mesher-gui
+k-mesher-doe part.stp --sizes 12,8,4 --csv sweep.csv
+k-mesher-convert mesh.msh mesh.k
 ```
+
+Optional features live behind dependency extras: `pip install k-mesher[io]`
+(meshio bridge), `[post]` (lasso-python results reader), `[extras]`
+(scipy + matplotlib), or `[all]` for everything. The bridge modules and the
+scipy/matplotlib code paths degrade gracefully when the optional dependency is
+absent.
 
 Or double-click / run `start_gui.py` — it automatically uses the project's
 `.venv` interpreter (no console window) regardless of which Python starts it.
 
+### Use as a library
+
+`import k_mesher` exposes a small public API for driving meshing from Python:
+
+```python
+import k_mesher
+
+settings = k_mesher.MeshSettings(size_max=8.0, size_min=1.0)
+result = k_mesher.mesh_step_auto("part.stp", settings)   # -> MeshResult
+k_mesher.write_k(result, "part.k")
+```
+
+`k_mesher.read_k` / `KModel` parse an existing `.k` deck, and the submodules
+`k_mesher.connections` (spotweld / tied-contact detection), `k_mesher.doe`
+(convergence sweeps), `k_mesher.mesh_io` (meshio bridge) and `k_mesher.post`
+(lasso results reader) cover the rest. The package imports headless — the GUI
+module is intentionally not pulled in by `import k_mesher`.
+
 Command line (batch) use:
 
 ```
-python mesh_cli.py part.stp --size-max 8 --size-min 1
-python mesh_cli.py part.iges -o half.k --sym x --mat --elform 13
-python mesh_cli.py part.brep --etype tet10 --algo hxt --sym x:0:+ --sym y:5:-
-python mesh_cli.py part.stl --etype tri3 --thickness 1.2      # STL -> shells
-python mesh_cli.py part.stl --etype tet4                      # watertight STL -> tets
-python mesh_cli.py sheet.stp --etype quad4 --thickness 2.5
-python mesh_cli.py part.stp --sym x --sym-constraint antisymmetric
-python mesh_cli.py part.stp --sym x --no-sym-spc              # node set, no BC
-python mesh_cli.py part.stp --sym x --sym-dofs 13             # custom SPC DOFs
-python mesh_cli.py part.stp --sym x --sym-segset              # + plane segment set
-python mesh_cli.py part.stp --list-faces
-python mesh_cli.py part.stp --face-nodeset 7 --face-segset 12
-python mesh_cli.py part.stp --refine-sphere 0:0:0:15:1.5 --face-size 6:2.0
-python mesh_cli.py part.stp --defeature 7 --spc 1 --pressure 6:0.5 \
+python -m k_mesher.mesh_cli part.stp --size-max 8 --size-min 1
+python -m k_mesher.mesh_cli part.iges -o half.k --sym x --mat --elform 13
+python -m k_mesher.mesh_cli part.brep --etype tet10 --algo hxt --sym x:0:+ --sym y:5:-
+python -m k_mesher.mesh_cli part.stl --etype tri3 --thickness 1.2      # STL -> shells
+python -m k_mesher.mesh_cli part.stl --etype tet4                      # watertight STL -> tets
+python -m k_mesher.mesh_cli sheet.stp --etype quad4 --thickness 2.5
+python -m k_mesher.mesh_cli part.stp --sym x --sym-constraint antisymmetric
+python -m k_mesher.mesh_cli part.stp --sym x --no-sym-spc              # node set, no BC
+python -m k_mesher.mesh_cli part.stp --sym x --sym-dofs 13             # custom SPC DOFs
+python -m k_mesher.mesh_cli part.stp --sym x --sym-segset              # + plane segment set
+python -m k_mesher.mesh_cli part.stp --list-faces
+python -m k_mesher.mesh_cli part.stp --face-nodeset 7 --face-segset 12
+python -m k_mesher.mesh_cli part.stp --refine-sphere 0:0:0:15:1.5 --face-size 6:2.0
+python -m k_mesher.mesh_cli part.stp --defeature 7 --spc 1 --pressure 6:0.5 \
                             --force 4:z:-500 --implicit-cards --auto-refine
-python mesh_cli.py part.stp --mesh-only -o part_mesh.k   # for *INCLUDE decks
-python mesh_cli.py part.stp --mat --stats-json part_stats.json --title "bracket"
-python mesh_cli.py asm.stp --glue --mat --part-mat 2:70000:0.33:2.7e-9
-python mesh_cli.py asm.stp --contact 0.15 --tssfac 0.9 --gravity z:9810
-python mesh_cli.py asm.stp --split-parts        # + one standalone .k per body
-python mesh_cli.py asm.stp --split-include      # *INCLUDE fragments + master
-python mesh_cli.py asm.stp --mat --part-rigid 2         # body 2 = *MAT_RIGID
-python mesh_cli.py part.stl --etype tet4 --mat \
+python -m k_mesher.mesh_cli part.stp --mesh-only -o part_mesh.k   # for *INCLUDE decks
+python -m k_mesher.mesh_cli part.stp --mat --stats-json part_stats.json --title "bracket"
+python -m k_mesher.mesh_cli asm.stp --glue --mat --part-mat 2:70000:0.33:2.7e-9
+python -m k_mesher.mesh_cli asm.stp --contact 0.15 --tssfac 0.9 --gravity z:9810
+python -m k_mesher.mesh_cli asm.stp --split-parts        # + one standalone .k per body
+python -m k_mesher.mesh_cli asm.stp --split-include      # *INCLUDE fragments + master
+python -m k_mesher.mesh_cli plate.stp --midsurface --mat   # thin plate -> midsurface shell
+python -m k_mesher.mesh_cli asm.stp --auto-spotweld        # weld detected interfaces
+python -m k_mesher.mesh_cli asm.stp --auto-spotweld 15     # + thin welds to 15 spacing
+python -m k_mesher.mesh_cli asm.stp --tied-contact --connect-tol 0.05   # tie interfaces
+python -m k_mesher.mesh_cli asm.stp --mat --part-rigid 2         # body 2 = *MAT_RIGID
+python -m k_mesher.mesh_cli part.stl --etype tet4 --mat \
     --nset plane,z,0,spc=123 --nset sphere,0,0,40,15,force=z:-500
-python mesh_cli.py part.stp --export part.vtk --mat --target-dt 5e-7
-python mesh_cli.py asm.stp --mat --endtim 0.01 --mass-scale=-1e-6 \
+python -m k_mesher.mesh_cli part.stp --export part.vtk --mat --target-dt 5e-7
+python -m k_mesher.mesh_cli asm.stp --mat --endtim 0.01 --mass-scale=-1e-6 \
     --control-energy --hourglass 5:0.05         # explicit control cards
-python mesh_cli.py asm.stp --mat --d3plot-dt 1e-4 --database GLSTAT:1e-5 \
+python -m k_mesher.mesh_cli asm.stp --mat --d3plot-dt 1e-4 --database GLSTAT:1e-5 \
     --database MATSUM:1e-5                       # output requests
-python mesh_cli.py asm.stp --mat --init-velocity 0:0:-5000 \
+python -m k_mesher.mesh_cli asm.stp --mat --init-velocity 0:0:-5000 \
     --contact 0.1 --contact-type tied_surface_to_surface
-python mesh_cli.py asm.stp --mat --rigidwall 0:0:-50:0:0:1:0.2 \
+python -m k_mesher.mesh_cli asm.stp --mat --rigidwall 0:0:-50:0:0:1:0.2 \
     --spotweld 101:202 --define-curve 99:0,0;1,1 \
     --prescribed-motion 5:3:0:99:1.0            # loads / BCs
-python mesh_cli.py --version
+python -m k_mesher.mesh_cli --version
 ```
 
 Note: pass negative scientific-notation values with `=`, e.g.
 `--mass-scale=-1e-6`, so argparse does not read them as a flag.
 
-`python mesh_cli.py -h` lists all options (the new LS-DYNA control / load
+**Midsurface & automatic connections** (grouped under "mesh-time connections /
+midsurface" in `-h`):
+
+- `--midsurface` — for thin, roughly constant-thickness plate solids (the
+  sheet-metal case), extract a midsurface **shell** mesh instead of solids
+  (CAD B-rep only; rejected for STL/OBJ/PLY). The detected wall thickness is
+  printed and written on `*SECTION_SHELL`; an explicit `--thickness` overrides
+  it. A shell `--etype` (tri3/quad4) is honoured, otherwise TRI3 is used.
+- `--auto-spotweld [SPACING]` — detect the interfaces of a multi-body model and
+  weld the coincident node pairs with `*CONSTRAINED_SPOTWELD`; the optional
+  `SPACING` thins the pattern to that minimum spot spacing.
+- `--tied-contact` — detect the interfaces and tie them with
+  `*CONTACT_TIED_SURFACE_TO_SURFACE` over the interface `*SET_SEGMENT`s.
+- `--connect-tol TOL` — node-matching tolerance shared by the two flags
+  (default: 1e-3 of the bounding-box diagonal). On a single-body model the two
+  connection flags find no interface and warn but do not fail. The connection
+  cards are added to the single-file and `*INCLUDE`-master output only, not the
+  standalone per-part split files.
+
+`python -m k_mesher.mesh_cli -h` lists all options (the new LS-DYNA control / load
 flags are grouped under "LS-DYNA control / loads"). GUI settings are remembered
 between sessions in `k_mesher_settings.json` (written on every run and on
 window close).
@@ -319,14 +369,21 @@ big meshes:
 
 | File | Purpose |
 |---|---|
-| `main.py` | entry point, launches the GUI |
-| `start_gui.py` | launcher that relaunches via the project `.venv` (double-click friendly) |
-| `mesh_cli.py` | command-line interface for batch meshing |
-| `gui.py` | tkinter GUI |
-| `job_runner.py` | GUI-independent mesh+write job execution (also used by the parallel batch workers) |
-| `mesher.py` | gmsh meshing core (STEP/IGES/BREP/STL/OBJ/PLY import, symmetry, refinement, tet/shell extraction) |
-| `dyna_writer.py` | LS-DYNA `.k` writer (single file, per-part files, *INCLUDE assemblies) |
-| `preview.py` | standalone Gmsh viewer process |
+| `main.py` | root launcher, launches the GUI |
+| `start_gui.py` | root launcher that relaunches via the project `.venv` (double-click friendly) |
+| `k_mesher/__init__.py` | public library API (`import k_mesher`) |
+| `k_mesher/_version.py` | single-source package version |
+| `k_mesher/mesh_cli.py` | command-line interface for batch meshing (`python -m k_mesher.mesh_cli`) |
+| `k_mesher/gui.py` | tkinter GUI |
+| `k_mesher/job_runner.py` | GUI-independent mesh+write job execution (also used by the parallel batch workers) |
+| `k_mesher/mesher.py` | gmsh meshing core (STEP/IGES/BREP/STL/OBJ/PLY import, symmetry, refinement, tet/shell extraction) |
+| `k_mesher/dyna_writer.py` | LS-DYNA `.k` writer (single file, per-part files, *INCLUDE assemblies) |
+| `k_mesher/k_reader.py` | LS-DYNA `.k` keyword reader (`read_k` / `KModel`) |
+| `k_mesher/connections.py` | automatic connection detection between touching bodies (spotweld pairs / tied-contact segment sets) |
+| `k_mesher/mesh_io.py` | meshio bridge: convert k_mesher meshes to/from other FE formats |
+| `k_mesher/post.py` | post-processing bridge: read LS-DYNA results (d3plot/binout) back via lasso |
+| `k_mesher/doe.py` | design-of-experiments / mesh-convergence driver (meshing as code) |
+| `k_mesher/preview.py` | standalone Gmsh viewer process |
 | `pyproject.toml` | packaging (`pip install .` → `k-mesher` / `k-mesher-gui`) |
 | `examples/make_test_step.py` | generates test parts (STEP + IGES/BREP/STL) |
 | `tests/test_headless.py` | end-to-end tests, pytest-compatible (`pytest tests/ -v` or `python tests/test_headless.py`) |
@@ -340,6 +397,17 @@ automatically — that would need transfinite/swept regions or an external hex
 mesher, so solid meshes are tetrahedra only. (gmsh's tet-subdivision "all-hex"
 mode exists but produces badly distorted hexes and is deliberately not
 offered.) Shells are meshed on the model's surfaces: use them for
-surface-only STEP exports or thin-walled parts; midsurface extraction is not
-performed, so export midsurfaces from CAD when shell-meshing solids-like
-sheet parts.
+surface-only STEP exports or thin-walled parts. For thin, roughly
+constant-thickness plate solids (sheet metal), `--midsurface` extracts a
+midsurface shell mesh and sets the shell thickness from the measured wall
+gap; general or strongly curved solids are not midsurfaced, so export the
+midsurface from CAD in those cases.
+
+### Python modules
+
+Beyond the CLI/GUI, k_mesher can be driven as a library via `import k_mesher`
+(see **Use as a library** above): `k_mesher.mesher` + `k_mesher.dyna_writer`
+mesh and write, `k_mesher.connections` derives spotweld/tied-contact data from
+a `MeshResult`, `k_mesher.mesh_io` converts meshes to/from other FE formats via
+meshio, `k_mesher.post` reads LS-DYNA results back (lasso), and `k_mesher.doe`
+runs element-size / parameter studies as code.

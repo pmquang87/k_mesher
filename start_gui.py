@@ -30,7 +30,7 @@ def main() -> None:
         return
 
     sys.path.insert(0, ROOT)
-    from gui import main as gui_main
+    from k_mesher.gui import main as gui_main
     gui_main()
 
 
