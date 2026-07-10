@@ -1,2 +1,5 @@
-gmsh>=4.13
-numpy>=1.26
+# Install k-mesher and its runtime dependencies in editable mode.
+# pyproject.toml is the single source of truth for the dependency versions
+# (currently gmsh>=4.13, numpy>=1.26). Installing with `-e .` pulls those in
+# and makes the console scripts (k-mesher, k-mesher-gui) available.
+-e .

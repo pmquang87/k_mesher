@@ -6,12 +6,21 @@ This module is GUI-agnostic so it can also be used from scripts/tests.
 from __future__ import annotations
 
 import collections
+import logging
 import os
+import threading
 import time
 from dataclasses import dataclass, field, replace
 
 import numpy as np
 import gmsh
+
+_LOG = logging.getLogger(__name__)
+
+# gmsh is a process-global singleton: overlapping initialize()/finalize() from
+# two threads corrupts its state. Serialize every initialize..finalize block
+# (mesh_step, list_faces) with this module-level lock.
+_GMSH_LOCK = threading.Lock()
 
 # gmsh 3D algorithm ids
 ALGO3D = {
@@ -190,42 +199,48 @@ def mesh_step(settings: MeshSettings, log=print, preview_path: str | None = None
     family = ETYPES[settings.element_type]["family"]
 
     # interruptible=False: skips SIGINT handler installation, which would fail
-    # when meshing runs in the GUI worker thread (signals need the main thread)
-    gmsh.initialize(interruptible=False)
-    try:
-        bbox, already_meshed = _load_geometry(settings, log)
-        if not already_meshed:
-            _apply_refinements(settings, log)
-            _generate_mesh(settings, log)
+    # when meshing runs in the GUI worker thread (signals need the main thread).
+    # _GMSH_LOCK serializes the whole init..finalize block: gmsh is a global
+    # singleton and concurrent inits from two threads corrupt its state.
+    with _GMSH_LOCK:
+        if not gmsh.isInitialized():
+            gmsh.initialize(interruptible=False)
+        try:
+            bbox, already_meshed = _load_geometry(settings, log)
+            if not already_meshed:
+                _apply_refinements(settings, log)
+                _generate_mesh(settings, log)
 
-        shell_checks = {}
-        if family == "solid":
-            coords, elems, elem_parts, part_names, tag_map = _extract_tets(
-                ETYPES[settings.element_type]["order"], log)
-        else:
-            coords, elems, elem_parts, part_names, tag_map, shell_checks = \
-                _extract_shells(log)
+            shell_checks = {}
+            if family == "solid":
+                coords, elems, elem_parts, part_names, tag_map = _extract_tets(
+                    ETYPES[settings.element_type]["order"], log)
+            else:
+                coords, elems, elem_parts, part_names, tag_map, shell_checks = \
+                    _extract_shells(log)
 
-        sym_nodes = _find_symmetry_nodes(coords, settings.symmetry, bbox)
-        sym_segs = _find_symmetry_segments(
-            coords, settings.symmetry, sym_nodes, tag_map, settings.element_type)
-        face_nodes, face_segs = _collect_face_data(
-            settings.collect_faces, tag_map, settings.element_type, log)
-        stats = _collect_stats(coords, elems, settings.element_type, bbox,
-                               elem_parts)
-        stats.update(shell_checks)
-        stats["duplicate_nodes"] = _count_duplicate_nodes(coords)
-        _log_stats(stats, sym_nodes, log)
+            sym_nodes = _find_symmetry_nodes(coords, settings.symmetry, bbox)
+            sym_segs = _find_symmetry_segments(
+                coords, settings.symmetry, sym_nodes, tag_map,
+                settings.element_type)
+            face_nodes, face_segs = _collect_face_data(
+                settings.collect_faces, tag_map, settings.element_type, log)
+            stats = _collect_stats(coords, elems, settings.element_type, bbox,
+                                   elem_parts)
+            stats.update(shell_checks)
+            stats["duplicate_nodes"] = _count_duplicate_nodes(coords)
+            _log_stats(stats, sym_nodes, log)
 
-        for out_path in ([preview_path] if preview_path else []) + list(export_paths):
-            gmsh.write(out_path)
+            out_all = ([preview_path] if preview_path else []) + list(export_paths)
+            for out_path in out_all:
+                gmsh.write(out_path)
 
-        return MeshResult(coords=coords, elems=elems, elem_parts=elem_parts,
-                          part_names=part_names, sym_nodes=sym_nodes,
-                          face_nodes=face_nodes, face_segs=face_segs, stats=stats,
-                          sym_segs=sym_segs)
-    finally:
-        gmsh.finalize()
+            return MeshResult(coords=coords, elems=elems, elem_parts=elem_parts,
+                              part_names=part_names, sym_nodes=sym_nodes,
+                              face_nodes=face_nodes, face_segs=face_segs,
+                              stats=stats, sym_segs=sym_segs)
+        finally:
+            gmsh.finalize()
 
 
 def _round_path(path: str, rnd: int) -> str:
@@ -303,30 +318,35 @@ def list_faces(settings: MeshSettings, log=print) -> list[dict]:
         raise RuntimeError(
             "Face scanning is not available for STL/tessellated input - it "
             "has no CAD faces, only triangles. Use a STEP/IGES/BREP file.")
-    gmsh.initialize(interruptible=False)
-    try:
-        _load_geometry(settings, log)
-        faces = []
-        for _, tag in sorted(gmsh.model.getEntities(2)):
-            try:
-                area = gmsh.model.occ.getMass(2, tag)
-                com = gmsh.model.occ.getCenterOfMass(2, tag)
-            except Exception:
-                area, com = 0.0, (0.0, 0.0, 0.0)
-            try:
-                ftype = gmsh.model.getType(2, tag)
-                bb = gmsh.model.getBoundingBox(2, tag)
-                diag = float(np.linalg.norm(np.array(bb[3:]) - np.array(bb[:3])))
-            except Exception:
-                ftype, diag = "", 0.0
-            name = gmsh.model.getEntityName(2, tag)
-            faces.append({"tag": tag, "name": name.split("/")[-1] if name else "",
-                          "type": ftype, "area": float(area), "diag": diag,
-                          "centroid": tuple(float(c) for c in com)})
-        log(f"Found {len(faces)} faces")
-        return faces
-    finally:
-        gmsh.finalize()
+    # _GMSH_LOCK serializes the init..finalize block (see mesh_step).
+    with _GMSH_LOCK:
+        if not gmsh.isInitialized():
+            gmsh.initialize(interruptible=False)
+        try:
+            _load_geometry(settings, log)
+            faces = []
+            for _, tag in sorted(gmsh.model.getEntities(2)):
+                try:
+                    area = gmsh.model.occ.getMass(2, tag)
+                    com = gmsh.model.occ.getCenterOfMass(2, tag)
+                except Exception:
+                    area, com = 0.0, (0.0, 0.0, 0.0)
+                try:
+                    ftype = gmsh.model.getType(2, tag)
+                    bb = gmsh.model.getBoundingBox(2, tag)
+                    diag = float(np.linalg.norm(
+                        np.array(bb[3:]) - np.array(bb[:3])))
+                except Exception:
+                    ftype, diag = "", 0.0
+                name = gmsh.model.getEntityName(2, tag)
+                faces.append(
+                    {"tag": tag, "name": name.split("/")[-1] if name else "",
+                     "type": ftype, "area": float(area), "diag": diag,
+                     "centroid": tuple(float(c) for c in com)})
+            log(f"Found {len(faces)} faces")
+            return faces
+        finally:
+            gmsh.finalize()
 
 
 # --------------------------------------------------------------------------
@@ -470,6 +490,16 @@ def _load_tessellation(settings: MeshSettings, family: str, log):
             f"{fmt} input carries no CAD geometry (only triangles), so these "
             f"are not available: {', '.join(active)}. Use a STEP/IGES/BREP "
             f"file for those features.")
+
+    # A target-unit request (Geometry.OCCTargetUnit) only drives the OCC CAD
+    # import; a tessellation carries no unit metadata, so there is no source
+    # unit to convert *from* and the option is silently ignored by gmsh.merge.
+    # Surface the fact instead of pretending the conversion happened.
+    if settings.occ_unit:
+        log(f"WARNING: unit conversion to {settings.occ_unit} is NOT applied "
+            f"to {fmt} tessellation input - it carries no unit information, so "
+            f"the mesh is used in its file coordinates. Scale the source file "
+            f"beforehand if a unit change is required.")
 
     log(f"Importing {fmt} tessellation: {settings.step_file}")
     gmsh.merge(settings.step_file)
@@ -1279,7 +1309,12 @@ def _collect_stats(coords: np.ndarray, elems: np.ndarray, element_type: str,
         hist, _ = np.histogram(np.clip(q, 0.0, 1.0), bins=10, range=(0.0, 1.0))
         stats["quality_hist"] = hist.tolist()
     except Exception:
-        pass
+        # Swallowing this silently made quality_min absent, which downstream
+        # defaults to a perfect 1.0 - disabling auto-refine AND the critical
+        # timestep estimate with no trace. Log it (but never crash the mesh).
+        q = None
+        _LOG.warning("SICN element-quality computation failed; quality "
+                     "statistics unavailable for this mesh", exc_info=True)
 
     try:
         crit, failed, char_len = _quality_criteria(coords, elems,
@@ -1295,7 +1330,11 @@ def _collect_stats(coords: np.ndarray, elems: np.ndarray, element_type: str,
             "p50": float(np.percentile(char_len, 50)),
         }
     except Exception:
-        pass
+        # Losing char_length silently disables the critical-timestep estimate
+        # (and hides quality-criteria failures). Log it; do not crash the mesh.
+        _LOG.warning("Quality-criteria / characteristic-length computation "
+                     "failed; timestep and criteria stats unavailable",
+                     exc_info=True)
 
     if family == "solid" and q is not None:
         # locations + local size of the 5 worst elements, whatever their

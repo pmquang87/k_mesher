@@ -5,19 +5,28 @@ on:
     branches: [main]
   pull_request:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest]
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        include:
+          # Also run one Windows job to catch platform-specific issues.
+          - os: windows-latest
+            python-version: "3.12"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
           cache: pip
 
       - name: Install system libraries for gmsh + headless GUI (Linux)
@@ -28,15 +37,37 @@ jobs:
             libxcursor1 libxft2 libxinerama1 libfontconfig1 xvfb
 
       - name: Install Python dependencies
-        run: pip install -r requirements.txt pytest ruff
+        run: pip install -r requirements.txt pytest pytest-cov ruff
 
       - name: Lint (ruff)
         run: ruff check .
 
       - name: Run tests (Linux, under Xvfb for the GUI tests)
         if: runner.os == 'Linux'
-        run: xvfb-run -a pytest tests/ -v
+        run: xvfb-run -a pytest tests/ -v --cov=. --cov-report=term-missing --cov-report=xml
 
       - name: Run tests (Windows)
         if: runner.os == 'Windows'
-        run: pytest tests/ -v
+        run: pytest tests/ -v --cov=. --cov-report=term-missing --cov-report=xml
+
+  package:
+    name: package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install build tooling
+        run: pip install build
+
+      - name: Build the wheel
+        run: python -m build
+
+      - name: Install the built wheel and smoke-test the console entry point
+        run: |
+          pip install dist/*.whl
+          k-mesher --help
