@@ -37,7 +37,10 @@ jobs:
             libxcursor1 libxft2 libxinerama1 libfontconfig1 xvfb
 
       - name: Install Python dependencies
-        run: pip install -r requirements.txt pytest pytest-cov ruff
+        # .[all] pulls the optional extras (meshio, lasso-python, scipy,
+        # matplotlib) so the bridge / viz / DoE tests actually run instead of
+        # being skipped.
+        run: pip install -e ".[all]" pytest pytest-cov ruff
 
       - name: Lint (ruff)
         run: ruff check .

@@ -99,13 +99,21 @@ GMSH2DYNA_TET10 = [0, 1, 2, 3, 4, 5, 6, 7, 9, 8]
 # in LS-DYNA ordering
 NEGFIX = {4: [0, 2, 1, 3], 10: [0, 2, 1, 3, 6, 5, 4, 7, 9, 8]}
 
-# Plate detection for midsurface extraction. A thin, roughly constant-thickness
-# plate (the sheet-metal case) has two dominant boundary faces that are nearly
-# parallel and of nearly equal area, separated by a small gap - the wall
-# thickness - relative to the in-plane extent sqrt(area).
+# Thin-shell detection for midsurface extraction. A thin, roughly
+# constant-thickness region (the sheet-metal case) has two dominant boundary
+# faces of nearly equal area separated by a small, roughly constant gap - the
+# wall thickness - relative to the in-plane extent sqrt(area). This covers both
+# FLAT plates (the two faces are planar and globally parallel) and CURVED shells
+# (a bent/cylindrical sheet whose faces are NOT globally parallel but stay a
+# constant wall thickness apart). The gap is measured by sampling the true
+# closest-point distance between the two faces at several points, so it is
+# correct for curved faces (a single plane-to-plane distance is not).
 _PLATE_AREA_RATIO = 0.5        # min (second / first) dominant-face area ratio
 _PLATE_PARALLEL = 0.9          # min |dot| of the two dominant-face unit normals
+                               # (only used to classify a plate as FLAT)
 _PLATE_THICKNESS_RATIO = 0.25  # max thickness / sqrt(in-plane area)
+_PLATE_THICKNESS_VARIATION = 0.25  # max thickness std/mean before warning that
+                                   # the constant-thickness assumption is weak
 
 # quality criteria limits (LS-DYNA practice)
 QUALITY_LIMITS = {
@@ -381,18 +389,78 @@ def _face_props(tag: int):
     return float(area), com, normal
 
 
+def _sample_thickness(t_src: int, t_dst: int, n_grid: int = 5):
+    """Measure the wall gap from face ``t_src`` to the opposite face ``t_dst``.
+
+    Samples an interior ``n_grid`` x ``n_grid`` parametric grid on ``t_src`` and,
+    for each point, takes the true closest-point distance to ``t_dst`` (via
+    OpenCASCADE). This is correct for CURVED faces, where a single plane-to-plane
+    distance would be wrong. Returns a dict with the mean/std/min/max gap, the
+    sample count, and ``sign`` - the orientation (+/-1) of ``t_src``'s surface
+    normal relative to the direction toward ``t_dst`` (so a node can be offset
+    ``sign * half_thickness * normal`` to reach the mid-surface). Returns None if
+    nothing could be sampled."""
+    try:
+        pmin, pmax = gmsh.model.getParametrizationBounds(2, t_src)
+    except Exception:
+        return None
+    # skip the parametric border (endpoints) to avoid closest points that land
+    # on a shared edge rather than across the wall
+    us = np.linspace(pmin[0], pmax[0], n_grid + 2)[1:-1]
+    vs = np.linspace(pmin[1], pmax[1], n_grid + 2)[1:-1]
+    dists, dots = [], []
+    for u in us:
+        for v in vs:
+            try:
+                p = np.array(gmsh.model.getValue(2, t_src, [u, v]), dtype=float)
+                cp, _ = gmsh.model.getClosestPoint(2, t_dst, p.tolist())
+                d = np.array(cp, dtype=float) - p
+            except Exception:
+                continue
+            dist = float(np.linalg.norm(d))
+            if dist <= 0:
+                continue
+            dists.append(dist)
+            try:
+                nn = np.array(gmsh.model.getNormal(t_src, [u, v])[:3], dtype=float)
+                ln = float(np.linalg.norm(nn))
+                if ln > 0:
+                    dots.append(float(np.dot(d / dist, nn / ln)))
+            except Exception:
+                pass
+    if not dists:
+        return None
+    dists = np.array(dists)
+    sign = 1.0 if (not dots or float(np.mean(dots)) >= 0) else -1.0
+    return {"mean": float(dists.mean()), "std": float(dists.std()),
+            "min": float(dists.min()), "max": float(dists.max()),
+            "n": int(len(dists)), "sign": sign}
+
+
 def _detect_plate(vol: int):
-    """Decide whether solid ``vol`` is a thin, roughly constant-thickness plate.
+    """Decide whether solid ``vol`` is a thin, roughly constant-thickness region
+    - a FLAT plate or a CURVED (bent/cylindrical) shell.
 
-    Returns ``{"dominant": face_tag, "thickness": t, "mid_move": (3,)}`` for a
-    plate (``mid_move`` translates the dominant face to the mid-plane), or None.
+    Returns, or None if the body is not thin-shell-like::
 
-    Heuristic: the two largest boundary faces must be nearly parallel, of nearly
-    equal area, and separated by a gap (the wall thickness) that is small
-    relative to the in-plane extent sqrt(area). Limits: a single dominant face
-    per side (a face split into patches is not recognised) and near-planar,
-    roughly constant-thickness plates only - no medial-axis midsurfacing of
-    general solids."""
+        {"dominant": face_tag, "thickness": mean, "thickness_std": ...,
+         "thickness_min": ..., "thickness_max": ..., "curved": bool,
+         "mid_move": (3,), "offset_sign": float}
+
+    For a FLAT plate ``mid_move`` translates the dominant face to the mid-plane
+    (exact). For a CURVED shell ``mid_move`` is zero and ``offset_sign`` orients
+    the local surface normal so each meshed node can be offset inward by half the
+    wall thickness to reach the mid-surface.
+
+    Heuristic: the two largest boundary faces must be of nearly equal area and
+    separated by a wall gap that is small and roughly constant relative to the
+    in-plane extent sqrt(area). Global normal parallelism is NOT required - it is
+    only used to classify a plate as flat (and so drive the exact translate). The
+    gap is measured by closest-point sampling between the two faces, so curved
+    shells are handled. Limits: a single dominant face per side (a face split into
+    patches is not recognised); near-constant thickness only - a strongly tapered
+    wall is reported by its mean gap with a variation warning; no medial-axis
+    midsurfacing of general/branching solids."""
     faces = [t for _, t in gmsh.model.getBoundary([(3, vol)], oriented=False)]
     if len(faces) < 2:
         return None
@@ -401,46 +469,114 @@ def _detect_plate(vol: int):
     t0, t1 = ordered[0], ordered[1]
     a0, c0, n0 = props[t0]
     a1, c1, n1 = props[t1]
-    if a0 <= 0 or n0 is None or n1 is None:
+    if a0 <= 0:
         return None
     if a1 / a0 < _PLATE_AREA_RATIO:                 # areas not nearly equal
         return None
-    if abs(float(np.dot(n0, n1))) < _PLATE_PARALLEL:  # faces not parallel
-        return None
-    signed = float(np.dot(c1 - c0, n0))
-    thickness = abs(signed)
     inplane = float(np.sqrt(a0))
-    if thickness <= 0 or inplane <= 0:
+    if inplane <= 0:
         return None
-    if thickness / inplane > _PLATE_THICKNESS_RATIO:  # too thick to be a plate
+
+    # A flat plate has two planar, globally (anti)parallel dominant faces; only
+    # then is the exact rigid translate to the mid-plane valid.
+    planar = (n0 is not None and n1 is not None
+              and gmsh.model.getType(2, t0) == "Plane"
+              and gmsh.model.getType(2, t1) == "Plane"
+              and abs(float(np.dot(n0, n1))) >= _PLATE_PARALLEL)
+
+    samp = _sample_thickness(t0, t1)
+    if samp is not None:
+        thickness = samp["mean"]
+        t_std, t_min, t_max, sign = (samp["std"], samp["min"],
+                                     samp["max"], samp["sign"])
+    elif planar:
+        # closest-point sampling unavailable: fall back to the exact plane gap
+        signed = float(np.dot(c1 - c0, n0))
+        thickness = abs(signed)
+        t_std, t_min, t_max = 0.0, thickness, thickness
+        sign = 1.0 if signed >= 0 else -1.0
+    else:
         return None
-    mid_move = n0 * (np.sign(signed) * 0.5 * thickness)
-    return {"dominant": t0, "thickness": thickness, "mid_move": mid_move}
+
+    if thickness <= 0:
+        return None
+    if thickness / inplane > _PLATE_THICKNESS_RATIO:  # too thick to be a shell
+        return None
+
+    det = {"dominant": t0, "thickness": thickness, "thickness_std": t_std,
+           "thickness_min": t_min, "thickness_max": t_max, "curved": not planar,
+           "mid_move": np.zeros(3), "offset_sign": 0.0}
+    if planar:
+        signed = float(np.dot(c1 - c0, n0))
+        det["mid_move"] = n0 * (np.sign(signed) * 0.5 * thickness)
+    else:
+        det["offset_sign"] = sign
+    return det
+
+
+def _offset_shell_nodes(tag: int, dist: float, sign: float, log) -> None:
+    """Move the meshed nodes of face ``tag`` inward by ``dist`` along the local
+    surface normal (``sign`` orients the normal toward the opposite wall),
+    turning a meshed curved face into the constant-thickness mid-surface.
+
+    The opposite wall has already been dropped by mesh time, so a single
+    (constant) ``dist`` = half the measured wall thickness is used per node; the
+    direction is the exact local surface normal at each node."""
+    try:
+        ntags, coords, params = gmsh.model.mesh.getNodes(
+            2, tag, includeBoundary=True, returnParametricCoord=True)
+    except Exception as e:
+        log(f"  (mid-surface offset skipped for face {tag}: {e})")
+        return
+    coords = np.asarray(coords, dtype=float).reshape(-1, 3)
+    params = np.asarray(params, dtype=float).reshape(-1, 2)
+    moved = 0
+    for i, nt in enumerate(ntags):
+        try:
+            n = np.array(gmsh.model.getNormal(tag, params[i].tolist())[:3],
+                         dtype=float)
+            ln = float(np.linalg.norm(n))
+            if ln == 0:
+                continue
+            newp = coords[i] + sign * dist * (n / ln)
+            gmsh.model.mesh.setNode(int(nt), newp.tolist(), [])
+            moved += 1
+        except Exception:
+            continue
+    log(f"  mid-surface offset: moved {moved} node(s) of face {tag} inward by "
+        f"{dist:.4g} along the local normal")
 
 
 def midsurface_shell(settings: MeshSettings, log=print,
                      preview_path: str | None = None,
                      export_paths: tuple[str, ...] = ()) -> MeshResult:
-    """Extract a midsurface shell mesh from thin, plate-like solids of roughly
-    constant thickness (the common sheet-metal case) and set the shell
-    thickness from the measured wall thickness.
+    """Extract a midsurface shell mesh from thin solids of roughly constant
+    thickness - both FLAT plates and CURVED (bent/cylindrical) shells, the common
+    sheet-metal cases - and set the shell thickness from the measured wall gap.
 
-    For every solid body the plate detector looks for two dominant boundary
-    faces that are nearly parallel and of nearly equal area, a small gap apart;
-    that gap is the wall thickness. One dominant face is translated to the
-    mid-plane and meshed with shells. Bodies that are not plate-like are skipped
-    with a warning; if no body is plate-like a RuntimeError is raised.
+    For every solid body the detector looks for two dominant boundary faces of
+    nearly equal area a small, roughly constant gap apart; that gap (measured by
+    closest-point sampling between the faces, so it is correct for curved walls)
+    is the wall thickness. A FLAT plate's dominant face is translated to the
+    mid-plane and meshed; a CURVED shell's dominant face is meshed and each node
+    is then offset inward by half the wall thickness along the local surface
+    normal, so the shell lands on the true mid-surface. Bodies that are not
+    thin-shell-like are skipped with a warning; if none qualifies a RuntimeError
+    is raised.
 
     The measured thickness is reported as ``stats["midsurface_thickness"]`` (the
-    mean) and ``stats["midsurface_thicknesses"]`` (per plate body) - feed it to
+    mean over bodies) and ``stats["midsurface_thicknesses"]`` (per body); the
+    per-body mean/std/min/max and a curved flag are in
+    ``stats["midsurface_thickness_stats"]``. Feed the thickness to
     ``dyna_writer.write_k(..., element_kind="shell", thickness=...)``.
 
-    Approximation / limits: constant-thickness, near-planar plates only (no
-    medial-axis midsurfacing of general solids); each plate must present a
-    single dominant face per side (a face split into patches, tapered or
-    strongly curved plates are not handled). The shell sits on the mid-plane of
-    the two dominant faces, so for a genuinely constant-thickness plate it is
-    the true midsurface; the reported thickness is the measured wall gap.
+    Approximation / limits: constant-thickness only - the offset uses one mean
+    wall thickness per body, so a strongly tapered wall is meshed at its mean gap
+    (with a variation warning); each body must present a single dominant face per
+    side (a face split into patches is not recognised); no medial-axis
+    midsurfacing of general/branching solids. For a genuinely constant-thickness
+    plate or shell the result is the true mid-surface; the reported thickness is
+    the measured wall gap.
 
     ``settings.element_type`` selects the shell element when it is a shell type
     (TRI3/QUAD4); otherwise TRI3 is used. Symmetry/refinement/defeature options
@@ -472,7 +608,17 @@ def midsurface_shell(settings: MeshSettings, log=print,
                         f"gap apart) - skipped for midsurface extraction")
                 else:
                     plates.append(det)
-                    log(f"Plate solid {v}: wall thickness {det['thickness']:.4g}")
+                    kind = "curved shell" if det["curved"] else "flat plate"
+                    log(f"{kind} solid {v}: wall thickness "
+                        f"{det['thickness']:.4g} (min {det['thickness_min']:.4g}, "
+                        f"max {det['thickness_max']:.4g})")
+                    if det["thickness"] > 0 and (det["thickness_std"]
+                            / det["thickness"]) > _PLATE_THICKNESS_VARIATION:
+                        log(f"  WARNING: wall thickness of solid {v} varies a "
+                            f"lot (std/mean "
+                            f"{det['thickness_std'] / det['thickness']:.2f}) - "
+                            f"the constant-thickness assumption is weak; using "
+                            f"the mean {det['thickness']:.4g}")
             if not plates:
                 raise RuntimeError(
                     "No plate-like solid found. Midsurface extraction handles "
@@ -508,6 +654,13 @@ def midsurface_shell(settings: MeshSettings, log=print,
                                     defeature_faces=[], collect_faces=[])
             _generate_mesh(mesh_settings, log)
 
+            # curved shells: bend the meshed dominant face onto the mid-surface
+            # by offsetting each node inward by half the wall thickness
+            for det in plates:
+                if det["curved"]:
+                    _offset_shell_nodes(det["dominant"], 0.5 * det["thickness"],
+                                        det["offset_sign"], log)
+
             coords, elems, elem_parts, part_names, _, checks = _extract_shells(log)
             sym_nodes: dict = {}
             stats = _collect_stats(coords, elems, shell_type, bbox, elem_parts)
@@ -516,6 +669,10 @@ def midsurface_shell(settings: MeshSettings, log=print,
             thicknesses = [float(d["thickness"]) for d in plates]
             stats["midsurface_thicknesses"] = thicknesses
             stats["midsurface_thickness"] = float(np.mean(thicknesses))
+            stats["midsurface_thickness_stats"] = [
+                {"mean": float(d["thickness"]), "std": float(d["thickness_std"]),
+                 "min": float(d["thickness_min"]), "max": float(d["thickness_max"]),
+                 "curved": bool(d["curved"])} for d in plates]
             _log_stats(stats, sym_nodes, log)
             log(f"Midsurface shell from {len(plates)} plate body(ies); "
                 f"thickness {stats['midsurface_thickness']:.4g} (per body: "

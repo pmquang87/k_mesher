@@ -12,6 +12,10 @@ them into connection data ready for :func:`dyna_writer.write_k`:
     interface facets, for ``write_k(face_sets=...)`` (-> ``*SET_SEGMENT``).
   * :func:`tied_contact`      - convenience returning both the segment sets and
     a ``contacts`` tuple (-> ``*CONTACT_TIED_SURFACE_TO_SURFACE``).
+  * :func:`interface_pairs`   - just the touching ``(body_i, body_j)`` index
+    pairs (0-based), a lower-level helper over :func:`detect_interfaces`.
+  * :func:`contact_pairs`     - one scoped, per-pair contact dict per touching
+    body pair for ``write_k(contact_pairs=...)`` (part-to-part contact).
 
 Indexing convention
 -------------------
@@ -224,6 +228,54 @@ def detect_interfaces(result, tol: float | None = None,
             "tol": tol,
         })
     return interfaces
+
+
+def interface_pairs(result, tol: float | None = None) -> list[tuple[int, int]]:
+    """The touching body pairs of ``result`` as raw 0-based index tuples.
+
+    A lower-level helper over :func:`detect_interfaces`: returns just the
+    ``(i, j)`` body indices (0-based into ``result.elem_parts``, ``i < j``) of
+    every pair whose boundaries touch or nearly touch within ``tol`` - dropping
+    the matched-node/segment geometry. ``tol`` defaults to :func:`default_tol`.
+
+    Returns ``[]`` for single-body meshes or when no bodies touch.
+    """
+    return [itf["bodies"] for itf in detect_interfaces(result, tol=tol)]
+
+
+def contact_pairs(result, base_pid: int = 1, tol: float | None = None,
+                  ctype: str = "automatic_surface_to_surface",
+                  fs: float = 0.0) -> list[dict]:
+    """Per-touching-pair scoped contact suggestions for ``write_k``.
+
+    One dict per touching body pair - ready for the ``contact_pairs`` argument
+    of :func:`dyna_writer.write_k` - so an assembly gets a single contact scoped
+    to each pair of parts that actually touch, rather than one contact spanning
+    everything.
+
+    ``base_pid`` maps a 0-based body index to its LS-DYNA part id exactly as the
+    CLI numbers parts: **body k -> PID ``base_pid + k``** (so body 0 -> base_pid,
+    body 1 -> base_pid + 1, ...). For each touching pair ``(i, j)`` from
+    :func:`interface_pairs` the dict is::
+
+        {"slave_parts":  [base_pid + i],
+         "master_parts": [base_pid + j],
+         "type":         ctype,
+         "fs":           fs,
+         "title":        f"CONTACT_p{base_pid + i}_p{base_pid + j}"}
+
+    ``ctype`` is the contact type suffix (default
+    ``"automatic_surface_to_surface"``) and ``fs`` the static friction
+    coefficient. Returns ``[]`` for single-body meshes or when no bodies touch.
+    """
+    return [
+        {"slave_parts": [base_pid + i],
+         "master_parts": [base_pid + j],
+         "type": ctype,
+         "fs": fs,
+         "title": f"CONTACT_p{base_pid + i}_p{base_pid + j}"}
+        for i, j in interface_pairs(result, tol=tol)
+    ]
 
 
 def _thin_by_spacing(points: np.ndarray, spacing: float) -> np.ndarray:
