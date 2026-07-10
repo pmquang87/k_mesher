@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Importable `k_mesher` package** — the flat modules were repackaged into a
+  `k_mesher/` package with a public API exposed via `import k_mesher`
+  (`MeshSettings`, `MeshResult`, `mesh_step` / `mesh_step_auto`,
+  `midsurface_shell`, `list_faces`, `select_nodes`, timestep/mass helpers, the
+  `.k` reader/writer functions and the `KModel` type). The package imports
+  headless; the GUI module is not pulled in.
+- **New library modules** — `connections` (automatic spotweld / tied-contact
+  detection between touching bodies), `mesh_io` (meshio bridge to/from other FE
+  formats), `post` (lasso bridge to read LS-DYNA results back) and `doe`
+  (mesh-convergence / parameter-study driver).
+- **Midsurface shell extraction** (`--midsurface`) for thin, roughly
+  constant-thickness plate solids, with the wall thickness measured and written
+  on `*SECTION_SHELL`.
+- **Automatic connection detection** in the CLI and GUI — `--auto-spotweld`
+  (`*CONSTRAINED_SPOTWELD`) and `--tied-contact`
+  (`*CONTACT_TIED_SURFACE_TO_SURFACE`) over detected interfaces, with a shared
+  `--connect-tol` node-matching tolerance.
+- **New console scripts** — `k-mesher-doe` (mesh-convergence sweep) and
+  `k-mesher-convert` (FE-format conversion via meshio, writing `.k` through the
+  LS-DYNA writer), alongside the existing `k-mesher` / `k-mesher-gui`.
+- **Optional-dependency extras** — `k-mesher[io]` (meshio), `[post]`
+  (lasso-python), `[extras]` (scipy + matplotlib) and `[all]`; the bridge
+  modules and scipy/matplotlib code paths degrade gracefully when the optional
+  dependency is absent.
+
+### Changed
+
+- The command-line tool is now invoked as `python -m k_mesher.mesh_cli` from a
+  source checkout (or the `k-mesher` console script); the old
+  `python mesh_cli.py` form no longer works because the module moved into the
+  package. `python main.py` and `start_gui.py` remain root GUI launchers.
+
 ## [0.5.0]
 
 ### Added
