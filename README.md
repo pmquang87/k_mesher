@@ -123,6 +123,12 @@ python -m k_mesher.mesh_cli asm.stp --mat --init-velocity 0:0:-5000 \
 python -m k_mesher.mesh_cli asm.stp --mat --rigidwall 0:0:-50:0:0:1:0.2 \
     --spotweld 101:202 --define-curve 99:0,0;1,1 \
     --prescribed-motion 5:3:0:99:1.0            # loads / BCs
+python -m k_mesher.mesh_cli asm.stp --auto-contact --contact 0.1   # per-pair contact
+python -m k_mesher.mesh_cli asm.stp --auto-contact tied_surface_to_surface
+python -m k_mesher.mesh_cli part.stp --mat --cross-section 0:0:0:1:0:0:MIDCUT \
+    --history-node 1,2,3 --history-solid 10,11    # section force + time history
+python -m k_mesher.mesh_cli part.stp \
+    --mat-model plastic_kinematic:210000:0.3:7.85e-9:1000:200   # plasticity material
 python -m k_mesher.mesh_cli --version
 ```
 
@@ -134,9 +140,11 @@ midsurface" in `-h`):
 
 - `--midsurface` — for thin, roughly constant-thickness plate solids (the
   sheet-metal case), extract a midsurface **shell** mesh instead of solids
-  (CAD B-rep only; rejected for STL/OBJ/PLY). The detected wall thickness is
-  printed and written on `*SECTION_SHELL`; an explicit `--thickness` overrides
-  it. A shell `--etype` (tri3/quad4) is honoured, otherwise TRI3 is used.
+  (CAD B-rep only; rejected for STL/OBJ/PLY). This now also handles **curved**
+  constant-thickness shells (single-curvature panels), not just flat plates.
+  The detected wall thickness is printed and written on `*SECTION_SHELL`; an
+  explicit `--thickness` overrides it. A shell `--etype` (tri3/quad4) is
+  honoured, otherwise TRI3 is used.
 - `--auto-spotweld [SPACING]` — detect the interfaces of a multi-body model and
   weld the coincident node pairs with `*CONSTRAINED_SPOTWELD`; the optional
   `SPACING` thins the pattern to that minimum spot spacing.
@@ -147,6 +155,27 @@ midsurface" in `-h`):
   connection flags find no interface and warn but do not fail. The connection
   cards are added to the single-file and `*INCLUDE`-master output only, not the
   standalone per-part split files.
+
+**Assembly contacts / output / materials** (grouped under "assembly contacts /
+output / materials" in `-h`):
+
+- `--auto-contact [TYPE]` — detect the touching part pairs of a multi-body model
+  and write one **scoped `*CONTACT_`** per pair (each part pair gets its own
+  `*SET_PART_LIST` slave/master sets), instead of a single contact spanning the
+  whole assembly. `TYPE` defaults to `automatic_surface_to_surface` (the other
+  contact types are also accepted); the friction comes from `--contact FS` and
+  the matching tolerance from `--connect-tol`. A single-body model warns and
+  writes no card. Like the other connection cards it lands in the single-file
+  and `*INCLUDE`-master output only, not the standalone per-part split files.
+- `--cross-section X:Y:Z:NX:NY:NZ[:TITLE]` — a `*DATABASE_CROSS_SECTION_PLANE`
+  section cut (in-plane point + normal) through the whole model; the required
+  `*DATABASE_SECFORC` output request is added automatically. Repeatable.
+- `--history-node`, `--history-solid`, `--history-shell` — comma-separated id
+  lists (repeatable) written as `*DATABASE_HISTORY_NODE/_SOLID/_SHELL` time-
+  history requests.
+- `--mat-model MODEL:E:NU:RHO:SIGY[:ETAN]` — write a plasticity material in
+  place of `--mat`: `plastic_kinematic` (`*MAT_PLASTIC_KINEMATIC`) or
+  `piecewise` (`*MAT_PIECEWISE_LINEAR_PLASTICITY`).
 
 `python -m k_mesher.mesh_cli -h` lists all options (the new LS-DYNA control / load
 flags are grouped under "LS-DYNA control / loads"). GUI settings are remembered
@@ -299,6 +328,8 @@ window close).
 *HOURGLASS            (optional; --hourglass, referenced by every *PART)
 *CONTACT_...          (optional; single-surface, or the --contact-type card;
                        friction on card 2)
+*SET_PART_LIST /      (optional; --auto-contact writes one scoped *CONTACT_ per
+*CONTACT_...           touching part pair via slave/master part-list sets)
 *LOAD_BODY_X/Y/Z      (optional gravity; scaled unit ramp curve)
 *NODE                 (I8 id, 3 x E16.9 coordinates)
 *ELEMENT_SOLID        (TET4: one line, tet as degenerate hex;
@@ -313,6 +344,8 @@ window close).
 *RIGIDWALL_PLANAR     (optional; --rigidwall)
 *CONSTRAINED_SPOTWELD (optional; --spotweld, one per node pair)
 *DATABASE_BINARY_D3PLOT / *DATABASE_<NAME>   (optional; --d3plot-dt / --database)
+*DATABASE_CROSS_SECTION_PLANE     (optional; --cross-section, + auto SECFORC)
+*DATABASE_HISTORY_NODE/_SOLID/_SHELL   (optional; --history-node/-solid/-shell)
 *END
 ```
 
@@ -382,6 +415,7 @@ big meshes:
 | `k_mesher/connections.py` | automatic connection detection between touching bodies (spotweld pairs / tied-contact segment sets) |
 | `k_mesher/mesh_io.py` | meshio bridge: convert k_mesher meshes to/from other FE formats |
 | `k_mesher/post.py` | post-processing bridge: read LS-DYNA results (d3plot/binout) back via lasso |
+| `k_mesher/post_viz.py` | results visualization: plots (matplotlib PNG) and ParaView `.vtu` exports from `post` results |
 | `k_mesher/doe.py` | design-of-experiments / mesh-convergence driver (meshing as code) |
 | `k_mesher/preview.py` | standalone Gmsh viewer process |
 | `pyproject.toml` | packaging (`pip install .` → `k-mesher` / `k-mesher-gui`) |
@@ -409,5 +443,6 @@ Beyond the CLI/GUI, k_mesher can be driven as a library via `import k_mesher`
 (see **Use as a library** above): `k_mesher.mesher` + `k_mesher.dyna_writer`
 mesh and write, `k_mesher.connections` derives spotweld/tied-contact data from
 a `MeshResult`, `k_mesher.mesh_io` converts meshes to/from other FE formats via
-meshio, `k_mesher.post` reads LS-DYNA results back (lasso), and `k_mesher.doe`
+meshio, `k_mesher.post` reads LS-DYNA results back (lasso), `k_mesher.post_viz`
+turns those results into plots / ParaView `.vtu` exports, and `k_mesher.doe`
 runs element-size / parameter studies as code.

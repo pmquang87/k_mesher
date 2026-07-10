@@ -487,3 +487,63 @@ def _split_cell_data(mesh, values: np.ndarray, elems, element_kind: str):
         else:  # pragma: no cover - defensive
             out.append(values[: len(cb.data)])
     return out
+
+
+def main(argv=None) -> int:
+    """Console entry (``k-mesher-post``): make quick plots / a VTU from results.
+
+    Reads an LS-DYNA d3plot (for displacement plots / deformed shape / VTU) or a
+    binout (for energy plots) and writes PNG/VTU files.
+    """
+    import argparse
+
+    from k_mesher import post
+
+    p = argparse.ArgumentParser(
+        prog="k-mesher-post",
+        description="Visualize LS-DYNA results: energy / displacement plots, "
+                    "deformed shape, or a ParaView .vtu (via lasso + matplotlib "
+                    "+ meshio).")
+    p.add_argument("result", help="a d3plot file (displacement/shape/vtu) or a "
+                                  "binout file (energy)")
+    p.add_argument("--kind", choices=["d3plot", "binout"], default="d3plot",
+                   help="how to read the result file")
+    p.add_argument("--energy", metavar="PNG",
+                   help="binout: write the global energy time-history plot")
+    p.add_argument("--part-energy", metavar="PNG",
+                   help="binout: write the per-part energy plot")
+    p.add_argument("--displacement", metavar="PNG",
+                   help="d3plot: write the max-displacement time-history plot")
+    p.add_argument("--deformed", metavar="PNG",
+                   help="d3plot: write a deformed-shape image (last state)")
+    p.add_argument("--scale", type=float, default=1.0,
+                   help="displacement scale factor for --deformed")
+    p.add_argument("--vtu", metavar="VTU",
+                   help="d3plot: write a ParaView .vtu of the last state")
+    args = p.parse_args(argv)
+
+    written = []
+    if args.kind == "binout":
+        res = post.read_binout(args.result)
+        if args.energy:
+            written.append(plot_energy(res, args.energy))
+        if args.part_energy:
+            written.append(plot_part_energy(res, args.part_energy))
+    else:
+        res = post.read_d3plot(args.result)
+        if args.displacement:
+            written.append(plot_displacement_history(res, path=args.displacement))
+        if args.deformed:
+            written.append(deformed_shape_png(res, args.deformed, scale=args.scale))
+        if args.vtu:
+            written.append(results_to_vtu(res, args.vtu))
+    if not written:
+        p.error("nothing to do: pass at least one output option "
+                "(--energy/--part-energy/--displacement/--deformed/--vtu)")
+    for path in written:
+        print(f"Wrote {path}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
