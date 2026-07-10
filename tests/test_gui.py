@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.join(ROOT, "examples"))
 
 tk = pytest.importorskip("tkinter", reason="tkinter not available")
 
-import gui  # noqa: E402
+from k_mesher import gui  # noqa: E402
 from make_test_step import make, make_two_bodies  # noqa: E402
 
 STEP = os.path.join(ROOT, "examples", "test_part.step")

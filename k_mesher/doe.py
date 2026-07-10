@@ -28,7 +28,7 @@ import json
 import time
 from dataclasses import dataclass, fields, replace
 
-import mesher
+from k_mesher import mesher
 
 # ---------------------------------------------------------------------------
 # records
@@ -230,3 +230,45 @@ def plot_convergence(records: list[SweepResult], metric: str, path: str) -> bool
     fig.savefig(path, dpi=100)
     plt.close(fig)
     return True
+
+
+def main(argv=None) -> int:
+    """Console entry (``k-mesher-doe``): run an element-size convergence sweep."""
+    import argparse
+
+    p = argparse.ArgumentParser(
+        prog="k-mesher-doe",
+        description="Mesh-convergence sweep: mesh a CAD file at several element "
+                    "sizes and report how the mesh metrics evolve.")
+    p.add_argument("input", help="CAD/mesh input (STEP/IGES/BREP/STL/...)")
+    p.add_argument("--sizes", required=True,
+                   help="comma-separated max element sizes, e.g. 12,8,4")
+    p.add_argument("--etype", default="tet4",
+                   choices=["tet4", "tet10", "tri3", "quad4"])
+    p.add_argument("--csv", help="write the sweep records to this CSV file")
+    p.add_argument("--json", help="write the sweep records to this JSON file")
+    args = p.parse_args(argv)
+
+    sizes = [float(s) for s in args.sizes.split(",") if s.strip()]
+    settings = mesher.MeshSettings(step_file=args.input,
+                                   element_type=args.etype.upper(),
+                                   size_max=max(sizes), size_min=0.0)
+    records = size_sweep(settings, sizes)
+    print(f"{'size':>10} {'nodes':>10} {'elems':>10} {'q_min':>8}  status")
+    for r in records:
+        if r.error:
+            print(f"{r.value:>10g} {'':>10} {'':>10} {'':>8}  ERROR: {r.error}")
+        else:
+            print(f"{r.value:>10g} {r.n_nodes:>10} {r.n_elems:>10} "
+                  f"{(r.quality_min or 0):>8.3f}  ok ({r.seconds:.1f}s)")
+    if args.csv:
+        to_csv(records, args.csv)
+        print(f"Wrote {args.csv}")
+    if args.json:
+        to_json(records, args.json)
+        print(f"Wrote {args.json}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -11,8 +11,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "examples"))
 
-import doe
-import mesher
+from k_mesher import doe
+from k_mesher import mesher
 from make_test_step import make
 
 OUT_DIR = os.path.join(ROOT, "tests", "out")

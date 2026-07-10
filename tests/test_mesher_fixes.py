@@ -19,7 +19,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "examples"))
 
-import mesher  # noqa: E402
+from k_mesher import mesher  # noqa: E402
 from make_test_step import make, make_formats  # noqa: E402
 
 EX = os.path.join(ROOT, "examples")

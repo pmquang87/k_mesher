@@ -32,10 +32,10 @@ import sys
 
 import numpy as np
 
-import _version
-import connections
-import dyna_writer
-import mesher
+from k_mesher import _version
+from k_mesher import connections
+from k_mesher import dyna_writer
+from k_mesher import mesher
 
 # sentinel: --auto-spotweld given with no SPACING value (welds at every node)
 _SPOTWELD_ON = object()

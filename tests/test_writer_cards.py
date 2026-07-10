@@ -14,7 +14,7 @@ import numpy as np
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-import dyna_writer
+from k_mesher import dyna_writer
 
 OUT_DIR = os.path.join(ROOT, "tests", "out")
 

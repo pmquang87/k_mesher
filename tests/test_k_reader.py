@@ -13,8 +13,8 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import dyna_writer  # noqa: E402
-import k_reader  # noqa: E402
+from k_mesher import dyna_writer  # noqa: E402
+from k_mesher import k_reader  # noqa: E402
 
 
 def test_roundtrip_tet4_solid(tmp_path):

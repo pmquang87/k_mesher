@@ -37,9 +37,9 @@ import traceback
 
 import numpy as np
 
-import connections
-import dyna_writer
-import mesher
+from k_mesher import connections
+from k_mesher import dyna_writer
+from k_mesher import mesher
 
 
 def run_job(settings, out: str, kopts: dict, log=print) -> str:

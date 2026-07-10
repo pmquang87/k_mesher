@@ -16,7 +16,7 @@ pytest.importorskip("lasso")
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import post  # noqa: E402
+from k_mesher import post  # noqa: E402
 
 
 # ---------------------------------------------------------------------------

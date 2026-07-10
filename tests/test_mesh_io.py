@@ -13,7 +13,7 @@ import pytest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-import mesh_io  # noqa: E402
+from k_mesher import mesh_io  # noqa: E402
 
 meshio = pytest.importorskip("meshio", reason="meshio not installed")
 

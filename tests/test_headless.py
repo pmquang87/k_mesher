@@ -14,9 +14,9 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "examples"))
 
-import dyna_writer
-import mesh_cli
-import mesher
+from k_mesher import dyna_writer
+from k_mesher import mesh_cli
+from k_mesher import mesher
 from make_test_step import make, make_two_bodies, make_shell, make_formats
 
 EX = os.path.join(ROOT, "examples")
@@ -939,7 +939,7 @@ def test_export_paths():
 
 def test_job_runner():
     print("=== job_runner (GUI-independent job execution) ===")
-    import job_runner
+    from k_mesher import job_runner
     _ensure_geometry()
     kopts = {
         "pid": 10, "elform": 10, "element_kind": "solid", "thickness": 1.0,
@@ -980,7 +980,7 @@ def test_parallel_batch_workers():
     print("=== parallel batch (worker processes) ===")
     import multiprocessing
 
-    import job_runner
+    from k_mesher import job_runner
     from concurrent.futures import ProcessPoolExecutor, as_completed
     _ensure_geometry()
     kopts = {
@@ -1179,7 +1179,7 @@ def test_cli_assembly_options():
 
 def test_cli_version():
     print("=== CLI: --version flag / _version import ===")
-    import _version
+    from k_mesher import _version
     assert _version.__version__, "package must expose a version string"
     try:
         mesh_cli.build_parser().parse_args(["x", "--version"])
@@ -1220,7 +1220,7 @@ def test_cli_dyna_control_cards():
 
 def test_job_runner_control_cards():
     print("=== job_runner: new LS-DYNA control/load kopts ===")
-    import job_runner
+    from k_mesher import job_runner
     _ensure_geometry()
     kopts = {
         "pid": 1, "elform": 10, "element_kind": "solid", "thickness": 1.0,
@@ -1368,7 +1368,7 @@ def test_cli_tied_contact():
 
 def test_job_runner_midsurface_and_connect():
     print("=== job_runner: midsurface + auto_connect kopts ===")
-    import job_runner
+    from k_mesher import job_runner
     _ensure_plate()
     base = {
         "pid": 1, "elform": None, "element_kind": "solid", "thickness": 1.0,

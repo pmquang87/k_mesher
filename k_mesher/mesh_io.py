@@ -249,3 +249,36 @@ def import_mesh(path, file_format=None):
     meshio = _require_meshio()
     mesh = meshio.read(path, file_format=file_format)
     return from_meshio(mesh)
+
+
+def main(argv=None) -> int:
+    """Console entry (``k-mesher-convert``): convert a mesh between formats.
+
+    Reads any meshio-supported mesh and writes it out again. If the output
+    ends in ``.k`` the LS-DYNA writer is used (meshio cannot write LS-DYNA).
+    """
+    import argparse
+
+    p = argparse.ArgumentParser(
+        prog="k-mesher-convert",
+        description="Convert a mesh file between FE formats (via meshio); "
+                    "an .k output is written with k_mesher's LS-DYNA writer.")
+    p.add_argument("input", help="input mesh (meshio-readable: .inp/.bdf/.vtu/...)")
+    p.add_argument("output", help="output mesh (.k for LS-DYNA, else any meshio format)")
+    p.add_argument("--thickness", type=float, default=1.0,
+                   help="shell thickness when writing .k shells")
+    args = p.parse_args(argv)
+
+    coords, elems, element_kind = import_mesh(args.input)
+    if args.output.lower().endswith(".k"):
+        from k_mesher import dyna_writer
+        dyna_writer.write_k(args.output, coords, elems,
+                            element_kind=element_kind, thickness=args.thickness)
+    else:
+        export_mesh(args.output, coords, elems, element_kind)
+    print(f"Wrote {args.output} ({len(coords)} nodes, {len(elems)} {element_kind} elements)")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

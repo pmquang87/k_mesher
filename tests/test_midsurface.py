@@ -16,8 +16,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 import gmsh
-import dyna_writer
-import mesher
+from k_mesher import dyna_writer
+from k_mesher import mesher
 
 OUT = os.path.join(ROOT, "tests", "out")
 

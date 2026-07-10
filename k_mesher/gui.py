@@ -13,8 +13,8 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from tkinter.scrolledtext import ScrolledText
 
-import job_runner
-import mesher
+from k_mesher import job_runner
+from k_mesher import mesher
 
 ELEMENT_TYPES = {
     "TET4 (linear tetrahedron)": "TET4",
