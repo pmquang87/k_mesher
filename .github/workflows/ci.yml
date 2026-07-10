@@ -61,6 +61,12 @@ jobs:
           python-version: "3.12"
           cache: pip
 
+      - name: Install system libraries for gmsh
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libglu1-mesa libgl1 libxrender1 \
+            libxcursor1 libxft2 libxinerama1 libfontconfig1
+
       - name: Install build tooling
         run: pip install build
 
