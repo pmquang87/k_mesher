@@ -12,6 +12,17 @@ tested headlessly.
     face_titles, coord_sets, implicit_cards, qa_sets, mesh_only, split_mode
     (None | "parts" | "include"), contact_fs, tssfac, gravity
 
+Mesh-time features (all read with a safe default, so a caller that omits them
+still works):
+    midsurface -> bool. Mesh thin plate solids as a midsurface shell instead of
+        mesh_step_auto; forces element_kind="shell" and takes the thickness from
+        the detected wall thickness (stats["midsurface_thickness"]).
+    auto_connect -> None | {"mode": "spotweld"|"tied", "tol": float|None,
+        "spacing": float|None, "fs": float}. After meshing a multi-body model,
+        detect the interfaces and inject *CONSTRAINED_SPOTWELD pairs (spotweld)
+        or the interface segment sets + *CONTACT_TIED_SURFACE_TO_SURFACE (tied)
+        into the write_k / write_k_include calls (never the split files).
+
 Optional LS-DYNA control / load cards (all read with a safe default, so a
 caller that omits them still works):
     endtim, mass_scale, hourglass, control_energy, databases,
@@ -26,6 +37,7 @@ import traceback
 
 import numpy as np
 
+import connections
 import dyna_writer
 import mesher
 
@@ -42,7 +54,24 @@ def run_job(settings, out: str, kopts: dict, log=print) -> str:
             "face assignments still point at the intended faces "
             "(rescan shows the post-defeature tags).")
 
-    result = mesher.mesh_step_auto(settings, log=log, preview_path=preview_path)
+    midsurface = kopts.get("midsurface", False)
+    if midsurface:
+        result = mesher.midsurface_shell(settings, log=log,
+                                         preview_path=preview_path)
+        element_kind = "shell"
+        thickness = result.stats["midsurface_thickness"]
+        log(f"Midsurface thickness: {thickness:.4g}")
+        # a solid element_type on the settings still needs a shell type for the
+        # mass/timestep estimate below (the extracted mesh is shells)
+        elem_type = (settings.element_type
+                     if mesher.ETYPES[settings.element_type]["family"] == "shell"
+                     else "TRI3")
+    else:
+        result = mesher.mesh_step_auto(settings, log=log,
+                                       preview_path=preview_path)
+        element_kind = kopts["element_kind"]
+        thickness = kopts["thickness"]
+        elem_type = settings.element_type
 
     sym_sets = []
     # segset alone still needs the sym_sets items (the node set it comes
@@ -103,6 +132,33 @@ def run_job(settings, out: str, kopts: dict, log=print) -> str:
         face_sets.append(item)
         log(f"Coordinate set {label}: {len(ids)} nodes")
 
+    # automatic connection detection (spotwelds / tied contact go to the
+    # single-file and *INCLUDE-master output only, never the split files -
+    # like contact); tied segment sets are merged into face_sets
+    auto_spotwelds = ()
+    auto_contacts = ()
+    auto = kopts.get("auto_connect")
+    if auto:
+        tol = auto.get("tol")
+        if auto.get("mode") == "spotweld":
+            auto_spotwelds = tuple(connections.spotweld_pairs(
+                result, tol=tol, spacing=auto.get("spacing")))
+            if auto_spotwelds:
+                log(f"Auto-spotweld: {len(auto_spotwelds)} weld(s) on the "
+                    f"detected interfaces")
+            else:
+                log("WARNING: auto_connect spotweld found no interfaces "
+                    "(single body or no bodies within tolerance)")
+        elif auto.get("mode") == "tied":
+            tie_sets, auto_contacts = connections.tied_contact(
+                result, tol=tol, fs=auto.get("fs", 0.0))
+            if tie_sets:
+                face_sets.extend(tie_sets)
+                log(f"Tied contact: {len(tie_sets)} interface segment set(s)")
+            else:
+                log("WARNING: auto_connect tied found no interfaces "
+                    "(single body or no bodies within tolerance)")
+
     elem_sets = []
     failed = result.stats.get("failed_elems", ())
     if kopts["qa_sets"] and len(failed):
@@ -117,9 +173,8 @@ def run_job(settings, out: str, kopts: dict, log=print) -> str:
         for p, t in part_titles.items():
             log(f"  PID {p}: {t}")
 
-    thickness_scale = (kopts["thickness"]
-                       if kopts["element_kind"] == "shell" else 1.0)
-    mesher.mass_and_timestep(result, settings.element_type, kopts["mat"],
+    thickness_scale = thickness if element_kind == "shell" else 1.0
+    mesher.mass_and_timestep(result, elem_type, kopts["mat"],
                              kopts["part_mats"], pid0, thickness_scale,
                              log=log)
     if kopts["mat"] and not kopts["part_mats"]:
@@ -137,8 +192,8 @@ def run_job(settings, out: str, kopts: dict, log=print) -> str:
 
     title = os.path.splitext(os.path.basename(out))[0]
     common = dict(
-        element_kind=kopts["element_kind"], elform=kopts["elform"],
-        thickness=kopts["thickness"], start_nid=kopts["start_nid"],
+        element_kind=element_kind, elform=kopts["elform"],
+        thickness=thickness, start_nid=kopts["start_nid"],
         start_eid=kopts["start_eid"], start_sid=kopts["start_sid"],
         comments=tuple(comments), sym_sets=tuple(sym_sets),
         mat=kopts["mat"], part_mats=kopts["part_mats"],
@@ -153,19 +208,21 @@ def run_job(settings, out: str, kopts: dict, log=print) -> str:
         define_curves=tuple(kopts.get("define_curves") or ()),
         prescribed_motion=tuple(kopts.get("prescribed_motion") or ()),
         rigidwalls=tuple(kopts.get("rigidwalls") or ()),
-        spotwelds=tuple(kopts.get("spotwelds") or ()),
     )
     databases = kopts.get("databases")
     if databases:
         common["databases"] = databases
-    contacts = tuple(kopts.get("contacts") or ())
+    # spotwelds/contacts stay out of `common` so the split files omit them
+    spotwelds = tuple(kopts.get("spotwelds") or ()) + auto_spotwelds
+    contacts = tuple(kopts.get("contacts") or ()) + auto_contacts
     split_mode = kopts.get("split_mode")
     log(f"Writing LS-DYNA keyword file: {out}")
     if split_mode == "include":
         files = dyna_writer.write_k_include(
             out, result.coords, result.elems, pid=pid0,
             part_ids=part_ids, part_titles=part_titles, title=title,
-            contact_fs=kopts["contact_fs"], contacts=contacts, **common)
+            contact_fs=kopts["contact_fs"], contacts=contacts,
+            spotwelds=spotwelds, **common)
         for p, fpath in files:
             log(f"Wrote mesh fragment: {fpath} (PID {p})")
         log(f"Master deck with *INCLUDE cards: {out}")
@@ -173,7 +230,8 @@ def run_job(settings, out: str, kopts: dict, log=print) -> str:
         dyna_writer.write_k(
             out, result.coords, result.elems, pid=pid0,
             part_ids=part_ids, part_titles=part_titles, title=title,
-            contact_fs=kopts["contact_fs"], contacts=contacts, **common)
+            contact_fs=kopts["contact_fs"], contacts=contacts,
+            spotwelds=spotwelds, **common)
         if split_mode == "parts":
             files = dyna_writer.write_k_split(
                 out, result.coords, result.elems,
@@ -184,7 +242,7 @@ def run_job(settings, out: str, kopts: dict, log=print) -> str:
 
     log(f"Done in {time.perf_counter() - t_start:.1f} s. "
         f"{result.stats['n_nodes']} nodes / "
-        f"{result.stats['n_elems']} {settings.element_type} "
+        f"{result.stats['n_elems']} {elem_type} "
         f"elements written.")
     return preview_path
 

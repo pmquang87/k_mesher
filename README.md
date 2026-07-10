@@ -79,6 +79,10 @@ python mesh_cli.py asm.stp --glue --mat --part-mat 2:70000:0.33:2.7e-9
 python mesh_cli.py asm.stp --contact 0.15 --tssfac 0.9 --gravity z:9810
 python mesh_cli.py asm.stp --split-parts        # + one standalone .k per body
 python mesh_cli.py asm.stp --split-include      # *INCLUDE fragments + master
+python mesh_cli.py plate.stp --midsurface --mat   # thin plate -> midsurface shell
+python mesh_cli.py asm.stp --auto-spotweld        # weld detected interfaces
+python mesh_cli.py asm.stp --auto-spotweld 15     # + thin welds to 15 spacing
+python mesh_cli.py asm.stp --tied-contact --connect-tol 0.05   # tie interfaces
 python mesh_cli.py asm.stp --mat --part-rigid 2         # body 2 = *MAT_RIGID
 python mesh_cli.py part.stl --etype tet4 --mat \
     --nset plane,z,0,spc=123 --nset sphere,0,0,40,15,force=z:-500
@@ -97,6 +101,25 @@ python mesh_cli.py --version
 
 Note: pass negative scientific-notation values with `=`, e.g.
 `--mass-scale=-1e-6`, so argparse does not read them as a flag.
+
+**Midsurface & automatic connections** (grouped under "mesh-time connections /
+midsurface" in `-h`):
+
+- `--midsurface` — for thin, roughly constant-thickness plate solids (the
+  sheet-metal case), extract a midsurface **shell** mesh instead of solids
+  (CAD B-rep only; rejected for STL/OBJ/PLY). The detected wall thickness is
+  printed and written on `*SECTION_SHELL`; an explicit `--thickness` overrides
+  it. A shell `--etype` (tri3/quad4) is honoured, otherwise TRI3 is used.
+- `--auto-spotweld [SPACING]` — detect the interfaces of a multi-body model and
+  weld the coincident node pairs with `*CONSTRAINED_SPOTWELD`; the optional
+  `SPACING` thins the pattern to that minimum spot spacing.
+- `--tied-contact` — detect the interfaces and tie them with
+  `*CONTACT_TIED_SURFACE_TO_SURFACE` over the interface `*SET_SEGMENT`s.
+- `--connect-tol TOL` — node-matching tolerance shared by the two flags
+  (default: 1e-3 of the bounding-box diagonal). On a single-body model the two
+  connection flags find no interface and warn but do not fail. The connection
+  cards are added to the single-file and `*INCLUDE`-master output only, not the
+  standalone per-part split files.
 
 `python mesh_cli.py -h` lists all options (the new LS-DYNA control / load
 flags are grouped under "LS-DYNA control / loads"). GUI settings are remembered
@@ -326,6 +349,10 @@ big meshes:
 | `job_runner.py` | GUI-independent mesh+write job execution (also used by the parallel batch workers) |
 | `mesher.py` | gmsh meshing core (STEP/IGES/BREP/STL/OBJ/PLY import, symmetry, refinement, tet/shell extraction) |
 | `dyna_writer.py` | LS-DYNA `.k` writer (single file, per-part files, *INCLUDE assemblies) |
+| `connections.py` | automatic connection detection between touching bodies (spotweld pairs / tied-contact segment sets) |
+| `mesh_io.py` | meshio bridge: convert k_mesher meshes to/from other FE formats |
+| `post.py` | post-processing bridge: read LS-DYNA results (d3plot/binout) back via lasso |
+| `doe.py` | design-of-experiments / mesh-convergence driver (meshing as code) |
 | `preview.py` | standalone Gmsh viewer process |
 | `pyproject.toml` | packaging (`pip install .` → `k-mesher` / `k-mesher-gui`) |
 | `examples/make_test_step.py` | generates test parts (STEP + IGES/BREP/STL) |
@@ -340,6 +367,16 @@ automatically — that would need transfinite/swept regions or an external hex
 mesher, so solid meshes are tetrahedra only. (gmsh's tet-subdivision "all-hex"
 mode exists but produces badly distorted hexes and is deliberately not
 offered.) Shells are meshed on the model's surfaces: use them for
-surface-only STEP exports or thin-walled parts; midsurface extraction is not
-performed, so export midsurfaces from CAD when shell-meshing solids-like
-sheet parts.
+surface-only STEP exports or thin-walled parts. For thin, roughly
+constant-thickness plate solids (sheet metal), `--midsurface` extracts a
+midsurface shell mesh and sets the shell thickness from the measured wall
+gap; general or strongly curved solids are not midsurfaced, so export the
+midsurface from CAD in those cases.
+
+### Python modules
+
+Beyond the CLI/GUI, k_mesher can be driven as a library: `mesher` +
+`dyna_writer` mesh and write, `connections` derives spotweld/tied-contact
+data from a `MeshResult`, `mesh_io` converts meshes to/from other FE formats
+via meshio, `post` reads LS-DYNA results back (lasso), and `doe` runs
+element-size / parameter studies as code.

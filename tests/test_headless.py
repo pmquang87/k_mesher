@@ -1253,6 +1253,168 @@ def test_job_runner_control_cards():
     print("OK: control/load cards land through run_job kopts")
 
 
+# --------------------------------------------------------------------------
+# midsurface + automatic connection detection
+# --------------------------------------------------------------------------
+
+PLATE = os.path.join(EX, "test_plate.step")
+
+
+def _make_plate(path):
+    """A thin, constant-thickness plate solid (80 x 60 x 3) for midsurface
+    extraction: two dominant 80x60 faces 3 apart -> wall thickness 3."""
+    import gmsh
+    gmsh.initialize()
+    try:
+        gmsh.model.occ.addBox(0, 0, 0, 80, 60, 3)
+        gmsh.model.occ.synchronize()
+        gmsh.write(path)
+    finally:
+        gmsh.finalize()
+
+
+def _ensure_plate():
+    _ensure_geometry()
+    if not os.path.isfile(PLATE):
+        _make_plate(PLATE)
+
+
+def section_shell_thickness(path):
+    """The T1 thickness on the first *SECTION_SHELL of a standard-format file."""
+    lines = open(path).read().splitlines()
+    for i, ln in enumerate(lines):
+        if ln.strip().upper() == "*SECTION_SHELL":
+            for j in range(i + 1, len(lines)):
+                if lines[j].lstrip().startswith("$#      t1"):
+                    return float(lines[j + 1][0:10])
+    return None
+
+
+def test_cli_midsurface():
+    print("=== CLI: --midsurface (thin plate -> shell) ===")
+    _ensure_plate()
+    k_cli = os.path.join(OUT_DIR, "cli_midsurface.k")
+    rc = mesh_cli.main([PLATE, "-o", k_cli, "--size-max", "10", "--midsurface",
+                        "--mat"])
+    assert rc == 0
+    _, _, shells, kws = parse_k(k_cli)
+    assert "*ELEMENT_SHELL" in kws and "*SECTION_SHELL" in kws
+    assert "*ELEMENT_SOLID" not in kws, "midsurface must not write solids"
+    assert len(shells) > 5
+    t = section_shell_thickness(k_cli)
+    assert t is not None and abs(t - 3.0) < 1e-3, \
+        f"*SECTION_SHELL thickness must match the 3.0 plate wall: {t}"
+    # a tessellation input must be rejected for midsurface
+    _ensure_geometry()
+    if not os.path.isfile(FORMAT_BASE + ".stl"):
+        make_formats(FORMAT_BASE)
+    rc2 = mesh_cli.main([FORMAT_BASE + ".stl", "--midsurface",
+                         "-o", os.path.join(OUT_DIR, "cli_mid_bad.k")])
+    assert rc2 == 2, "midsurface on an STL tessellation must error"
+    # an explicit --thickness overrides the detected value
+    k_cli2 = os.path.join(OUT_DIR, "cli_midsurface_t.k")
+    rc3 = mesh_cli.main([PLATE, "-o", k_cli2, "--size-max", "10",
+                         "--midsurface", "--thickness", "1.25"])
+    assert rc3 == 0
+    assert abs(section_shell_thickness(k_cli2) - 1.25) < 1e-3, \
+        "explicit --thickness must win over the detected thickness"
+    print(f"OK: {len(shells)} shells, detected thickness {t:.4g}, guards fire")
+
+
+def test_cli_auto_spotweld():
+    print("=== CLI: --auto-spotweld (unglued two-body interface) ===")
+    _ensure_geometry()
+    k_cli = os.path.join(OUT_DIR, "cli_spotweld.k")
+    # STEP2 is two boxes touching at x=20; WITHOUT --glue they keep two
+    # coincident node layers -> a detectable interface
+    rc = mesh_cli.main([STEP2, "-o", k_cli, "--size-max", "8",
+                        "--auto-spotweld"])
+    assert rc == 0
+    _, _, _, kws = parse_k(k_cli)
+    assert "*CONSTRAINED_SPOTWELD" in kws, "auto-spotweld must weld the interface"
+    n_welds = kws.count("*CONSTRAINED_SPOTWELD")
+    assert n_welds > 3
+    # SPACING thins the pattern to fewer welds
+    k_cli2 = os.path.join(OUT_DIR, "cli_spotweld_sp.k")
+    rc2 = mesh_cli.main([STEP2, "-o", k_cli2, "--size-max", "8",
+                         "--auto-spotweld", "15"])
+    assert rc2 == 0
+    _, _, _, kws2 = parse_k(k_cli2)
+    assert 0 < kws2.count("*CONSTRAINED_SPOTWELD") < n_welds, \
+        "spacing must thin the weld pattern"
+    print(f"OK: {n_welds} welds, thinned to "
+          f"{kws2.count('*CONSTRAINED_SPOTWELD')} with spacing")
+
+
+def test_cli_tied_contact():
+    print("=== CLI: --tied-contact (unglued two-body interface) ===")
+    _ensure_geometry()
+    k_cli = os.path.join(OUT_DIR, "cli_tied.k")
+    rc = mesh_cli.main([STEP2, "-o", k_cli, "--size-max", "8",
+                        "--tied-contact"])
+    assert rc == 0
+    _, _, _, kws = parse_k(k_cli)
+    assert "*CONTACT_TIED_SURFACE_TO_SURFACE" in kws, "tied contact card"
+    assert "*SET_SEGMENT_TITLE" in kws, "interface segment sets"
+    # a single-body model has no interface -> warn and continue (rc 0)
+    rc2 = mesh_cli.main([STEP, "-o", os.path.join(OUT_DIR, "cli_tied_single.k"),
+                         "--size-max", "10", "--tied-contact"])
+    assert rc2 == 0
+    _, _, _, kws1 = parse_k(os.path.join(OUT_DIR, "cli_tied_single.k"))
+    assert "*CONTACT_TIED_SURFACE_TO_SURFACE" not in kws1, \
+        "no interface on a single body -> no tied contact"
+    print("OK: tied contact + segment sets written, single-body warns")
+
+
+def test_job_runner_midsurface_and_connect():
+    print("=== job_runner: midsurface + auto_connect kopts ===")
+    import job_runner
+    _ensure_plate()
+    base = {
+        "pid": 1, "elform": None, "element_kind": "solid", "thickness": 1.0,
+        "start_nid": 1, "start_eid": 1, "start_sid": 1,
+        "sym_nodeset": False, "sym_spc": False, "sym_constraint": "symmetric",
+        "sym_dofs": "", "sym_segset": False,
+        "mat": dict(STEEL), "part_mats": {},
+        "face_nodesets": False, "face_segsets": False, "face_roles": [],
+        "plain_faces": [], "face_titles": {}, "coord_sets": [],
+        "implicit_cards": False, "qa_sets": False, "mesh_only": False,
+        "split_mode": None, "contact_fs": None, "tssfac": None,
+        "gravity": None,
+    }
+    # (a) midsurface: shell section + thickness from the detected wall gap
+    kopts_mid = {**base, "elform": 4, "midsurface": True}
+    out_mid = os.path.join(OUT_DIR, "runner_midsurface.k")
+    logmsgs = []
+    job_runner.run_job(mesher.MeshSettings(step_file=PLATE, size_max=10.0),
+                       out_mid, kopts_mid, log=lambda m: logmsgs.append(str(m)))
+    _, _, shells, kws = parse_k(out_mid)
+    assert "*SECTION_SHELL" in kws and "*ELEMENT_SHELL" in kws
+    assert "*ELEMENT_SOLID" not in kws
+    assert abs(section_shell_thickness(out_mid) - 3.0) < 1e-3
+    assert any("Midsurface thickness" in m for m in logmsgs)
+
+    # (b) auto_connect spotweld on the unglued two-body model
+    kopts_sw = {**base, "auto_connect": {"mode": "spotweld", "tol": None,
+                                         "spacing": None, "fs": 0.0}}
+    out_sw = os.path.join(OUT_DIR, "runner_spotweld.k")
+    job_runner.run_job(mesher.MeshSettings(step_file=STEP2, size_max=8.0),
+                       out_sw, kopts_sw, log=QUIET)
+    _, _, _, kws_sw = parse_k(out_sw)
+    assert "*CONSTRAINED_SPOTWELD" in kws_sw
+
+    # (c) auto_connect tied on the unglued two-body model
+    kopts_tie = {**base, "auto_connect": {"mode": "tied", "tol": None,
+                                          "spacing": None, "fs": 0.0}}
+    out_tie = os.path.join(OUT_DIR, "runner_tied.k")
+    job_runner.run_job(mesher.MeshSettings(step_file=STEP2, size_max=8.0),
+                       out_tie, kopts_tie, log=QUIET)
+    _, _, _, kws_tie = parse_k(out_tie)
+    assert "*CONTACT_TIED_SURFACE_TO_SURFACE" in kws_tie
+    assert "*SET_SEGMENT_TITLE" in kws_tie
+    print("OK: midsurface shell + spotweld + tied contact via run_job kopts")
+
+
 def main():
     tests = [(name, fn) for name, fn in sorted(globals().items())
              if name.startswith("test_") and callable(fn)]
