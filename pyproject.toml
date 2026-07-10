@@ -4,11 +4,35 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "k-mesher"
-version = "0.4.0"
+dynamic = ["version"]
 description = "Mesh STEP/IGES/BREP/STL geometry to LS-DYNA .k files (TET4/TET10 solids, TRI3/QUAD4 shells) with symmetry, defeaturing, BCs/loads and quality checks - built on gmsh"
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
+authors = [
+    { name = "Minh Quang Pham", email = "pmquang87@gmail.com" },
+]
+keywords = [
+    "mesh",
+    "LS-DYNA",
+    "gmsh",
+    "STEP",
+    "FEA",
+    "CAD",
+    "tetrahedra",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering",
+]
 dependencies = [
     "gmsh>=4.13",
     "numpy>=1.26",
@@ -16,6 +40,8 @@ dependencies = [
 
 [project.urls]
 Homepage = "https://github.com/pmquang87/k_mesher"
+Repository = "https://github.com/pmquang87/k_mesher"
+"Bug Tracker" = "https://github.com/pmquang87/k_mesher/issues"
 
 [project.scripts]
 k-mesher = "mesh_cli:cli_entry"
@@ -24,4 +50,16 @@ k-mesher = "mesh_cli:cli_entry"
 k-mesher-gui = "gui:main"
 
 [tool.setuptools]
-py-modules = ["dyna_writer", "gui", "job_runner", "mesh_cli", "mesher", "preview"]
+py-modules = [
+    "_version",
+    "dyna_writer",
+    "gui",
+    "job_runner",
+    "k_reader",
+    "mesh_cli",
+    "mesher",
+    "preview",
+]
+
+[tool.setuptools.dynamic]
+version = { attr = "_version.__version__" }

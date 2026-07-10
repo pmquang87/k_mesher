@@ -60,6 +60,16 @@ SPLIT_MODES = {
     "Standalone .k per body": "parts",
     "*INCLUDE fragments + master deck": "include",
 }
+# contact card kinds (label -> job_runner contact type id). The first entry is
+# the default: it keeps the legacy single-surface behaviour driven by contact_fs
+# (kopts["contacts"] stays empty); any other choice emits a *CONTACT via
+# kopts["contacts"].
+CONTACT_TYPES = {
+    "Automatic single surface (default)": "automatic_single_surface",
+    "Automatic surface to surface": "automatic_surface_to_surface",
+    "Tied surface to surface": "tied_surface_to_surface",
+    "Tied nodes to surface": "tied_nodes_to_surface",
+}
 # coordinate node-set kinds (label -> (mesher.select_nodes kind, params hint))
 COORD_KINDS = {
     "Plane": ("plane", "params: axis (x/y/z), offset  e.g. z, 0"),
@@ -368,6 +378,85 @@ class KMesherGUI:
         self.lst_pmat.grid(row=1, column=0, sticky="ew", pady=3)
         ttk.Button(pmat, text="Remove", command=self._remove_part_mat
                    ).grid(row=1, column=1, sticky="n", pady=3)
+
+        ctrl = ttk.LabelFrame(tab, text="Control & output cards", padding=6)
+        ctrl.grid(row=2, column=0, sticky="ew", **pad)
+        for c in (1, 3):
+            ctrl.columnconfigure(c, weight=1)
+
+        ttk.Label(ctrl, text="Termination time (*CONTROL_TERMINATION):"
+                  ).grid(row=0, column=0, sticky="w")
+        self.var_endtim = tk.StringVar(value="")
+        ttk.Entry(ctrl, textvariable=self.var_endtim, width=12).grid(
+            row=0, column=1, sticky="w", padx=4)
+
+        ttk.Label(ctrl, text="Mass scaling (DT2MS):").grid(
+            row=0, column=2, sticky="w")
+        self.var_mass_scale = tk.StringVar(value="")
+        ttk.Entry(ctrl, textvariable=self.var_mass_scale, width=12).grid(
+            row=0, column=3, sticky="w", padx=4)
+        ttk.Label(ctrl, text="(both blank = off; DT2MS typically negative)",
+                  foreground="gray").grid(row=1, column=0, columnspan=4, sticky="w")
+
+        self.var_hourglass = tk.BooleanVar(value=False)
+        ttk.Checkbutton(ctrl, text="Write *HOURGLASS",
+                        variable=self.var_hourglass).grid(row=2, column=0, sticky="w")
+        hgrow = ttk.Frame(ctrl)
+        hgrow.grid(row=2, column=1, columnspan=3, sticky="w")
+        ttk.Label(hgrow, text="IHQ:").pack(side="left")
+        self.var_hg_ihq = tk.StringVar(value="4")
+        ttk.Combobox(hgrow, textvariable=self.var_hg_ihq, state="readonly",
+                     width=4, values=[str(i) for i in range(1, 7)]).pack(side="left", padx=4)
+        ttk.Label(hgrow, text="QM:").pack(side="left")
+        self.var_hg_qm = tk.StringVar(value="0.1")
+        ttk.Entry(hgrow, textvariable=self.var_hg_qm, width=8).pack(side="left", padx=4)
+
+        self.var_ctrl_energy = tk.BooleanVar(value=False)
+        ttk.Checkbutton(ctrl, text="Write *CONTROL_ENERGY",
+                        variable=self.var_ctrl_energy).grid(
+            row=3, column=0, columnspan=2, sticky="w")
+
+        self.var_db = tk.BooleanVar(value=False)
+        ttk.Checkbutton(ctrl, text="Write *DATABASE output,  d3plot dt:",
+                        variable=self.var_db).grid(row=4, column=0, sticky="w")
+        self.var_db_dt = tk.StringVar(value="1.0")
+        ttk.Entry(ctrl, textvariable=self.var_db_dt, width=10).grid(
+            row=4, column=1, sticky="w", padx=4)
+        dbrow = ttk.Frame(ctrl)
+        dbrow.grid(row=5, column=0, columnspan=4, sticky="w")
+        ttk.Label(dbrow, text="ASCII (shared dt):").pack(side="left")
+        self.var_db_glstat = tk.BooleanVar(value=False)
+        ttk.Checkbutton(dbrow, text="GLSTAT", variable=self.var_db_glstat
+                        ).pack(side="left", padx=4)
+        self.var_db_matsum = tk.BooleanVar(value=False)
+        ttk.Checkbutton(dbrow, text="MATSUM", variable=self.var_db_matsum
+                        ).pack(side="left", padx=4)
+        self.var_db_rcforc = tk.BooleanVar(value=False)
+        ttk.Checkbutton(dbrow, text="RCFORC", variable=self.var_db_rcforc
+                        ).pack(side="left", padx=4)
+        self.var_db_spcforc = tk.BooleanVar(value=False)
+        ttk.Checkbutton(dbrow, text="SPCFORC", variable=self.var_db_spcforc
+                        ).pack(side="left", padx=4)
+
+        ttk.Label(ctrl, text="Initial velocity (Vx, Vy, Vz):").grid(
+            row=6, column=0, sticky="w")
+        ivrow = ttk.Frame(ctrl)
+        ivrow.grid(row=6, column=1, columnspan=3, sticky="w")
+        self.var_ivel_vx = tk.StringVar(value="")
+        self.var_ivel_vy = tk.StringVar(value="")
+        self.var_ivel_vz = tk.StringVar(value="")
+        for v in (self.var_ivel_vx, self.var_ivel_vy, self.var_ivel_vz):
+            ttk.Entry(ivrow, textvariable=v, width=8).pack(side="left", padx=2)
+        ttk.Label(ivrow, text="(blank = 0; all-zero = off)",
+                  foreground="gray").pack(side="left", padx=4)
+
+        ttk.Label(ctrl, text="Contact type:").grid(row=7, column=0, sticky="w")
+        self.var_contact_type = tk.StringVar(value=next(iter(CONTACT_TYPES)))
+        ttk.Combobox(ctrl, textvariable=self.var_contact_type, state="readonly",
+                     width=32, values=list(CONTACT_TYPES)).grid(
+            row=7, column=1, columnspan=2, sticky="w", padx=4)
+        ttk.Label(ctrl, text="(uses the contact friction set above)",
+                  foreground="gray").grid(row=7, column=3, sticky="w")
 
     # ----------------------------------------- tab: symmetry & face sets --
     def _build_sym_tab(self, tab, pad):
@@ -1011,6 +1100,12 @@ class KMesherGUI:
                 raise ValueError(f"{name} must be >= {minval}.")
             return v
 
+        def opt_num(var, name, minval=None):
+            """A number that may be left blank (blank -> None = 'off')."""
+            if not var.get().strip():
+                return None
+            return num(var, name, minval=minval)
+
         smax = num(self.var_smax, "Max element size")
         if smax <= 0:
             raise ValueError("Max element size must be > 0.")
@@ -1096,9 +1191,18 @@ class KMesherGUI:
             if thickness <= 0:
                 raise ValueError("Shell thickness must be > 0.")
 
+        # Contact: the default single-surface kind keeps driving contact_fs (as
+        # before); any other kind emits a *CONTACT via kopts["contacts"].
         contact_fs = None
+        contacts: tuple = ()
         if self.var_contact.get():
-            contact_fs = num(self.var_contact_fs, "Contact friction", minval=0.0)
+            fs = num(self.var_contact_fs, "Contact friction", minval=0.0)
+            ctype = CONTACT_TYPES.get(self.var_contact_type.get(),
+                                      "automatic_single_surface")
+            if ctype == "automatic_single_surface":
+                contact_fs = fs
+            else:
+                contacts = ({"type": ctype, "fs": fs},)
         tssfac = None
         if self.var_ctrl_dt.get():
             tssfac = num(self.var_tssfac, "TSSFAC")
@@ -1108,6 +1212,43 @@ class KMesherGUI:
         if self.var_grav.get():
             gravity = (self.var_grav_axis.get().lower(),
                        num(self.var_grav_a, "Gravity acceleration"))
+
+        # --- extra control / output cards (all optional; blank/unchecked = off)
+        endtim = opt_num(self.var_endtim, "Termination time", minval=0.0)
+        mass_scale = opt_num(self.var_mass_scale, "Mass scaling (DT2MS)")
+
+        hourglass = None
+        if self.var_hourglass.get():
+            try:
+                ihq = int(self.var_hg_ihq.get())
+            except ValueError:
+                raise ValueError("Hourglass IHQ must be an integer.") from None
+            hourglass = {"ihq": ihq,
+                         "qm": num(self.var_hg_qm, "Hourglass QM", minval=0.0)}
+
+        control_energy = self.var_ctrl_energy.get()
+
+        databases = None
+        if self.var_db.get():
+            d3dt = num(self.var_db_dt, "d3plot dt")
+            if d3dt <= 0:
+                raise ValueError("d3plot dt must be > 0.")
+            ascii_out = {}
+            for aname, avar in (("GLSTAT", self.var_db_glstat),
+                                ("MATSUM", self.var_db_matsum),
+                                ("RCFORC", self.var_db_rcforc),
+                                ("SPCFORC", self.var_db_spcforc)):
+                if avar.get():
+                    ascii_out[aname] = d3dt
+            databases = {"d3plot_dt": d3dt, "ascii": ascii_out}
+
+        vel = [opt_num(v, name) or 0.0 for v, name in (
+            (self.var_ivel_vx, "Initial velocity Vx"),
+            (self.var_ivel_vy, "Initial velocity Vy"),
+            (self.var_ivel_vz, "Initial velocity Vz"))]
+        initial_velocity = None
+        if any(vel):
+            initial_velocity = {"vx": vel[0], "vy": vel[1], "vz": vel[2]}
 
         pid0 = integer(self.var_pid, "Part ID")
         part_mats = {}
@@ -1141,8 +1282,15 @@ class KMesherGUI:
             "mesh_only": self.var_mesh_only.get(),
             "split_mode": SPLIT_MODES.get(self.var_split_mode.get()),
             "contact_fs": contact_fs,
+            "contacts": contacts,
             "tssfac": tssfac,
             "gravity": gravity,
+            "endtim": endtim,
+            "mass_scale": mass_scale,
+            "hourglass": hourglass,
+            "control_energy": control_energy,
+            "databases": databases,
+            "initial_velocity": initial_velocity,
             "part_mats": part_mats,
             "coord_sets": [dict(cs) for cs in self.coord_sets],
             "face_titles": {t: f.get("name", "")
@@ -1225,9 +1373,18 @@ class KMesherGUI:
             "implicit": self.var_implicit, "qa": self.var_qa,
             "mesh_only": self.var_mesh_only, "split_mode": self.var_split_mode,
             "contact": self.var_contact, "contact_fs": self.var_contact_fs,
+            "contact_type": self.var_contact_type,
             "ctrl_dt": self.var_ctrl_dt, "tssfac": self.var_tssfac,
             "grav": self.var_grav, "grav_axis": self.var_grav_axis,
             "grav_a": self.var_grav_a,
+            "endtim": self.var_endtim, "mass_scale": self.var_mass_scale,
+            "hourglass": self.var_hourglass, "hg_ihq": self.var_hg_ihq,
+            "hg_qm": self.var_hg_qm, "ctrl_energy": self.var_ctrl_energy,
+            "db": self.var_db, "db_dt": self.var_db_dt,
+            "db_glstat": self.var_db_glstat, "db_matsum": self.var_db_matsum,
+            "db_rcforc": self.var_db_rcforc, "db_spcforc": self.var_db_spcforc,
+            "ivel_vx": self.var_ivel_vx, "ivel_vy": self.var_ivel_vy,
+            "ivel_vz": self.var_ivel_vz,
             "batch_par": self.var_batch_par,
             "batch_workers": self.var_batch_workers,
         }

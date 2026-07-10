@@ -32,6 +32,7 @@ import sys
 
 import numpy as np
 
+import _version
 import dyna_writer
 import mesher
 
@@ -50,6 +51,8 @@ ALGO_CHOICES = {
     "hxt": "HXT (parallel Delaunay)",
 }
 STEEL_MMTS = {"e": 210000.0, "pr": 0.3, "ro": 7.85e-9}  # steel, mm-t-s units
+CONTACT_TYPES = ("automatic_single_surface", "automatic_surface_to_surface",
+                 "tied_surface_to_surface", "tied_nodes_to_surface")
 
 
 def parse_sym(text: str) -> mesher.SymmetryPlane:
@@ -236,11 +239,140 @@ def _parse_force(text: str) -> tuple[int, str, float]:
     return tag, axis, total
 
 
+def parse_hourglass(text: str) -> dict:
+    """IHQ[:QM] e.g. '5' or '5:0.05' -> *HOURGLASS (QM defaults to 0.1)."""
+    parts = text.split(":")
+    try:
+        ihq = int(parts[0])
+    except (ValueError, IndexError):
+        raise argparse.ArgumentTypeError(
+            f"hourglass IHQ must be an integer: {text!r}") from None
+    try:
+        qm = float(parts[1]) if len(parts) > 1 and parts[1] else 0.1
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"bad hourglass QM in {text!r}") from None
+    return {"ihq": ihq, "qm": qm}
+
+
+def parse_database(text: str) -> tuple[str, float]:
+    """NAME:DT e.g. 'GLSTAT:1e-4' -> one *DATABASE_<NAME> ascii request."""
+    name, sep, dt = text.partition(":")
+    if not sep or not name.strip():
+        raise argparse.ArgumentTypeError(f"expected NAME:DT, got {text!r}")
+    try:
+        return name.strip().upper(), float(dt)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"bad database interval in {text!r}") from None
+
+
+def parse_init_velocity(text: str) -> dict:
+    """VX:VY:VZ[:VXR:VYR:VZR] initial velocity; the optional rotational
+    components map to an OMEGA about the axis they define."""
+    parts = text.split(":")
+    if len(parts) not in (3, 6):
+        raise argparse.ArgumentTypeError(
+            f"init-velocity needs VX:VY:VZ or VX:VY:VZ:VXR:VYR:VZR: {text!r}")
+    try:
+        vals = [float(v) for v in parts]
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"bad init-velocity numbers in {text!r}") from None
+    iv = {"vx": vals[0], "vy": vals[1], "vz": vals[2]}
+    if len(vals) == 6:
+        iv.update(vxr=vals[3], vyr=vals[4], vzr=vals[5])
+    return iv
+
+
+def parse_rigidwall(text: str) -> dict:
+    """TX:TY:TZ:HX:HY:HZ[:FRIC] -> *RIGIDWALL_PLANAR (normal tail -> head)."""
+    parts = text.split(":")
+    if len(parts) not in (6, 7):
+        raise argparse.ArgumentTypeError(
+            f"rigidwall needs 6 or 7 colon-separated numbers "
+            f"(tail xyz, head xyz[, fric]): {text!r}")
+    try:
+        vals = [float(v) for v in parts]
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"bad rigidwall numbers in {text!r}") from None
+    rw = {"tail": tuple(vals[0:3]), "head": tuple(vals[3:6])}
+    if len(vals) == 7:
+        rw["fric"] = vals[6]
+    return rw
+
+
+def parse_spotweld(text: str) -> tuple[int, int]:
+    """N1:N2 node-id pair -> *CONSTRAINED_SPOTWELD."""
+    parts = text.split(":")
+    try:
+        return int(parts[0]), int(parts[1])
+    except (ValueError, IndexError):
+        raise argparse.ArgumentTypeError(
+            f"spotweld needs two node ids N1:N2: {text!r}") from None
+
+
+def parse_define_curve(text: str) -> dict:
+    """LCID:x1,y1;x2,y2;... -> *DEFINE_CURVE with the listed points."""
+    lcid_str, sep, pts = text.partition(":")
+    if not sep:
+        raise argparse.ArgumentTypeError(
+            f"define-curve needs LCID:x1,y1;x2,y2;...: {text!r}")
+    try:
+        lcid = int(lcid_str)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"define-curve LCID must be an integer: {text!r}") from None
+    points = []
+    for pair in pts.split(";"):
+        pair = pair.strip()
+        if not pair:
+            continue
+        xy = pair.split(",")
+        if len(xy) != 2:
+            raise argparse.ArgumentTypeError(
+                f"define-curve point must be x,y: {pair!r} in {text!r}")
+        try:
+            points.append((float(xy[0]), float(xy[1])))
+        except ValueError:
+            raise argparse.ArgumentTypeError(
+                f"bad define-curve point {pair!r} in {text!r}") from None
+    if not points:
+        raise argparse.ArgumentTypeError(
+            f"define-curve needs at least one point: {text!r}")
+    return {"lcid": lcid, "points": points}
+
+
+def parse_prescribed_motion(text: str) -> dict:
+    """NSID:DOF:VAD:LCID[:SF] -> *BOUNDARY_PRESCRIBED_MOTION_SET."""
+    parts = text.split(":")
+    if len(parts) not in (4, 5):
+        raise argparse.ArgumentTypeError(
+            f"prescribed-motion needs NSID:DOF:VAD:LCID[:SF]: {text!r}")
+    try:
+        pm = {"nsid": int(parts[0]), "dof": int(parts[1]),
+              "vad": int(parts[2]), "lcid": int(parts[3])}
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"prescribed-motion NSID/DOF/VAD/LCID must be integers: "
+            f"{text!r}") from None
+    if len(parts) == 5:
+        try:
+            pm["sf"] = float(parts[4])
+        except ValueError:
+            raise argparse.ArgumentTypeError(
+                f"bad prescribed-motion SF in {text!r}") from None
+    return pm
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="Mesh a STEP/IGES/BREP/STL file to TET4/TET10/TRI3/QUAD4 "
                     "and write an LS-DYNA .k file.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    p.add_argument("--version", action="version",
+                   version=f"%(prog)s {_version.__version__}")
     p.add_argument("input", help="CAD/mesh input: STEP/IGES/BREP solid or "
                                  "surface, or an STL/OBJ/PLY tessellation "
                                  "(shells, or tets if watertight)")
@@ -397,6 +529,52 @@ def build_parser() -> argparse.ArgumentParser:
                         "to reach this explicit timestep (mass-scaling guide)")
     p.add_argument("--preview", action="store_true",
                    help="open the Gmsh viewer on the result")
+
+    g = p.add_argument_group("LS-DYNA control / loads")
+    g.add_argument("--endtim", type=float, default=None, metavar="TIME",
+                   help="write *CONTROL_TERMINATION with this end time")
+    g.add_argument("--mass-scale", type=float, default=None, metavar="DT2MS",
+                   help="mass scaling: *CONTROL_TIMESTEP DT2MS (typically "
+                        "negative, e.g. -1e-6); forces the card even without "
+                        "--tssfac")
+    g.add_argument("--hourglass", type=parse_hourglass, default=None,
+                   metavar="IHQ[:QM]",
+                   help="write *HOURGLASS (IHQ type, QM coefficient default "
+                        "0.1); its HGID is stamped on every *PART")
+    g.add_argument("--control-energy", action="store_true",
+                   help="write *CONTROL_ENERGY (hourglass / sliding / "
+                        "rigidwall / Rayleigh energy tracking)")
+    g.add_argument("--d3plot-dt", type=float, default=None, metavar="DT",
+                   help="write *DATABASE_BINARY_D3PLOT with this output "
+                        "interval")
+    g.add_argument("--database", type=parse_database, action="append",
+                   default=[], metavar="NAME:DT",
+                   help="ASCII database output, e.g. GLSTAT:1e-4 -> one "
+                        "*DATABASE_<NAME> card, repeatable")
+    g.add_argument("--init-velocity", type=parse_init_velocity, default=None,
+                   metavar="VX:VY:VZ[:VXR:VYR:VZR]",
+                   help="*INITIAL_VELOCITY_GENERATION over all nodes "
+                        "(rotational components -> OMEGA about their axis)")
+    g.add_argument("--contact-type", choices=CONTACT_TYPES, default=None,
+                   help="contact type used with --contact (default is plain "
+                        "single-surface); writes the matching *CONTACT_ card "
+                        "with --contact's friction")
+    g.add_argument("--rigidwall", type=parse_rigidwall, action="append",
+                   default=[], metavar="TX:TY:TZ:HX:HY:HZ[:FRIC]",
+                   help="*RIGIDWALL_PLANAR, normal pointing tail -> head, "
+                        "repeatable")
+    g.add_argument("--spotweld", type=parse_spotweld, action="append",
+                   default=[], metavar="N1:N2",
+                   help="*CONSTRAINED_SPOTWELD between two node ids, "
+                        "repeatable")
+    g.add_argument("--define-curve", type=parse_define_curve, action="append",
+                   default=[], metavar="LCID:x1,y1;x2,y2;...",
+                   help="*DEFINE_CURVE with the given point list, repeatable")
+    g.add_argument("--prescribed-motion", type=parse_prescribed_motion,
+                   action="append", default=[],
+                   metavar="NSID:DOF:VAD:LCID[:SF]",
+                   help="*BOUNDARY_PRESCRIBED_MOTION_SET (vad 0 vel / 1 accel "
+                        "/ 2 disp), repeatable")
     return p
 
 
@@ -579,6 +757,22 @@ def main(argv=None) -> int:
         comments.append(f"Symmetry: {sp.axis.upper()} = {sp.offset:g}, "
                         f"kept '{sp.keep}' side")
 
+    # contact: a plain --contact writes single-surface via contact_fs; adding
+    # --contact-type routes it into the general `contacts` list instead (kept
+    # out of common so the per-part split files still omit contact)
+    contact_fs = args.contact
+    contacts = ()
+    if args.contact_type is not None:
+        fs = args.contact if args.contact is not None else 0.0
+        contacts = ({"type": args.contact_type, "fs": fs},)
+        contact_fs = None
+
+    databases = {}
+    if args.d3plot_dt is not None:
+        databases["d3plot_dt"] = args.d3plot_dt
+    if args.database:
+        databases["ascii"] = dict(args.database)
+
     common = dict(
         element_kind="shell" if is_shell else "solid",
         elform=elform, thickness=args.thickness,
@@ -590,13 +784,21 @@ def main(argv=None) -> int:
         elem_sets=tuple(elem_sets), implicit_cards=args.implicit_cards,
         mesh_only=args.mesh_only, tssfac=args.tssfac,
         body_load=args.gravity, long_format=args.long_format,
+        endtim=args.endtim, mass_scale=args.mass_scale,
+        hourglass=args.hourglass, control_energy=args.control_energy,
+        initial_velocity=args.init_velocity,
+        define_curves=tuple(args.define_curve),
+        prescribed_motion=tuple(args.prescribed_motion),
+        rigidwalls=tuple(args.rigidwall), spotwelds=tuple(args.spotweld),
     )
+    if databases:
+        common["databases"] = databases
     split_files = []
     if args.split_include:
         split_files = dyna_writer.write_k_include(
             out, result.coords, result.elems, pid=args.pid,
             part_ids=part_ids, part_titles=part_titles,
-            contact_fs=args.contact, **common)
+            contact_fs=contact_fs, contacts=contacts, **common)
         for p, f in split_files:
             print(f"Wrote {f} (mesh fragment, PID {p})")
         print(f"Wrote {out} (master deck with *INCLUDE cards)")
@@ -604,7 +806,7 @@ def main(argv=None) -> int:
         dyna_writer.write_k(
             out, result.coords, result.elems, pid=args.pid,
             part_ids=part_ids, part_titles=part_titles,
-            contact_fs=args.contact, **common)
+            contact_fs=contact_fs, contacts=contacts, **common)
         print(f"Wrote {out}")
         if args.split_parts:
             split_files = dyna_writer.write_k_split(

@@ -1,7 +1,22 @@
 line-length = 100
 
 [lint]
-# defaults (E4/E7/E9/F) plus nothing exotic - the codebase is plain Python
+# Active ruleset kept to the ruff defaults (E4/E7/E9/F) so CI stays green while
+# several source modules are being edited concurrently.
+#
+# Recommended broader ruleset to adopt once the codebase has been cleaned up
+# (see CONTRIBUTING.md). Enable by replacing the block above with:
+#
+#   select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+#
+#   E    - pycodestyle errors
+#   F    - pyflakes
+#   I    - isort (import sorting)
+#   UP   - pyupgrade (modern syntax)
+#   B    - flake8-bugbear (likely bugs)
+#   SIM  - flake8-simplify
+#   RUF  - ruff-specific rules
+
 [lint.per-file-ignores]
 # the tests must extend sys.path before importing the project modules
 "tests/*" = ["E402"]

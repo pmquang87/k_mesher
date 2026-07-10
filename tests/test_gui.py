@@ -157,3 +157,86 @@ def test_progress_bar_toggles(app):
     assert app.progress.winfo_manager() == "pack"
     app._set_busy(False)
     assert app.progress.winfo_manager() == ""
+
+
+def test_control_output_defaults_off(app):
+    _ensure_geometry()
+    _, _, kopts = app._collect_inputs(need_out=False)
+    assert kopts["endtim"] is None
+    assert kopts["mass_scale"] is None
+    assert kopts["hourglass"] is None
+    assert kopts["control_energy"] is False
+    assert kopts["databases"] is None
+    assert kopts["initial_velocity"] is None
+    assert kopts["contacts"] == ()
+
+
+def test_control_output_wiring(app):
+    _ensure_geometry()
+    app.var_endtim.set("0.01")
+    app.var_mass_scale.set("-1e-6")
+    app.var_hourglass.set(True)
+    app.var_hg_ihq.set("5")
+    app.var_hg_qm.set("0.15")
+    app.var_ctrl_energy.set(True)
+    app.var_db.set(True)
+    app.var_db_dt.set("0.001")
+    app.var_db_glstat.set(True)
+    app.var_db_rcforc.set(True)
+    app.var_ivel_vx.set("100")
+    app.var_ivel_vz.set("-5")
+    _, _, kopts = app._collect_inputs(need_out=False)
+    assert kopts["endtim"] == 0.01
+    assert kopts["mass_scale"] == -1e-6
+    assert kopts["hourglass"] == {"ihq": 5, "qm": 0.15}
+    assert kopts["control_energy"] is True
+    assert kopts["databases"] == {"d3plot_dt": 0.001,
+                                  "ascii": {"GLSTAT": 0.001, "RCFORC": 0.001}}
+    assert kopts["initial_velocity"] == {"vx": 100.0, "vy": 0.0, "vz": -5.0}
+
+
+def test_contact_type_wiring(app):
+    _ensure_geometry()
+    app.var_contact.set(True)
+    app.var_contact_fs.set("0.2")
+    # the default single-surface kind keeps contact_fs and leaves contacts empty
+    _, _, kopts = app._collect_inputs(need_out=False)
+    assert kopts["contact_fs"] == 0.2
+    assert kopts["contacts"] == ()
+    # a non-default kind moves the friction into a *CONTACT entry instead
+    app.var_contact_type.set("Tied surface to surface")
+    _, _, kopts = app._collect_inputs(need_out=False)
+    assert kopts["contact_fs"] is None
+    assert kopts["contacts"] == ({"type": "tied_surface_to_surface",
+                                  "fs": 0.2},)
+
+
+def test_db_dt_validation(app):
+    _ensure_geometry()
+    app.var_db.set(True)
+    app.var_db_dt.set("0")
+    with pytest.raises(ValueError):
+        app._collect_inputs(need_out=False)
+
+
+def test_control_output_settings_round_trip(app):
+    _ensure_geometry()
+    app.var_endtim.set("0.02")
+    app.var_hourglass.set(True)
+    app.var_db.set(True)
+    app.var_contact_type.set("Automatic surface to surface")
+    data = app._collect_settings_data()
+    for key in ("endtim", "mass_scale", "hourglass", "hg_ihq", "hg_qm",
+                "ctrl_energy", "db", "db_dt", "db_glstat", "db_matsum",
+                "db_rcforc", "db_spcforc", "ivel_vx", "ivel_vy", "ivel_vz",
+                "contact_type"):
+        assert key in data
+    app.var_endtim.set("")
+    app.var_hourglass.set(False)
+    app.var_db.set(False)
+    app.var_contact_type.set(next(iter(gui.CONTACT_TYPES)))
+    app._apply_settings_data(data)
+    assert app.var_endtim.get() == "0.02"
+    assert app.var_hourglass.get() is True
+    assert app.var_db.get() is True
+    assert app.var_contact_type.get() == "Automatic surface to surface"

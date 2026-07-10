@@ -91,7 +91,9 @@ def write_k(
     *,
     element_kind: str = "solid",       # "solid" | "shell"
     pid: int = 1,              # base part id; also used as SECID and MID
-    elform: int = 10,
+    elform: int | None = None,         # element formulation; None -> a sensible
+                                       # default from element_kind + node count
+                                       # (solid TET4->10, TET10->16, shell->2)
     thickness: float = 1.0,    # shell thickness (shells only)
     start_nid: int = 1,
     start_eid: int = 1,
@@ -104,7 +106,13 @@ def write_k(
                                        #                fixed (default symmetric),
                                        #  "dofs": optional 6-seq/digit-str override,
                                        #  "segset": optional (S,4) plane segments}
-    mat: dict | None = None,           # {"e": E, "pr": nu, "ro": density} -> *MAT_ELASTIC
+    mat: dict | None = None,           # {"e": E, "pr": nu, "ro": density} ->
+                                       # *MAT_ELASTIC (or "rigid":True -> *MAT_RIGID).
+                                       # A raw passthrough is also accepted:
+                                       # {"keyword":"*MAT_...","cards":[raw lines]}
+                                       # emits the keyword + those lines verbatim;
+                                       # each raw line gets .format(mid=...) so a
+                                       # "{mid}" placeholder receives the real MID.
     part_ids: np.ndarray | None = None,   # (M,) per-element part id; default all = pid
     part_titles: dict[int, str] | None = None,
     face_sets: tuple[dict, ...] = (),  # {"kind":"node"|"segment","title",
@@ -129,9 +137,56 @@ def write_k(
     mesh_blocks: bool = True,          # write *NODE/*ELEMENT (False for an
                                        # *INCLUDE master deck - the mesh then
                                        # comes from the included fragments)
+    endtim: float | None = None,       # *CONTROL_TERMINATION ENDTIM (skipped in
+                                       # mesh_only; the implicit deck writes its
+                                       # own termination, so ignored when
+                                       # implicit_cards is on)
+    mass_scale: float | None = None,   # *CONTROL_TIMESTEP DT2MS (mass scaling,
+                                       # typically negative); forces the card
+                                       # even when tssfac is None (tssfac->0.9)
+    hourglass: dict | None = None,     # {"ihq":int,"qm":float,"hgid":int?} ->
+                                       # one *HOURGLASS card whose HGID is set on
+                                       # every *PART (default hgid 1)
+    control_energy: bool = False,      # *CONTROL_ENERGY with HGEN/RWEN/SLNTEN/
+                                       # RYLEN = 2 (skipped in mesh_only)
+    databases: dict | None = None,     # {"d3plot_dt":float,
+                                       #  "ascii":{"GLSTAT":dt,"MATSUM":dt,...}}
+                                       # -> *DATABASE_BINARY_D3PLOT + one
+                                       # *DATABASE_<NAME> per ascii entry
+                                       # (binary=1); ascii names case-insensitive
+    define_curves: tuple[dict, ...] = (),  # each {"lcid":int,"points":[(x,y)..],
+                                       #  "sfa":1.0,"sfo":1.0,"title":str?} ->
+                                       # a *DEFINE_CURVE (separate from the
+                                       # internal unit ramp used by loads)
+    initial_velocity: dict | None = None,  # {"vx","vy","vz","vxr"?,"vyr"?,
+                                       #  "vzr"?,"nsid":0?} ->
+                                       # *INITIAL_VELOCITY_GENERATION (nsid 0 =
+                                       # all nodes; rotational parts -> OMEGA+axis)
+    prescribed_motion: tuple[dict, ...] = (),  # each {"nsid":int,"dof":1-6,
+                                       #  "vad":0 vel|1 accel|2 disp,"lcid":int,
+                                       #  "sf":1.0} -> *BOUNDARY_PRESCRIBED_MOTION_SET
+    rigidwalls: tuple[dict, ...] = (),  # each {"tail":(x,y,z),"head":(x,y,z),
+                                       #  "fric":0.0} -> *RIGIDWALL_PLANAR
+                                       # (NSID 0; normal points tail -> head)
+    spotwelds: tuple[tuple[int, int], ...] = (),  # node-id pairs (raw, already
+                                       # offset) -> one *CONSTRAINED_SPOTWELD each
+    contacts: tuple[dict, ...] = (),   # each {"type": automatic_single_surface|
+                                       #  automatic_surface_to_surface|
+                                       #  tied_surface_to_surface|
+                                       #  tied_nodes_to_surface, "fs":0.0} ->
+                                       # the matching *CONTACT_ card over all
+                                       # parts (SSID/MSID 0); skipped in mesh_only
 ) -> None:
     n_nodes = len(coords)
     nn = elems.shape[1]
+    if elform is None:
+        # sensible default formulation from the element type and node count
+        if element_kind == "shell":
+            elform = 2
+        else:
+            elform = 16 if nn == 10 else 10
+    # hourglass id stamped on every *PART (0 = LS-DYNA default, no *HOURGLASS)
+    hgid = int(hourglass.get("hgid", 1)) if hourglass is not None else 0
     nids = np.arange(start_nid, start_nid + n_nodes, dtype=np.int64)
     eids = np.arange(start_eid, start_eid + len(elems), dtype=np.int64)
     elem_nids = elems - 1 + start_nid
@@ -167,8 +222,15 @@ def write_k(
         else:
             if implicit_cards:
                 _write_implicit_cards(f, w)
-            if tssfac is not None:
-                _write_control_timestep(f, w, tssfac)
+            if tssfac is not None or mass_scale is not None:
+                _write_control_timestep(
+                    f, w, tssfac if tssfac is not None else 0.9,
+                    mass_scale or 0.0)
+            # implicit deck already writes its own *CONTROL_TERMINATION
+            if endtim is not None and not implicit_cards:
+                _write_control_termination(f, w, endtim)
+            if control_energy:
+                _write_control_energy(f, w)
 
             # --- PART / SECTION / MAT ---------------------------------------
             for p in unique_pids:
@@ -177,7 +239,7 @@ def write_k(
                 f.write(f"{part_titles.get(p, f'part {p}')[:70]}\n")
                 f.write("$#     pid     secid       mid     eosid      hgid"
                         "      grav    adpopt      tmid\n")
-                f.write(w.ints(p, pid, mid, 0, 0, 0, 0, 0) + "\n")
+                f.write(w.ints(p, pid, mid, 0, hgid, 0, 0, 0) + "\n")
 
             # one material card per referenced MID; per-part materials
             # override the global one for their pid
@@ -209,7 +271,14 @@ def write_k(
 
             for mid in sorted(mats_by_mid):
                 m = mats_by_mid[mid]
-                if m.get("rigid"):
+                if m.get("keyword") and m.get("cards") is not None:
+                    # raw passthrough: emit the keyword and its pre-formatted
+                    # card lines verbatim, substituting the real MID into any
+                    # "{mid}" placeholder the caller left in a line
+                    f.write(m["keyword"].strip() + "\n")
+                    for line in m["cards"]:
+                        f.write(line.format(mid=mid).rstrip("\n") + "\n")
+                elif m.get("rigid"):
                     # E/nu still matter: LS-DYNA uses them for the contact
                     # stiffness of the rigid body
                     f.write("*MAT_RIGID\n")
@@ -229,8 +298,16 @@ def write_k(
                     f.write(f"{mid:{w.f}d}{m['ro']:{w.f}.3e}{m['e']:{w.f}.4g}"
                             f"{m['pr']:{w.f}.4f}{0.0:{w.f}.1f}{0.0:{w.f}.1f}\n")
 
+            if hourglass is not None:
+                _write_hourglass(f, w, hgid, int(hourglass.get("ihq", 1)),
+                                 float(hourglass.get("qm", 0.1)))
+
             if contact_fs is not None:
                 _write_contact(f, w, contact_fs)
+            for c in contacts:
+                _write_general_contact(f, w, c.get("type",
+                                       "automatic_single_surface"),
+                                       float(c.get("fs", 0.0)))
 
         if mesh_blocks:
             _write_mesh_blocks(f, w, element_kind, nn, nids, coords,
@@ -259,8 +336,10 @@ def write_k(
 
         sid = start_sid - 1
         for s in sym_sets:
-            sid += 1
             set_nids = np.asarray(s["nodes"], dtype=np.int64) - 1 + start_nid
+            if len(set_nids) == 0:   # skip empty *SET_NODE cards entirely
+                continue
+            sid += 1
             constraint = (s.get("constraint") or "symmetric").lower()
             suffix = "" if constraint == "symmetric" else f" ({constraint})"
             _write_node_set(f, w, sid, f"SYM_{s['axis'].upper()} plane at "
@@ -274,9 +353,11 @@ def write_k(
                                               f"{s['offset']:g} segments", segs)
 
         for s in face_sets:
-            sid += 1
             if s["kind"] == "node":
                 set_nids = np.asarray(s["nodes"], dtype=np.int64) - 1 + start_nid
+                if len(set_nids) == 0:   # skip empty node sets entirely
+                    continue
+                sid += 1
                 _write_node_set(f, w, sid, s["title"], set_nids)
                 if s.get("spc_dofs"):
                     dofs = tuple(1 if str(d) in s["spc_dofs"] else 0
@@ -294,6 +375,9 @@ def write_k(
                             f"{sf:{w.f}.4g}\n")
             else:
                 segs = np.asarray(s["segments"], dtype=np.int64) - 1 + start_nid
+                if len(segs) == 0:   # skip empty segment sets entirely
+                    continue
+                sid += 1
                 _write_segment_set(f, w, sid, s["title"], segs)
                 if s.get("pressure") is not None:
                     f.write("*LOAD_SEGMENT_SET\n")
@@ -303,8 +387,10 @@ def write_k(
 
         # --- ELEMENT SETS (quality check failures etc.) -----------------------
         for s in elem_sets:
-            sid += 1
             set_eids = np.asarray(s["eids"], dtype=np.int64) - 1 + start_eid
+            if len(set_eids) == 0:   # skip empty element sets entirely
+                continue
+            sid += 1
             if element_kind == "solid":
                 f.write("*SET_SOLID_TITLE\n")
                 f.write(f"{s['title'][:70]}\n")
@@ -321,6 +407,20 @@ def write_k(
                 chunk = set_eids[row:row + 8]
                 f.write("".join(f"{e:{w.f}d}" for e in chunk) + "\n")
 
+        # --- user-defined curves, initial/boundary conditions, output ---------
+        for c in define_curves:
+            _write_define_curve(f, w, c)
+        if initial_velocity is not None:
+            _write_initial_velocity(f, w, initial_velocity)
+        for pm in prescribed_motion:
+            _write_prescribed_motion(f, w, pm)
+        for rw in rigidwalls:
+            _write_rigidwall(f, w, rw)
+        for n1, n2 in spotwelds:
+            _write_spotweld(f, w, int(n1), int(n2))
+        if databases is not None:
+            _write_databases(f, w, databases)
+
         f.write("*END\n")
 
 
@@ -329,8 +429,12 @@ def _write_mesh_blocks(f, w: _Widths, element_kind: str, nn: int,
     """The *NODE and *ELEMENT blocks (ids are final, already offset)."""
     f.write("*NODE\n")
     f.write("$#   nid               x               y               z\n")
-    node_block = np.column_stack((np.asarray(nids, dtype=float), coords))
-    np.savetxt(f, node_block, fmt=f"%{w.n}d" + f"%{w.c}.9e" * 3)
+    # keep node ids as true integers: promoting them to float (as column_stack
+    # with the coords would) loses precision for ids beyond 2^53 in LONG format
+    node_fmt = f"%{w.n}d" + f"%{w.c}.9e" * 3
+    coords = np.asarray(coords, dtype=float)
+    f.writelines(node_fmt % (int(nid), r[0], r[1], r[2]) + "\n"
+                 for nid, r in zip(nids, coords))
 
     if element_kind == "shell":
         f.write("*ELEMENT_SHELL\n")
@@ -537,11 +641,154 @@ def _write_spc(f, w: _Widths, sid: int, dofs) -> None:
     f.write(w.ints(sid, 0, *dofs) + "\n")
 
 
-def _write_control_timestep(f, w: _Widths, tssfac: float) -> None:
+def _write_control_timestep(f, w: _Widths, tssfac: float,
+                            mass_scale: float = 0.0) -> None:
     f.write("*CONTROL_TIMESTEP\n")
     f.write("$#  dtinit    tssfac      isdo    tslimt     dt2ms      lctm"
             "     erode     ms1st\n")
-    f.write(f"{0.0:{w.f}.1f}{float(tssfac):{w.f}.4f}\n")
+    if mass_scale:
+        # DT2MS given: fill dtinit/isdo/tslimt up to the dt2ms field
+        f.write(f"{0.0:{w.f}.1f}{float(tssfac):{w.f}.4f}{0:{w.f}d}"
+                f"{0.0:{w.f}.1f}{float(mass_scale):{w.f}.4g}\n")
+    else:
+        f.write(f"{0.0:{w.f}.1f}{float(tssfac):{w.f}.4f}\n")
+
+
+def _write_control_termination(f, w: _Widths, endtim: float) -> None:
+    f.write("*CONTROL_TERMINATION\n")
+    f.write("$#  endtim    endcyc     dtmin    endeng    endmas\n")
+    f.write(f"{float(endtim):{w.f}.4g}\n")
+
+
+def _write_control_energy(f, w: _Widths) -> None:
+    """Track hourglass, sliding-interface, rigidwall and Rayleigh energies."""
+    f.write("*CONTROL_ENERGY\n")
+    f.write("$#    hgen      rwen    slnten     rylen\n")
+    f.write(w.ints(2, 2, 2, 2) + "\n")
+
+
+def _write_hourglass(f, w: _Widths, hgid: int, ihq: int, qm: float) -> None:
+    """One *HOURGLASS card; its HGID is referenced by every *PART."""
+    f.write("*HOURGLASS\n")
+    f.write("$#    hgid       ihq        qm       ibq        q1        q2"
+            "    qb/vdc        qw\n")
+    f.write(f"{hgid:{w.f}d}{int(ihq):{w.f}d}{float(qm):{w.f}.4g}\n")
+
+
+def _CONTACT_KEYWORDS():
+    return {
+        "automatic_single_surface": "*CONTACT_AUTOMATIC_SINGLE_SURFACE",
+        "automatic_surface_to_surface": "*CONTACT_AUTOMATIC_SURFACE_TO_SURFACE",
+        "tied_surface_to_surface": "*CONTACT_TIED_SURFACE_TO_SURFACE",
+        "tied_nodes_to_surface": "*CONTACT_TIED_NODES_TO_SURFACE",
+    }
+
+
+def _write_general_contact(f, w: _Widths, ctype: str, fs: float) -> None:
+    """A contact of the given type scoped over ALL parts (SSID/MSID 0,
+    SSTYP/MSTYP 0). Only the friction coefficients are set; other fields
+    stay at their LS-DYNA defaults."""
+    keyword = _CONTACT_KEYWORDS().get(ctype.lower())
+    if keyword is None:
+        raise ValueError(f"unknown contact type {ctype!r}")
+    f.write(keyword + "\n")
+    f.write("$#    ssid      msid     sstyp     mstyp    sboxid    mboxid"
+            "       spr       mpr\n")
+    f.write(w.ints(0, 0, 0, 0, 0, 0, 0, 0) + "\n")
+    f.write("$#      fs        fd        dc        vc       vdc    penchk"
+            "        bt        dt\n")
+    f.write(f"{float(fs):{w.f}.4f}{float(fs):{w.f}.4f}"
+            + f"{0.0:{w.f}.1f}" * 6 + "\n")
+    f.write("$#     sfs       sfm       sst       mst      sfst      sfmt"
+            "       fsf       vsf\n")
+    f.write(f"{0.0:{w.f}.1f}" * 8 + "\n")
+
+
+def _write_define_curve(f, w: _Widths, c: dict) -> None:
+    """A user *DEFINE_CURVE: point rows are two floats each (2*w.f-wide)."""
+    title = c.get("title")
+    if title:
+        f.write("*DEFINE_CURVE_TITLE\n")
+        f.write(f"{str(title)[:70]}\n")
+    else:
+        f.write("*DEFINE_CURVE\n")
+    f.write("$#    lcid      sidr       sfa       sfo      offa      offo"
+            "    dattyp     lcint\n")
+    f.write(f"{int(c['lcid']):{w.f}d}{0:{w.f}d}"
+            f"{float(c.get('sfa', 1.0)):{w.f}.4g}"
+            f"{float(c.get('sfo', 1.0)):{w.f}.4g}"
+            f"{0.0:{w.f}.1f}{0.0:{w.f}.1f}{0:{w.f}d}{0:{w.f}d}\n")
+    for x, y in c["points"]:
+        f.write(f"{float(x):{2 * w.f}.10g}{float(y):{2 * w.f}.10g}\n")
+
+
+def _write_initial_velocity(f, w: _Widths, iv: dict) -> None:
+    """*INITIAL_VELOCITY_GENERATION over a node set (nsid 0 = all nodes).
+    Rotational components map to OMEGA about the axis they define."""
+    vxr = float(iv.get("vxr", 0.0))
+    vyr = float(iv.get("vyr", 0.0))
+    vzr = float(iv.get("vzr", 0.0))
+    omega = (vxr ** 2 + vyr ** 2 + vzr ** 2) ** 0.5
+    nx, ny, nz = (vxr / omega, vyr / omega, vzr / omega) if omega else (0.0, 0.0, 0.0)
+    nsid = int(iv.get("nsid", 0))
+    styp = 0 if nsid == 0 else 3   # 3 = node set id
+    f.write("*INITIAL_VELOCITY_GENERATION\n")
+    f.write("$#   nsid      styp     omega        vx        vy        vz"
+            "     ivatn      icid\n")
+    f.write(f"{nsid:{w.f}d}{styp:{w.f}d}{omega:{w.f}.4g}"
+            f"{float(iv.get('vx', 0.0)):{w.f}.4g}"
+            f"{float(iv.get('vy', 0.0)):{w.f}.4g}"
+            f"{float(iv.get('vz', 0.0)):{w.f}.4g}{0:{w.f}d}{0:{w.f}d}\n")
+    f.write("$#     xc        yc        zc        nx        ny        nz"
+            "     phase    irigid\n")
+    f.write(f"{0.0:{w.f}.1f}{0.0:{w.f}.1f}{0.0:{w.f}.1f}"
+            f"{nx:{w.f}.4g}{ny:{w.f}.4g}{nz:{w.f}.4g}{0:{w.f}d}{0:{w.f}d}\n")
+
+
+def _write_prescribed_motion(f, w: _Widths, pm: dict) -> None:
+    f.write("*BOUNDARY_PRESCRIBED_MOTION_SET\n")
+    f.write("$#    nsid       dof       vad      lcid        sf       vid"
+            "     death     birth\n")
+    f.write(f"{int(pm['nsid']):{w.f}d}{int(pm['dof']):{w.f}d}"
+            f"{int(pm.get('vad', 0)):{w.f}d}{int(pm['lcid']):{w.f}d}"
+            f"{float(pm.get('sf', 1.0)):{w.f}.4g}{0:{w.f}d}"
+            f"{1.0e28:{w.f}.4g}{0.0:{w.f}.1f}\n")
+
+
+def _write_rigidwall(f, w: _Widths, rw: dict) -> None:
+    """*RIGIDWALL_PLANAR over all nodes (NSID 0); the normal points from the
+    tail toward the head."""
+    xt, yt, zt = (float(v) for v in rw["tail"])
+    xh, yh, zh = (float(v) for v in rw["head"])
+    f.write("*RIGIDWALL_PLANAR\n")
+    f.write("$#    nsid    nsidex     boxid    offset     birth     death"
+            "     rwksf\n")
+    f.write(f"{0:{w.f}d}{0:{w.f}d}{0:{w.f}d}{0.0:{w.f}.1f}{0.0:{w.f}.1f}"
+            f"{1.0e28:{w.f}.4g}{1.0:{w.f}.1f}\n")
+    f.write("$#      xt        yt        zt        xh        yh        zh"
+            "      fric      wvel\n")
+    f.write(f"{xt:{w.f}.4g}{yt:{w.f}.4g}{zt:{w.f}.4g}"
+            f"{xh:{w.f}.4g}{yh:{w.f}.4g}{zh:{w.f}.4g}"
+            f"{float(rw.get('fric', 0.0)):{w.f}.4g}{0.0:{w.f}.1f}\n")
+
+
+def _write_spotweld(f, w: _Widths, n1: int, n2: int) -> None:
+    f.write("*CONSTRAINED_SPOTWELD\n")
+    f.write("$#      n1        n2        sn        ss         n         m"
+            "     tfail      epsf\n")
+    f.write(f"{n1:{w.f}d}{n2:{w.f}d}" + f"{0.0:{w.f}.1f}" * 6 + "\n")
+
+
+def _write_databases(f, w: _Widths, db: dict) -> None:
+    """*DATABASE_BINARY_D3PLOT plus one *DATABASE_<NAME> per ascii request."""
+    if db.get("d3plot_dt") is not None:
+        f.write("*DATABASE_BINARY_D3PLOT\n")
+        f.write("$#      dt\n")
+        f.write(f"{float(db['d3plot_dt']):{w.f}.4g}\n")
+    for name, dt in (db.get("ascii") or {}).items():
+        f.write(f"*DATABASE_{str(name).strip().upper()}\n")
+        f.write("$#      dt    binary\n")
+        f.write(f"{float(dt):{w.f}.4g}{1:{w.f}d}\n")
 
 
 def _write_contact(f, w: _Widths, fs: float) -> None:

@@ -83,9 +83,23 @@ python mesh_cli.py asm.stp --mat --part-rigid 2         # body 2 = *MAT_RIGID
 python mesh_cli.py part.stl --etype tet4 --mat \
     --nset plane,z,0,spc=123 --nset sphere,0,0,40,15,force=z:-500
 python mesh_cli.py part.stp --export part.vtk --mat --target-dt 5e-7
+python mesh_cli.py asm.stp --mat --endtim 0.01 --mass-scale=-1e-6 \
+    --control-energy --hourglass 5:0.05         # explicit control cards
+python mesh_cli.py asm.stp --mat --d3plot-dt 1e-4 --database GLSTAT:1e-5 \
+    --database MATSUM:1e-5                       # output requests
+python mesh_cli.py asm.stp --mat --init-velocity 0:0:-5000 \
+    --contact 0.1 --contact-type tied_surface_to_surface
+python mesh_cli.py asm.stp --mat --rigidwall 0:0:-50:0:0:1:0.2 \
+    --spotweld 101:202 --define-curve 99:0,0;1,1 \
+    --prescribed-motion 5:3:0:99:1.0            # loads / BCs
+python mesh_cli.py --version
 ```
 
-`python mesh_cli.py -h` lists all options. GUI settings are remembered
+Note: pass negative scientific-notation values with `=`, e.g.
+`--mass-scale=-1e-6`, so argparse does not read them as a flag.
+
+`python mesh_cli.py -h` lists all options (the new LS-DYNA control / load
+flags are grouped under "LS-DYNA control / loads"). GUI settings are remembered
 between sessions in `k_mesher_settings.json` (written on every run and on
 window close).
 
@@ -223,13 +237,18 @@ window close).
 
 ```
 *KEYWORD / *TITLE     (*KEYWORD LONG=Y when ids need 20-char fields)
-*CONTROL_TIMESTEP     (optional; chosen TSSFAC)
+*CONTROL_TIMESTEP     (optional; chosen TSSFAC and/or DT2MS mass scaling)
+*CONTROL_TERMINATION  (optional; --endtim)
+*CONTROL_ENERGY       (optional; --control-energy)
 *PART                 (one per solid body; SECID = base PID, MID = base PID
-                       or the body's own PID with per-body materials)
+                       or the body's own PID with per-body materials;
+                       HGID set when --hourglass is used)
 *SECTION_SOLID /      (chosen ELFORM; SECTION_SHELL carries the thickness)
 *SECTION_SHELL
 *MAT_ELASTIC          (optional; one per referenced MID)
-*CONTACT_AUTOMATIC_SINGLE_SURFACE   (optional; friction on card 2)
+*HOURGLASS            (optional; --hourglass, referenced by every *PART)
+*CONTACT_...          (optional; single-surface, or the --contact-type card;
+                       friction on card 2)
 *LOAD_BODY_X/Y/Z      (optional gravity; scaled unit ramp curve)
 *NODE                 (I8 id, 3 x E16.9 coordinates)
 *ELEMENT_SOLID        (TET4: one line, tet as degenerate hex;
@@ -238,8 +257,41 @@ window close).
 *SET_NODE_LIST_TITLE  (symmetry planes and selected faces)
 *BOUNDARY_SPC_SET     (one per symmetry plane)
 *SET_SEGMENT_TITLE    (selected faces; triangles as degenerate quads)
+*DEFINE_CURVE         (optional; --define-curve, user load curves)
+*INITIAL_VELOCITY_GENERATION      (optional; --init-velocity)
+*BOUNDARY_PRESCRIBED_MOTION_SET   (optional; --prescribed-motion)
+*RIGIDWALL_PLANAR     (optional; --rigidwall)
+*CONSTRAINED_SPOTWELD (optional; --spotweld, one per node pair)
+*DATABASE_BINARY_D3PLOT / *DATABASE_<NAME>   (optional; --d3plot-dt / --database)
 *END
 ```
+
+### LS-DYNA control / load cards
+
+Beyond the mesh, `.k` output can carry a set of optional analysis cards
+(CLI flags in parentheses; `run_job`/the GUI wire the same options):
+
+- `*CONTROL_TERMINATION` — analysis end time (`--endtim`).
+- `*CONTROL_TIMESTEP` — TSSFAC (`--tssfac`) and DT2MS mass scaling
+  (`--mass-scale`, typically negative; forces the card even without a TSSFAC).
+- `*CONTROL_ENERGY` — hourglass / sliding / rigidwall / Rayleigh energy
+  tracking (`--control-energy`).
+- `*HOURGLASS` — one card (`--hourglass IHQ[:QM]`) whose HGID is stamped on
+  every `*PART`.
+- `*DATABASE_BINARY_D3PLOT` and ASCII `*DATABASE_<NAME>` output requests
+  (`--d3plot-dt`, repeatable `--database NAME:DT`).
+- `*INITIAL_VELOCITY_GENERATION` over all nodes, translational plus optional
+  rotational components (`--init-velocity VX:VY:VZ[:VXR:VYR:VZR]`).
+- `*CONTACT_...` with a chosen type (`--contact-type`, used together with
+  `--contact FS`): automatic single-surface / surface-to-surface, or tied
+  surface-to-surface / nodes-to-surface.
+- `*RIGIDWALL_PLANAR` (`--rigidwall`, repeatable), `*CONSTRAINED_SPOTWELD`
+  (`--spotweld`, repeatable), user `*DEFINE_CURVE` (`--define-curve`,
+  repeatable) and `*BOUNDARY_PRESCRIBED_MOTION_SET` (`--prescribed-motion`,
+  repeatable).
+
+These are writer-only cards, added to the single-file and `*INCLUDE`-master
+output; the standalone per-part split files intentionally omit contact.
 
 All tets are checked and reoriented for positive volume before writing.
 TET10 node ordering follows the LS-DYNA convention (mid-side nodes 5-10).
