@@ -151,9 +151,40 @@ class MeshResult:
     sym_segs: dict[str, np.ndarray] = field(default_factory=dict)
 
 
-def mesh_step(settings: MeshSettings, log=print, preview_path: str | None = None) -> MeshResult:
+def select_nodes(coords: np.ndarray, kind: str, params,
+                 tol: float | None = None) -> np.ndarray:
+    """1-based ids of the mesh nodes matching a coordinate predicate.
+
+    Works for every input format (unlike face sets, which need CAD faces).
+      kind "plane":  params (axis, offset) - nodes within tol of the plane
+      kind "box":    params (x0, y0, z0, x1, y1, z1), grown by tol
+      kind "sphere": params (cx, cy, cz, r), grown by tol
+    tol defaults to 1e-6 of the mesh bounding-box diagonal."""
+    coords = np.asarray(coords, dtype=float)
+    if tol is None:
+        diag = (float(np.linalg.norm(coords.max(0) - coords.min(0)))
+                if len(coords) else 0.0)
+        tol = max(1e-6 * diag, 1e-9)
+    if kind == "plane":
+        axis, offset = params
+        mask = np.abs(coords[:, AXIS_INDEX[axis]] - float(offset)) <= tol
+    elif kind == "box":
+        p = np.asarray(params, dtype=float)
+        lo, hi = np.minimum(p[:3], p[3:]) - tol, np.maximum(p[:3], p[3:]) + tol
+        mask = ((coords >= lo) & (coords <= hi)).all(axis=1)
+    elif kind == "sphere":
+        p = np.asarray(params, dtype=float)
+        mask = np.linalg.norm(coords - p[:3], axis=1) <= p[3] + tol
+    else:
+        raise ValueError(f"unknown node selection kind: {kind!r}")
+    return np.flatnonzero(mask) + 1
+
+
+def mesh_step(settings: MeshSettings, log=print, preview_path: str | None = None,
+              export_paths: tuple[str, ...] = ()) -> MeshResult:
     """Mesh a CAD/mesh file (STEP/IGES/BREP/STL/OBJ/PLY). Optionally save a
-    .msh copy for preview."""
+    .msh copy for preview and/or export the mesh to other gmsh-supported
+    formats (.msh/.vtk/... - the format follows the extension)."""
     if settings.element_type not in ETYPES:
         raise ValueError(f"Unknown element type: {settings.element_type}")
     family = ETYPES[settings.element_type]["family"]
@@ -186,8 +217,8 @@ def mesh_step(settings: MeshSettings, log=print, preview_path: str | None = None
         stats["duplicate_nodes"] = _count_duplicate_nodes(coords)
         _log_stats(stats, sym_nodes, log)
 
-        if preview_path:
-            gmsh.write(preview_path)
+        for out_path in ([preview_path] if preview_path else []) + list(export_paths):
+            gmsh.write(out_path)
 
         return MeshResult(coords=coords, elems=elems, elem_parts=elem_parts,
                           part_names=part_names, sym_nodes=sym_nodes,
@@ -197,26 +228,34 @@ def mesh_step(settings: MeshSettings, log=print, preview_path: str | None = None
         gmsh.finalize()
 
 
+def _round_path(path: str, rnd: int) -> str:
+    """Per-round variant of an output path (suffix before the extension -
+    gmsh picks the file format by it)."""
+    base, ext = os.path.splitext(path)
+    return f"{base}.round{rnd}{ext}"
+
+
 def mesh_step_auto(settings: MeshSettings, log=print,
-                   preview_path: str | None = None) -> MeshResult:
+                   preview_path: str | None = None,
+                   export_paths: tuple[str, ...] = ()) -> MeshResult:
     """mesh_step with an optional quality-driven retry loop: if the minimum
     element quality is below the threshold, add refinement spheres at the
     worst spots and remesh (BatchMesher-style). Returns the best mesh; the
-    preview file (if requested) always matches the mesh that is returned."""
+    preview/export files (if requested) always match the mesh returned."""
     s = settings
     rounds = settings.auto_refine_rounds if settings.auto_refine else 0
-    best, best_preview, round_previews = None, None, []
+    out_paths = ([preview_path] if preview_path else []) + list(export_paths)
+    best, best_rnd = None, -1
     for rnd in range(rounds + 1):
-        rp = preview_path
-        if preview_path and rounds:
-            # per-round file so the preview of the KEPT mesh can be restored
+        if rounds and out_paths:
+            # per-round files so the output of the KEPT mesh can be restored
             # even when a later (worse) round overwrote a shared path
-            # (suffix goes before the extension - gmsh picks the format by it)
-            base, ext = os.path.splitext(preview_path)
-            rp = f"{base}.round{rnd}{ext}"
-            round_previews.append(rp)
+            pv = _round_path(preview_path, rnd) if preview_path else None
+            ex = tuple(_round_path(p, rnd) for p in export_paths)
+        else:
+            pv, ex = preview_path, tuple(export_paths)
         try:
-            res = mesh_step(s, log=log, preview_path=rp)
+            res = mesh_step(s, log=log, preview_path=pv, export_paths=ex)
         except Exception as e:
             if best is None:
                 raise
@@ -227,7 +266,7 @@ def mesh_step_auto(settings: MeshSettings, log=print,
             break
         if (best is None or res.stats.get("quality_min", 1.0)
                 > best.stats.get("quality_min", 1.0)):
-            best, best_preview = res, rp
+            best, best_rnd = res, rnd
         qmin = res.stats.get("quality_min", 1.0)
         worst = [w for w in (res.stats.get("worst_elements") or ())
                  if w[0] < s.auto_refine_threshold]
@@ -240,12 +279,16 @@ def mesh_step_auto(settings: MeshSettings, log=print,
             f"{s.auto_refine_threshold:g} - adding {len(add)} refinement "
             f"sphere(s) and remeshing (round {rnd + 1}/{rounds}) ...")
         s = replace(s, refinements=list(s.refinements) + add)
-    if preview_path and rounds:
-        if best_preview and os.path.isfile(best_preview):
-            os.replace(best_preview, preview_path)
-        for p in round_previews:
-            if p != best_preview and os.path.isfile(p):
-                os.remove(p)
+    if rounds and out_paths:
+        for p in out_paths:
+            kept = _round_path(p, best_rnd)
+            if os.path.isfile(kept):
+                os.replace(kept, p)
+        for r in range(rounds + 1):
+            for p in out_paths:
+                rp = _round_path(p, r)
+                if os.path.isfile(rp):
+                    os.remove(rp)
     if best.stats.get("quality_min", 1.0) != res.stats.get("quality_min", 1.0):
         log(f"Auto-refine: keeping the best of all rounds "
             f"(min quality {best.stats.get('quality_min', 1.0):.4f})")
@@ -1166,7 +1209,9 @@ def mass_and_timestep(result: MeshResult, element_type: str,
     if mass is not None:
         c = stats.get("cog", (0, 0, 0))
         log(f"Mass: {mass:.6g}   COG: ({c[0]:.4g}, {c[1]:.4g}, {c[2]:.4g})")
-    mats = list(part_mats.values()) + ([mat] if mat else [])
+    # rigid parts do not control the explicit timestep
+    mats = ([m for m in part_mats.values() if not m.get("rigid")]
+            + ([mat] if mat else []))
     dts = [critical_timestep(stats, element_type, m) for m in mats]
     dts = [d for d in dts if d]
     dt_est = min(dts) if dts else None

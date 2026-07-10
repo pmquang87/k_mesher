@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "k-mesher"
+version = "0.4.0"
+description = "Mesh STEP/IGES/BREP/STL geometry to LS-DYNA .k files (TET4/TET10 solids, TRI3/QUAD4 shells) with symmetry, defeaturing, BCs/loads and quality checks - built on gmsh"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+dependencies = [
+    "gmsh>=4.13",
+    "numpy>=1.26",
+]
+
+[project.urls]
+Homepage = "https://github.com/pmquang87/k_mesher"
+
+[project.scripts]
+k-mesher = "mesh_cli:cli_entry"
+
+[project.gui-scripts]
+k-mesher-gui = "gui:main"
+
+[tool.setuptools]
+py-modules = ["dyna_writer", "gui", "job_runner", "mesh_cli", "mesher", "preview"]

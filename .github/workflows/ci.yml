@@ -20,12 +20,12 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-      - name: Install system libraries for gmsh (Linux)
+      - name: Install system libraries for gmsh + headless GUI (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y libglu1-mesa libgl1 libxrender1 \
-            libxcursor1 libxft2 libxinerama1 libfontconfig1
+            libxcursor1 libxft2 libxinerama1 libfontconfig1 xvfb
 
       - name: Install Python dependencies
         run: pip install -r requirements.txt pytest ruff
@@ -33,5 +33,10 @@ jobs:
       - name: Lint (ruff)
         run: ruff check .
 
-      - name: Run end-to-end tests
-        run: pytest tests/test_headless.py -v
+      - name: Run tests (Linux, under Xvfb for the GUI tests)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a pytest tests/ -v
+
+      - name: Run tests (Windows)
+        if: runner.os == 'Windows'
+        run: pytest tests/ -v

@@ -125,6 +125,10 @@ def write_k(
                                        # *LOAD_BODY_ with the unit ramp curve
     long_format: bool = False,         # force LONG=Y 20-char fields (otherwise
                                        # auto-enabled when ids overflow I8)
+    include_files: tuple[str, ...] = (),  # *INCLUDE cards (e.g. mesh fragments)
+    mesh_blocks: bool = True,          # write *NODE/*ELEMENT (False for an
+                                       # *INCLUDE master deck - the mesh then
+                                       # comes from the included fragments)
 ) -> None:
     n_nodes = len(coords)
     nn = elems.shape[1]
@@ -151,6 +155,10 @@ def write_k(
         if auto_long:
             f.write("$ LONG=Y format enabled automatically: ids exceed the "
                     "8-character standard fields\n")
+
+        for inc in include_files:
+            f.write("*INCLUDE\n")
+            f.write(f"{inc}\n")
 
         if mesh_only:
             f.write(f"$ mesh-only file (for *INCLUDE): define *PART {pid}"
@@ -201,43 +209,32 @@ def write_k(
 
             for mid in sorted(mats_by_mid):
                 m = mats_by_mid[mid]
-                f.write("*MAT_ELASTIC\n")
-                f.write("$#     mid        ro         e        pr        da"
-                        "        db\n")
-                f.write(f"{mid:{w.f}d}{m['ro']:{w.f}.3e}{m['e']:{w.f}.4g}"
-                        f"{m['pr']:{w.f}.4f}{0.0:{w.f}.1f}{0.0:{w.f}.1f}\n")
+                if m.get("rigid"):
+                    # E/nu still matter: LS-DYNA uses them for the contact
+                    # stiffness of the rigid body
+                    f.write("*MAT_RIGID\n")
+                    f.write("$#     mid        ro         e        pr"
+                            "         n    couple         m     alias\n")
+                    f.write(f"{mid:{w.f}d}{m['ro']:{w.f}.3e}{m['e']:{w.f}.4g}"
+                            f"{m['pr']:{w.f}.4f}\n")
+                    f.write("$#     cmo      con1      con2\n")
+                    f.write(f"{0.0:{w.f}.1f}\n")
+                    f.write("$# lco/a1        a2        a3        v1"
+                            "        v2        v3\n")
+                    f.write(f"{0.0:{w.f}.1f}\n")
+                else:
+                    f.write("*MAT_ELASTIC\n")
+                    f.write("$#     mid        ro         e        pr        da"
+                            "        db\n")
+                    f.write(f"{mid:{w.f}d}{m['ro']:{w.f}.3e}{m['e']:{w.f}.4g}"
+                            f"{m['pr']:{w.f}.4f}{0.0:{w.f}.1f}{0.0:{w.f}.1f}\n")
 
             if contact_fs is not None:
                 _write_contact(f, w, contact_fs)
 
-        # --- NODES ----------------------------------------------------------
-        f.write("*NODE\n")
-        f.write("$#   nid               x               y               z\n")
-        node_block = np.column_stack((nids.astype(float), coords))
-        np.savetxt(f, node_block, fmt=f"%{w.n}d" + f"%{w.c}.9e" * 3)
-
-        # --- ELEMENTS ---------------------------------------------------------
-        if element_kind == "shell":
-            f.write("*ELEMENT_SHELL\n")
-            f.write("$#   eid     pid      n1      n2      n3      n4\n")
-            elem_block = np.column_stack((eids, part_ids, elem_nids))
-            np.savetxt(f, elem_block, fmt=f"%{w.n}d" * 6)
-        elif nn == 4:
-            f.write("*ELEMENT_SOLID\n")
-            f.write("$#   eid     pid      n1      n2      n3      n4      n5"
-                    "      n6      n7      n8\n")
-            elem_block = np.column_stack(
-                (eids, part_ids, elem_nids,
-                 elem_nids[:, 3], elem_nids[:, 3], elem_nids[:, 3], elem_nids[:, 3])
-            )
-            np.savetxt(f, elem_block, fmt=f"%{w.n}d" * 10)
-        else:  # TET10, two-line format
-            f.write("*ELEMENT_SOLID\n")
-            f.write("$#   eid     pid\n")
-            f.write("$#    n1      n2      n3      n4      n5      n6      n7"
-                    "      n8      n9     n10\n")
-            elem_block = np.column_stack((eids, part_ids, elem_nids))
-            np.savetxt(f, elem_block, fmt=f"%{w.n}d" * 2 + "\n" + f"%{w.n}d" * 10)
+        if mesh_blocks:
+            _write_mesh_blocks(f, w, element_kind, nn, nids, coords,
+                               eids, part_ids, elem_nids)
 
         # --- SETS (symmetry, then picked faces) -------------------------------
         need_curve = (body_load is not None
@@ -325,6 +322,110 @@ def write_k(
                 f.write("".join(f"{e:{w.f}d}" for e in chunk) + "\n")
 
         f.write("*END\n")
+
+
+def _write_mesh_blocks(f, w: _Widths, element_kind: str, nn: int,
+                       nids, coords, eids, part_ids, elem_nids) -> None:
+    """The *NODE and *ELEMENT blocks (ids are final, already offset)."""
+    f.write("*NODE\n")
+    f.write("$#   nid               x               y               z\n")
+    node_block = np.column_stack((np.asarray(nids, dtype=float), coords))
+    np.savetxt(f, node_block, fmt=f"%{w.n}d" + f"%{w.c}.9e" * 3)
+
+    if element_kind == "shell":
+        f.write("*ELEMENT_SHELL\n")
+        f.write("$#   eid     pid      n1      n2      n3      n4\n")
+        elem_block = np.column_stack((eids, part_ids, elem_nids))
+        np.savetxt(f, elem_block, fmt=f"%{w.n}d" * 6)
+    elif nn == 4:
+        f.write("*ELEMENT_SOLID\n")
+        f.write("$#   eid     pid      n1      n2      n3      n4      n5"
+                "      n6      n7      n8\n")
+        elem_block = np.column_stack(
+            (eids, part_ids, elem_nids,
+             elem_nids[:, 3], elem_nids[:, 3], elem_nids[:, 3], elem_nids[:, 3])
+        )
+        np.savetxt(f, elem_block, fmt=f"%{w.n}d" * 10)
+    else:  # TET10, two-line format
+        f.write("*ELEMENT_SOLID\n")
+        f.write("$#   eid     pid\n")
+        f.write("$#    n1      n2      n3      n4      n5      n6      n7"
+                "      n8      n9     n10\n")
+        elem_block = np.column_stack((eids, part_ids, elem_nids))
+        np.savetxt(f, elem_block, fmt=f"%{w.n}d" * 2 + "\n" + f"%{w.n}d" * 10)
+
+
+def write_k_include(
+    path: str,
+    coords: np.ndarray,
+    elems: np.ndarray,
+    *,
+    part_ids: np.ndarray,              # (M,) per-element part id
+    part_titles: dict[int, str] | None = None,
+    element_kind: str = "solid",
+    start_nid: int = 1,
+    start_eid: int = 1,
+    title: str = "k_mesher mesh",
+    comments: tuple[str, ...] = (),
+    long_format: bool = False,
+    **kw,                              # remaining write_k keyword arguments
+) -> list[tuple[int, str]]:
+    """Write an *INCLUDE assembly: one mesh fragment per part plus a master.
+
+    The fragments (``<path stem>_p<PID>[_<name>].k``) keep the GLOBAL node and
+    element numbering, and every node is defined in exactly one fragment
+    (interface nodes shared between glued parts go to the first part using
+    them) - so including all fragments rebuilds the complete mesh with no
+    duplicate definitions. The master deck at ``path`` carries the *INCLUDE
+    cards plus everything else (PART/SECTION/MAT, contact, control cards,
+    sets, BCs and loads, all referencing the global ids). Editing or
+    re-exporting one part's fragment leaves the rest of the assembly files
+    untouched. Returns [(pid, fragment path), ...].
+    """
+    part_ids = np.asarray(part_ids, dtype=np.int64)
+    part_titles = part_titles or {}
+    base, ext = os.path.splitext(path)
+    nn = elems.shape[1]
+    max_id = max(start_nid + len(coords) - 1, start_eid + len(elems) - 1)
+    w = _Widths(long_format or max_id > MAX_STD_ID)
+
+    written = []
+    claimed = np.zeros(len(coords) + 1, dtype=bool)   # 1-based ownership
+    for p in dict.fromkeys(int(v) for v in part_ids):
+        emask = part_ids == p
+        pelems = elems[emask]
+        used = np.zeros(len(coords) + 1, dtype=bool)
+        used[pelems.ravel()] = True
+        own = used & ~claimed
+        claimed |= used
+        own_ids = np.flatnonzero(own)                 # 1-based node ids
+
+        name = part_titles.get(p, "")
+        safe = "".join(ch if ch.isalnum() or ch in "-_" else "_"
+                       for ch in name).strip("_")[:30]
+        ppath = f"{base}_p{p}{'_' + safe if safe else ''}{ext or '.k'}"
+        with open(ppath, "w", newline="\n") as f:
+            f.write("*KEYWORD LONG=Y\n" if w.long else "*KEYWORD\n")
+            f.write("*TITLE\n")
+            f.write(f"{title} - {name or f'part {p}'}"[:80] + "\n")
+            f.write(f"$ mesh fragment (global ids) for *INCLUDE by "
+                    f"{os.path.basename(path)}\n")
+            _write_mesh_blocks(
+                f, w, element_kind, nn,
+                own_ids - 1 + start_nid, coords[own_ids - 1],
+                np.flatnonzero(emask) + start_eid,
+                np.full(len(pelems), p, dtype=np.int64),
+                pelems - 1 + start_nid)
+            f.write("*END\n")
+        written.append((p, ppath))
+
+    write_k(path, coords, elems,
+            element_kind=element_kind, part_ids=part_ids,
+            part_titles=part_titles, start_nid=start_nid, start_eid=start_eid,
+            title=title, comments=comments, long_format=w.long,
+            include_files=tuple(os.path.basename(fp) for _, fp in written),
+            mesh_blocks=False, **kw)
+    return written
 
 
 def write_k_split(

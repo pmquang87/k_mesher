@@ -7,15 +7,13 @@ import queue
 import subprocess
 import sys
 import threading
-import time
 import traceback
 import tkinter as tk
 
-import numpy as np
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from tkinter.scrolledtext import ScrolledText
 
-import dyna_writer
+import job_runner
 import mesher
 
 ELEMENT_TYPES = {
@@ -56,6 +54,19 @@ SYM_CONSTRAINTS = {
     "Fixed (all 6 DOFs)": "fixed",
     "Custom DOFs": "custom",
 }
+# per-body output modes (label -> job_runner split_mode id)
+SPLIT_MODES = {
+    "Off (single file)": None,
+    "Standalone .k per body": "parts",
+    "*INCLUDE fragments + master deck": "include",
+}
+# coordinate node-set kinds (label -> (mesher.select_nodes kind, params hint))
+COORD_KINDS = {
+    "Plane": ("plane", "params: axis (x/y/z), offset  e.g. z, 0"),
+    "Box": ("box", "params: xmin, ymin, zmin, xmax, ymax, zmax"),
+    "Sphere": ("sphere", "params: cx, cy, cz, radius"),
+}
+COORD_ROLES = ["Set only", "Fix (SPC)", "Force X", "Force Y", "Force Z"]
 # input file dialog filter (STEP/IGES/BREP CAD + STL/OBJ/PLY tessellation)
 CAD_FILETYPES = [
     ("CAD & mesh files",
@@ -80,7 +91,8 @@ class KMesherGUI:
         self.worker: threading.Thread | None = None
         self.last_preview: str | None = None
         self.refinements: list[dict] = []
-        self.part_mats: list[dict] = []    # {"body","e","pr","ro"}
+        self.part_mats: list[dict] = []    # {"body","e","pr","ro"[,"rigid"]}
+        self.coord_sets: list[dict] = []   # {"kind","params","role",...}
         self.face_roles: list[dict] = []   # {"tag","role","value","dofs"}
         self.faces_by_tag: dict[int, dict] = {}
         self.face_scan_sig: str | None = None
@@ -290,10 +302,11 @@ class KMesherGUI:
         ttk.Checkbutton(dyna, text="Mesh-only output for *INCLUDE (no PART / "
                                    "SECTION / MAT / control cards)",
                         variable=self.var_mesh_only).grid(row=7, column=0, columnspan=4, sticky="w")
-        self.var_split = tk.BooleanVar(value=False)
-        ttk.Checkbutton(dyna, text="Also write one .k file per body "
-                                   "(<output>_p<PID>[_<name>].k, standalone)",
-                        variable=self.var_split).grid(row=11, column=0, columnspan=4, sticky="w")
+        ttk.Label(dyna, text="Per-body files:").grid(row=11, column=0, sticky="w")
+        self.var_split_mode = tk.StringVar(value=next(iter(SPLIT_MODES)))
+        ttk.Combobox(dyna, textvariable=self.var_split_mode, state="readonly",
+                     width=40, values=list(SPLIT_MODES)).grid(
+            row=11, column=1, columnspan=3, sticky="w", padx=4)
 
         self.var_contact = tk.BooleanVar(value=False)
         ttk.Checkbutton(dyna, text="Contact between parts (*CONTACT_AUTOMATIC_"
@@ -347,6 +360,9 @@ class KMesherGUI:
         ttk.Label(pmrow, text="ρ:").pack(side="left", padx=(8, 0))
         self.var_pm_ro = tk.StringVar(value="7.85e-9")
         ttk.Entry(pmrow, textvariable=self.var_pm_ro, width=10).pack(side="left", padx=2)
+        self.var_pm_rigid = tk.BooleanVar(value=False)
+        ttk.Checkbutton(pmrow, text="rigid (*MAT_RIGID)",
+                        variable=self.var_pm_rigid).pack(side="left", padx=(8, 0))
         ttk.Button(pmrow, text="Add", command=self._add_part_mat).pack(side="left", padx=8)
         self.lst_pmat = tk.Listbox(pmat, height=3)
         self.lst_pmat.grid(row=1, column=0, sticky="ew", pady=3)
@@ -465,6 +481,42 @@ class KMesherGUI:
         ttk.Button(faces, text="Remove", command=self._remove_role
                    ).grid(row=3, column=1, sticky="n", pady=3)
 
+        csets = ttk.LabelFrame(
+            tab, text="Coordinate node sets (by position - works for "
+                      "STL/OBJ/PLY too)", padding=6)
+        csets.grid(row=2, column=0, sticky="ew", **pad)
+        csets.columnconfigure(1, weight=1)
+
+        self.var_cs_kind = tk.StringVar(value=next(iter(COORD_KINDS)))
+        cmb_cs = ttk.Combobox(csets, textvariable=self.var_cs_kind,
+                              state="readonly", width=8,
+                              values=list(COORD_KINDS))
+        cmb_cs.grid(row=0, column=0, sticky="w")
+        cmb_cs.bind("<<ComboboxSelected>>", lambda e: self._sync_cs_hint())
+        self.var_cs_params = tk.StringVar()
+        ttk.Entry(csets, textvariable=self.var_cs_params).grid(
+            row=0, column=1, sticky="ew", padx=4)
+        self.var_cs_role = tk.StringVar(value=COORD_ROLES[1])
+        ttk.Combobox(csets, textvariable=self.var_cs_role, state="readonly",
+                     width=10, values=COORD_ROLES).grid(row=0, column=2, padx=2)
+        ttk.Label(csets, text="value:").grid(row=0, column=3, sticky="e")
+        self.var_cs_val = tk.StringVar()
+        ttk.Entry(csets, textvariable=self.var_cs_val, width=9).grid(
+            row=0, column=4, padx=2)
+        ttk.Label(csets, text="DOFs:").grid(row=0, column=5, sticky="e")
+        self.var_cs_dofs = tk.StringVar(value="123456")
+        ttk.Entry(csets, textvariable=self.var_cs_dofs, width=8).grid(
+            row=0, column=6, padx=2)
+        ttk.Button(csets, text="Add", command=self._add_coord_set).grid(
+            row=0, column=7, padx=4)
+        self.lbl_cs_hint = ttk.Label(csets, foreground="gray")
+        self.lbl_cs_hint.grid(row=1, column=0, columnspan=6, sticky="w")
+        self._sync_cs_hint()
+        self.lst_csets = tk.Listbox(csets, height=3)
+        self.lst_csets.grid(row=2, column=0, columnspan=7, sticky="ew", pady=3)
+        ttk.Button(csets, text="Remove", command=self._remove_coord_set
+                   ).grid(row=2, column=7, sticky="n", pady=3)
+
     # -------------------------------------------- tab: batch & presets ----
     def _build_batch_tab(self, tab, pad):
         pre = ttk.LabelFrame(tab, text="Parameter presets", padding=6)
@@ -494,6 +546,13 @@ class KMesherGUI:
         ttk.Button(btns, text="Clear", command=self._batch_clear).pack(side="left")
         self.btn_batch = ttk.Button(btns, text="Run queue", command=self._batch_run)
         self.btn_batch.pack(side="left", padx=12)
+        self.var_batch_par = tk.BooleanVar(value=False)
+        ttk.Checkbutton(btns, text="parallel, workers:",
+                        variable=self.var_batch_par).pack(side="left", padx=(12, 2))
+        self.var_batch_workers = tk.StringVar(
+            value=str(max((os.cpu_count() or 2) // 2, 2)))
+        ttk.Entry(btns, textvariable=self.var_batch_workers, width=4
+                  ).pack(side="left")
 
         self.lst_jobs = tk.Listbox(bat, height=6)
         self.lst_jobs.grid(row=1, column=0, sticky="ew", pady=4)
@@ -593,6 +652,69 @@ class KMesherGUI:
             del self.face_roles[sel[0]]
             self._refresh_roles_list()
 
+    # -------------------------------------------- coordinate node sets ----
+    def _sync_cs_hint(self):
+        self.lbl_cs_hint.config(text=COORD_KINDS[self.var_cs_kind.get()][1])
+
+    def _add_coord_set(self):
+        kind = COORD_KINDS[self.var_cs_kind.get()][0]
+        tokens = [t.strip() for t in
+                  self.var_cs_params.get().replace(";", ",").split(",")
+                  if t.strip()]
+        try:
+            if kind == "plane":
+                if len(tokens) != 2 or tokens[0].lower() not in ("x", "y", "z"):
+                    raise ValueError
+                params = (tokens[0].lower(), float(tokens[1]))
+            else:
+                n = 6 if kind == "box" else 4
+                if len(tokens) != n:
+                    raise ValueError
+                params = [float(t) for t in tokens]
+        except ValueError:
+            messagebox.showerror(
+                "Invalid input",
+                f"{self.var_cs_kind.get()}: {COORD_KINDS[self.var_cs_kind.get()][1]}")
+            return
+        role_label = self.var_cs_role.get()
+        cs = {"kind": kind, "params": params, "role": "set"}
+        if role_label == "Fix (SPC)":
+            dofs = self.var_cs_dofs.get().strip()
+            if not dofs or any(ch not in "123456" for ch in dofs):
+                messagebox.showerror("Invalid input",
+                                     "SPC DOFs must be digits 1-6, e.g. 123.")
+                return
+            cs.update(role="spc", dofs=dofs)
+        elif role_label.startswith("Force"):
+            try:
+                value = float(self.var_cs_val.get())
+            except ValueError:
+                messagebox.showerror("Invalid input",
+                                     "Force needs a numeric total value.")
+                return
+            cs.update(role="force", axis=role_label[-1].lower(), value=value)
+        self.coord_sets.append(cs)
+        self._refresh_cset_list()
+        self.var_cs_params.set("")
+
+    def _remove_coord_set(self):
+        sel = self.lst_csets.curselection()
+        if sel:
+            del self.coord_sets[sel[0]]
+            self._refresh_cset_list()
+
+    def _refresh_cset_list(self):
+        self.lst_csets.delete(0, "end")
+        for cs in self.coord_sets:
+            if cs["kind"] == "plane":
+                p = f"{cs['params'][0]} = {cs['params'][1]:g}"
+            else:
+                p = ", ".join(f"{v:g}" for v in cs["params"])
+            role = {"set": "set only", "spc": f"SPC {cs.get('dofs')}",
+                    "force": f"force {cs.get('axis', '').upper()} = "
+                             f"{cs.get('value', 0):g}"}[cs["role"]]
+            self.lst_csets.insert("end", f"{cs['kind']}({p}): {role}")
+
     # ---------------------------------------------- per-body materials ----
     def _add_part_mat(self):
         try:
@@ -608,6 +730,8 @@ class KMesherGUI:
             messagebox.showerror("Invalid input", "Body # must be ≥ 1, E and ρ "
                                                   "> 0, and 0 < ν < 0.5.")
             return
+        if self.var_pm_rigid.get():
+            mat["rigid"] = True
         self.part_mats = [pm for pm in self.part_mats if pm["body"] != body]
         self.part_mats.append({"body": body, **mat})
         self.part_mats.sort(key=lambda pm: pm["body"])
@@ -622,8 +746,9 @@ class KMesherGUI:
     def _refresh_pmat_list(self):
         self.lst_pmat.delete(0, "end")
         for pm in self.part_mats:
+            rigid = "  RIGID" if pm.get("rigid") else ""
             self.lst_pmat.insert("end", f"Body {pm['body']}: E={pm['e']:g}  "
-                                        f"ν={pm['pr']:g}  ρ={pm['ro']:g}")
+                                        f"ν={pm['pr']:g}  ρ={pm['ro']:g}{rigid}")
 
     def _refresh_roles_list(self):
         self.lst_roles.delete(0, "end")
@@ -780,25 +905,63 @@ class KMesherGUI:
             return
         if self.worker and self.worker.is_alive():
             return
+        workers = 1
+        if self.var_batch_par.get():
+            try:
+                workers = max(int(self.var_batch_workers.get()), 1)
+            except ValueError:
+                messagebox.showerror("Batch", "Workers must be an integer ≥ 1.")
+                return
         self._save_settings()
         self._set_busy(True)
         self._log_clear()
         jobs = list(self.batch_jobs)
-        self.worker = threading.Thread(target=self._batch_worker, args=(jobs,),
-                                       daemon=True)
+        self.worker = threading.Thread(target=self._batch_worker,
+                                       args=(jobs, workers), daemon=True)
         self.worker.start()
 
-    def _batch_worker(self, jobs):
+    def _batch_worker(self, jobs, workers=1):
         log = self.log_queue.put
         ok = 0
         last_preview = None
-        for i, j in enumerate(jobs, 1):
-            log(f"===== batch job {i}/{len(jobs)}: {j['label']} =====")
+        parallel = workers > 1 and len(jobs) > 1
+        if parallel:
+            # one worker process per job (gmsh is one-instance-per-process);
+            # logs are captured per job and emitted on completion. Workers
+            # must be SPAWNED - forking a process whose gmsh/OpenMP runtime
+            # has already run deadlocks the child on Linux.
+            import multiprocessing
+            from concurrent.futures import ProcessPoolExecutor, as_completed
+            log(f"===== batch: {len(jobs)} jobs on {workers} worker "
+                f"process(es) =====")
+            args = [(j["label"], j["settings"], j["out"], j["kopts"])
+                    for j in jobs]
             try:
-                last_preview = self._do_job(j["settings"], j["out"], j["kopts"], log)
-                ok += 1
+                with ProcessPoolExecutor(
+                        max_workers=workers,
+                        mp_context=multiprocessing.get_context("spawn")) as pool:
+                    futures = [pool.submit(job_runner.run_job_captured, a)
+                               for a in args]
+                    for n, fut in enumerate(as_completed(futures), 1):
+                        label, success, text, preview = fut.result()
+                        log(f"===== [{n}/{len(jobs)}] {label} =====")
+                        log(text)
+                        if success:
+                            ok += 1
+                            last_preview = preview
             except Exception as e:
-                log(f"ERROR in job {i}: {e}")
+                log(f"ERROR: parallel batch failed ({e}) - falling back to "
+                    f"sequential execution")
+                ok, last_preview, parallel = 0, None, False
+        if not parallel:
+            for i, j in enumerate(jobs, 1):
+                log(f"===== batch job {i}/{len(jobs)}: {j['label']} =====")
+                try:
+                    last_preview = self._do_job(j["settings"], j["out"],
+                                                j["kopts"], log)
+                    ok += 1
+                except Exception as e:
+                    log(f"ERROR in job {i}: {e}")
         log(f"===== batch finished: {ok}/{len(jobs)} jobs succeeded =====")
         self.log_queue.put(("__done__" if ok else "__failed__", last_preview))
 
@@ -947,9 +1110,12 @@ class KMesherGUI:
                        num(self.var_grav_a, "Gravity acceleration"))
 
         pid0 = integer(self.var_pid, "Part ID")
-        part_mats = {pid0 + pm["body"] - 1:
-                     {"e": pm["e"], "pr": pm["pr"], "ro": pm["ro"]}
-                     for pm in self.part_mats}
+        part_mats = {}
+        for pm in self.part_mats:
+            m = {"e": pm["e"], "pr": pm["pr"], "ro": pm["ro"]}
+            if pm.get("rigid"):
+                m["rigid"] = True
+            part_mats[pid0 + pm["body"] - 1] = m
 
         kopts = {
             "pid": pid0,
@@ -973,11 +1139,14 @@ class KMesherGUI:
             "implicit_cards": self.var_implicit.get(),
             "qa_sets": self.var_qa.get(),
             "mesh_only": self.var_mesh_only.get(),
-            "split_parts": self.var_split.get(),
+            "split_mode": SPLIT_MODES.get(self.var_split_mode.get()),
             "contact_fs": contact_fs,
             "tssfac": tssfac,
             "gravity": gravity,
             "part_mats": part_mats,
+            "coord_sets": [dict(cs) for cs in self.coord_sets],
+            "face_titles": {t: f.get("name", "")
+                            for t, f in self.faces_by_tag.items()},
         }
         return settings, out, kopts
 
@@ -1022,130 +1191,9 @@ class KMesherGUI:
             self.log_queue.put(("__failed__", None))
 
     def _do_job(self, settings, out, kopts, log) -> str:
-        """Mesh + write one job. Returns the preview file path."""
-        preview_path = os.path.splitext(out)[0] + "_preview.msh"
-        t_start = time.perf_counter()
-
-        if settings.defeature_faces and (kopts["face_roles"]
-                                         or settings.face_sizes
-                                         or kopts["plain_faces"]):
-            log("NOTE: defeaturing changes face tags - verify that the other "
-                "face assignments still point at the intended faces "
-                "(rescan shows the post-defeature tags).")
-
-        result = mesher.mesh_step_auto(settings, log=log, preview_path=preview_path)
-
-        sym_sets = []
-        # segset alone still needs the sym_sets items (the node set it comes
-        # with is the carrier the writer requires)
-        if kopts["sym_nodeset"] or kopts["sym_spc"] or kopts["sym_segset"]:
-            for sp in settings.symmetry:
-                item = {"axis": sp.axis, "offset": sp.offset,
-                        "nodes": result.sym_nodes[sp.axis],
-                        "spc": kopts["sym_spc"],
-                        "constraint": kopts["sym_constraint"]}
-                if kopts["sym_constraint"] == "custom":
-                    item["dofs"] = kopts["sym_dofs"]
-                if kopts["sym_segset"] and len(result.sym_segs.get(sp.axis, ())) > 0:
-                    item["segset"] = result.sym_segs[sp.axis]
-                sym_sets.append(item)
-
-        face_sets = []
-        for tag in kopts["plain_faces"]:
-            info = self.faces_by_tag.get(tag, {})
-            base = f"FACE_{tag}" + (f" {info['name']}" if info.get("name") else "")
-            if kopts["face_nodesets"] and tag in result.face_nodes:
-                face_sets.append({"kind": "node", "title": base,
-                                  "nodes": result.face_nodes[tag]})
-            if kopts["face_segsets"] and len(result.face_segs.get(tag, ())) > 0:
-                face_sets.append({"kind": "segment", "title": base,
-                                  "segments": result.face_segs[tag]})
-        for r in kopts["face_roles"]:
-            tag = r["tag"]
-            if r["role"] == "Fix (SPC)" and tag in result.face_nodes:
-                face_sets.append({"kind": "node", "title": f"SPC_FACE_{tag}",
-                                  "nodes": result.face_nodes[tag],
-                                  "spc_dofs": r["dofs"]})
-            elif r["role"] == "Pressure" and len(result.face_segs.get(tag, ())) > 0:
-                face_sets.append({"kind": "segment", "title": f"PRES_FACE_{tag}",
-                                  "segments": result.face_segs[tag],
-                                  "pressure": r["value"]})
-            elif r["role"].startswith("Force") and tag in result.face_nodes:
-                axis = r["role"][-1].lower()
-                face_sets.append({"kind": "node", "title": f"FORCE_FACE_{tag}",
-                                  "nodes": result.face_nodes[tag],
-                                  "force": (axis, r["value"])})
-
-        elem_sets = []
-        failed = result.stats.get("failed_elems", ())
-        if kopts["qa_sets"] and len(failed):
-            elem_sets.append({"title": "QA quality-criteria failures",
-                              "eids": (failed + 1)})
-
-        pid0 = kopts["pid"]
-        part_ids = pid0 + result.elem_parts
-        part_titles = {pid0 + i: (name or f"body {i + 1}")
-                       for i, name in enumerate(result.part_names)}
-        if len(result.part_names) > 1:
-            for p, t in part_titles.items():
-                log(f"  PID {p}: {t}")
-
-        thickness_scale = (kopts["thickness"]
-                           if kopts["element_kind"] == "shell" else 1.0)
-        mesher.mass_and_timestep(result, settings.element_type, kopts["mat"],
-                                 kopts["part_mats"], pid0, thickness_scale,
-                                 log=log)
-        if kopts["mat"] and not kopts["part_mats"]:
-            # inertia scaling only well-defined for a homogeneous material
-            scale = kopts["mat"]["ro"] * thickness_scale
-            inertia = np.array(result.stats["inertia_unit_density"]) * scale
-            log(f"Inertia about COG (Ixx, Iyy, Izz): "
-                f"{inertia[0, 0]:.6g}, {inertia[1, 1]:.6g}, {inertia[2, 2]:.6g}")
-
-        comments = [f"Source geometry: {settings.step_file}",
-                    f"Element size: {settings.size_min:g} .. {settings.size_max:g}"]
-        for sp in settings.symmetry:
-            comments.append(f"Symmetry: {sp.axis.upper()} = {sp.offset:g}, "
-                            f"kept '{sp.keep}' side")
-
-        log(f"Writing LS-DYNA keyword file: {out}")
-        dyna_writer.write_k(
-            out, result.coords, result.elems,
-            element_kind=kopts["element_kind"],
-            pid=pid0, elform=kopts["elform"], thickness=kopts["thickness"],
-            start_nid=kopts["start_nid"], start_eid=kopts["start_eid"],
-            start_sid=kopts["start_sid"],
-            title=os.path.splitext(os.path.basename(out))[0],
-            comments=tuple(comments), sym_sets=tuple(sym_sets),
-            mat=kopts["mat"], part_ids=part_ids, part_titles=part_titles,
-            face_sets=tuple(face_sets), elem_sets=tuple(elem_sets),
-            implicit_cards=kopts["implicit_cards"],
-            mesh_only=kopts["mesh_only"], part_mats=kopts["part_mats"],
-            contact_fs=kopts["contact_fs"], tssfac=kopts["tssfac"],
-            body_load=kopts["gravity"],
-        )
-        if kopts["split_parts"]:
-            split_files = dyna_writer.write_k_split(
-                out, result.coords, result.elems,
-                part_ids=part_ids, part_titles=part_titles,
-                element_kind=kopts["element_kind"], elform=kopts["elform"],
-                thickness=kopts["thickness"], start_nid=kopts["start_nid"],
-                start_eid=kopts["start_eid"], start_sid=kopts["start_sid"],
-                title=os.path.splitext(os.path.basename(out))[0],
-                comments=tuple(comments), sym_sets=tuple(sym_sets),
-                mat=kopts["mat"], part_mats=kopts["part_mats"],
-                face_sets=tuple(face_sets), elem_sets=tuple(elem_sets),
-                implicit_cards=kopts["implicit_cards"],
-                mesh_only=kopts["mesh_only"], tssfac=kopts["tssfac"],
-                body_load=kopts["gravity"],
-            )
-            for p, fpath in split_files:
-                log(f"Wrote per-part file: {fpath} (PID {p})")
-        log(f"Done in {time.perf_counter() - t_start:.1f} s. "
-            f"{result.stats['n_nodes']} nodes / "
-            f"{result.stats['n_elems']} {settings.element_type} "
-            f"elements written.")
-        return preview_path
+        """Mesh + write one job (delegated to the GUI-independent runner).
+        Returns the preview file path."""
+        return job_runner.run_job(settings, out, kopts, log=log)
 
     # ----------------------------------------------------------- preview --
     def _open_preview(self) -> None:
@@ -1175,11 +1223,13 @@ class KMesherGUI:
             "preview": self.var_preview,
             "face_nodes": self.var_face_nodes, "face_segs": self.var_face_segs,
             "implicit": self.var_implicit, "qa": self.var_qa,
-            "mesh_only": self.var_mesh_only, "split": self.var_split,
+            "mesh_only": self.var_mesh_only, "split_mode": self.var_split_mode,
             "contact": self.var_contact, "contact_fs": self.var_contact_fs,
             "ctrl_dt": self.var_ctrl_dt, "tssfac": self.var_tssfac,
             "grav": self.var_grav, "grav_axis": self.var_grav_axis,
             "grav_a": self.var_grav_a,
+            "batch_par": self.var_batch_par,
+            "batch_workers": self.var_batch_workers,
         }
         for axis, (enabled, offset, keep) in self.sym_rows.items():
             d[f"sym_{axis}"] = enabled
@@ -1191,6 +1241,7 @@ class KMesherGUI:
         data = {k: v.get() for k, v in self._settings_vars().items()}
         data["refinements"] = self.refinements
         data["part_mats"] = self.part_mats
+        data["coord_sets"] = self.coord_sets
         return data
 
     def _apply_settings_data(self, data: dict) -> None:
@@ -1211,6 +1262,12 @@ class KMesherGUI:
             self.part_mats = [pm for pm in pms if isinstance(pm, dict)
                               and {"body", "e", "pr", "ro"} <= set(pm)]
             self._refresh_pmat_list()
+        css = data.get("coord_sets", [])
+        if isinstance(css, list):
+            self.coord_sets = [cs for cs in css if isinstance(cs, dict)
+                               and cs.get("kind") in ("plane", "box", "sphere")
+                               and "params" in cs]
+            self._refresh_cset_list()
 
     def _save_settings(self) -> None:
         try:

@@ -7,16 +7,19 @@ Mesh CAD geometry (STEP / IGES / BREP) or a surface tessellation
 and export an LS-DYNA keyword file (`.k`). Features: symmetry planes
 (half/quarter/eighth models) with separate node-set and boundary-condition
 options (symmetric / anti-symmetric / fixed / custom DOFs), per-body parts
-with per-body materials, single-surface contact and gravity load cards,
-defeaturing (remove holes/fillets), face sets with BCs and loads
-(SPC / pressure / force), local mesh refinement (regions and per-face sizes),
-LS-DYNA quality criteria with failed-element sets, quality-driven auto-remeshing,
-mass properties with an explicit critical-timestep estimate (plus an optional
-`*CONTROL_TIMESTEP` card), shell integrity checks, mesh-only output for
-`*INCLUDE` decks, per-part file export (one standalone `.k` per body),
-automatic LONG=Y format when ids overflow the standard
-fields, machine-readable statistics (JSON), parameter presets and a batch
-queue.
+with per-body materials (elastic or rigid), single-surface contact and
+gravity load cards, defeaturing (remove holes/fillets), face sets with BCs
+and loads (SPC / pressure / force), coordinate node sets (plane/box/sphere —
+BCs and loads on STL/OBJ/PLY too), local mesh refinement (regions and
+per-face sizes), LS-DYNA quality criteria with failed-element sets,
+quality-driven auto-remeshing, mass properties with an explicit
+critical-timestep estimate (plus an optional `*CONTROL_TIMESTEP` card and a
+target-dt sizing report), shell integrity checks, mesh-only output for
+`*INCLUDE` decks, per-part file export (standalone `.k` per body, or an
+`*INCLUDE` assembly of mesh fragments plus a master deck), mesh export to
+ParaView/Gmsh formats, automatic LONG=Y format when ids overflow the
+standard fields, machine-readable statistics (JSON), parameter presets and
+a batch queue with optional parallel workers.
 Meshing is done with [gmsh](https://gmsh.info) (OpenCASCADE kernel), the GUI is
 plain tkinter.
 
@@ -38,6 +41,15 @@ what is / isn't importable.
 ```
 pip install -r requirements.txt
 python main.py
+```
+
+Or install as a package — this puts `k-mesher` (CLI) and `k-mesher-gui`
+on your PATH:
+
+```
+pip install .
+k-mesher part.stp --size-max 8
+k-mesher-gui
 ```
 
 Or double-click / run `start_gui.py` — it automatically uses the project's
@@ -66,6 +78,11 @@ python mesh_cli.py part.stp --mat --stats-json part_stats.json --title "bracket"
 python mesh_cli.py asm.stp --glue --mat --part-mat 2:70000:0.33:2.7e-9
 python mesh_cli.py asm.stp --contact 0.15 --tssfac 0.9 --gravity z:9810
 python mesh_cli.py asm.stp --split-parts        # + one standalone .k per body
+python mesh_cli.py asm.stp --split-include      # *INCLUDE fragments + master
+python mesh_cli.py asm.stp --mat --part-rigid 2         # body 2 = *MAT_RIGID
+python mesh_cli.py part.stl --etype tet4 --mat \
+    --nset plane,z,0,spc=123 --nset sphere,0,0,40,15,force=z:-500
+python mesh_cli.py part.stp --export part.vtk --mat --target-dt 5e-7
 ```
 
 `python mesh_cli.py -h` lists all options. GUI settings are remembered
@@ -114,13 +131,19 @@ window close).
      elements and sets (no `*PART`/`*SECTION`/`*MAT`/control cards); define
      those in the master deck. Combine with the start node/element/set IDs to
      merge several meshes without ID clashes.
-   - *One .k file per body* — additionally export each body as its own
-     standalone file (`<output>_p<PID>[_<name>].k`) with compactly renumbered
-     nodes, that body's material, and the node/segment/element sets filtered
-     to the part (empty sets are dropped; contact cards are skipped since
-     contact acts between parts). Note the files are standalone, not
-     `*INCLUDE` fragments of the assembly — a face force's total is re-spread
-     over each file's own face nodes.
+   - *Per-body files* — two modes. **Standalone .k per body**: each body as
+     its own self-contained file (`<output>_p<PID>[_<name>].k`) with
+     compactly renumbered nodes, that body's material, and the sets filtered
+     to the part (empty sets dropped; contact cards skipped since contact
+     acts between parts; a face force's total is re-spread over each file's
+     own face nodes). ***INCLUDE fragments + master deck**: the main output
+     becomes a master deck (PART/MAT/contact/sets/`*INCLUDE` cards) and each
+     body's mesh goes into a fragment that keeps the **global** numbering —
+     every node defined in exactly one fragment — so the assembly rebuilds
+     exactly and one part can be re-exported without touching the rest.
+   - Per-body materials can be marked **rigid** (`*MAT_RIGID`; E/ν set the
+     contact stiffness) — rigid parts are excluded from the timestep
+     estimate.
    - *Contact between parts* — `*CONTACT_AUTOMATIC_SINGLE_SURFACE` over all
      parts with a friction coefficient, for assemblies whose bodies are not
      glued (glued bodies share nodes and need no contact).
@@ -149,6 +172,10 @@ window close).
      symmetry plane (solids only — useful for contact or pressure on the cut
      face). (STL/OBJ/PLY inputs have no CAD geometry to cut, so symmetry is
      unavailable for them.)
+   - Coordinate node sets: select nodes **by position** (plane, box or
+     sphere) instead of by CAD face, with an optional SPC or force role.
+     Because the selection runs on the mesh, this is the way to put BCs and
+     loads on STL/OBJ/PLY inputs, which have no faces to scan.
    - Face sets: **Scan faces from geometry** lists all model faces with
      type, area and centroid (uses the current symmetry/glue settings —
      rescan after changing them). "Select small faces" finds candidates for
@@ -166,7 +193,8 @@ window close).
        rescan to see the resulting geometry before assigning other roles.
 5. **Batch & presets tab** — save/apply named parameter presets; queue
    several STEP files (each job snapshots the current settings) and run them
-   unattended.
+   unattended, optionally on several worker processes in parallel (each job
+   runs in its own process — gmsh is single-instance per process).
 6. **Generate mesh** — runs in the background; the log shows per-stage
    timings, element counts, mesh volume/area, mass + COG + inertia (per part
    when per-body materials are set) and an
@@ -243,11 +271,14 @@ big meshes:
 | `start_gui.py` | launcher that relaunches via the project `.venv` (double-click friendly) |
 | `mesh_cli.py` | command-line interface for batch meshing |
 | `gui.py` | tkinter GUI |
+| `job_runner.py` | GUI-independent mesh+write job execution (also used by the parallel batch workers) |
 | `mesher.py` | gmsh meshing core (STEP/IGES/BREP/STL/OBJ/PLY import, symmetry, refinement, tet/shell extraction) |
-| `dyna_writer.py` | LS-DYNA `.k` writer |
+| `dyna_writer.py` | LS-DYNA `.k` writer (single file, per-part files, *INCLUDE assemblies) |
 | `preview.py` | standalone Gmsh viewer process |
+| `pyproject.toml` | packaging (`pip install .` → `k-mesher` / `k-mesher-gui`) |
 | `examples/make_test_step.py` | generates test parts (STEP + IGES/BREP/STL) |
 | `tests/test_headless.py` | end-to-end tests, pytest-compatible (`pytest tests/ -v` or `python tests/test_headless.py`) |
+| `tests/test_gui.py` | headless GUI tests (skipped when tkinter/display is unavailable; CI runs them under Xvfb) |
 | `docs/cad_formats.md` | survey of CAD input formats and what is importable |
 
 ## Notes on element types

@@ -22,3 +22,8 @@ examples/*.k
 
 # Claude Code local settings
 .claude/
+
+# packaging artifacts
+*.egg-info/
+build/
+dist/

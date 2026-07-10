@@ -17,6 +17,10 @@ Examples:
     python mesh_cli.py asm.stp --glue --mat --part-mat 2:70000:0.33:2.7e-9
     python mesh_cli.py asm.stp --contact 0.15 --tssfac 0.9 --gravity z:9810
     python mesh_cli.py part.stp --mesh-only --stats-json part_stats.json
+    python mesh_cli.py asm.stp --split-include --mat --part-rigid 2
+    python mesh_cli.py part.stl --etype tet4 --nset plane,z,0,spc=123 \
+                                --nset sphere,0,0,40,15,force=z:-500
+    python mesh_cli.py part.stp --export part.vtk --mat --target-dt 5e-7
 """
 from __future__ import annotations
 
@@ -94,6 +98,74 @@ def parse_part_mat(text: str) -> tuple[int, dict]:
         raise argparse.ArgumentTypeError(
             f"part-mat body index must be a positive integer: {text!r}") from None
     return body, parse_mat(":".join(parts[1:]))
+
+
+def parse_part_rigid(text: str) -> tuple[int, dict]:
+    """BODY[:E[:NU[:RHO]]] - make a body rigid (*MAT_RIGID); E/nu/rho are
+    used by LS-DYNA for the contact stiffness (defaults: steel mm-t-s)."""
+    body, mat = parse_part_mat(text)
+    mat["rigid"] = True
+    return body, mat
+
+
+def parse_nset(text: str) -> dict:
+    """Coordinate node set: KIND,PARAMS...[,key=value...]. Kinds:
+    plane,AXIS,OFFSET / box,X0,Y0,Z0,X1,Y1,Z1 / sphere,CX,CY,CZ,R.
+    Optional keys: spc=DOFS, force=AXIS:TOTAL, tol=T, title=NAME."""
+    tokens = [t.strip() for t in text.split(",") if t.strip()]
+    kind = tokens[0].lower() if tokens else ""
+    n_params = {"plane": 2, "box": 6, "sphere": 4}.get(kind)
+    if n_params is None:
+        raise argparse.ArgumentTypeError(
+            f"node-set kind must be plane, box or sphere: {text!r}")
+    raw = tokens[1:1 + n_params]
+    if len(raw) != n_params or any("=" in t for t in raw):
+        raise argparse.ArgumentTypeError(
+            f"{kind} needs {n_params} comma-separated parameters: {text!r}")
+    try:
+        if kind == "plane":
+            axis = raw[0].lower()
+            if axis not in ("x", "y", "z"):
+                raise ValueError
+            params = (axis, float(raw[1]))
+        else:
+            params = [float(t) for t in raw]
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"bad {kind} parameters in {text!r}") from None
+    cs = {"kind": kind, "params": params, "role": "set"}
+    for kv in tokens[1 + n_params:]:
+        key, sep, val = kv.partition("=")
+        key = key.strip().lower()
+        if not sep:
+            raise argparse.ArgumentTypeError(
+                f"expected key=value after the parameters: {kv!r}")
+        if key == "spc":
+            if not val or any(ch not in "123456" for ch in val):
+                raise argparse.ArgumentTypeError(
+                    f"spc= DOFs must be digits 1-6: {kv!r}")
+            cs.update(role="spc", dofs=val)
+        elif key == "force":
+            axis, _, total = val.partition(":")
+            if axis.lower() not in ("x", "y", "z"):
+                raise argparse.ArgumentTypeError(
+                    f"force= needs AXIS:TOTAL with axis x/y/z: {kv!r}")
+            try:
+                cs.update(role="force", axis=axis.lower(), value=float(total))
+            except ValueError:
+                raise argparse.ArgumentTypeError(
+                    f"bad force total in {kv!r}") from None
+        elif key == "tol":
+            try:
+                cs["tol"] = float(val)
+            except ValueError:
+                raise argparse.ArgumentTypeError(f"bad tol in {kv!r}") from None
+        elif key == "title":
+            cs["title"] = val[:60]
+        else:
+            raise argparse.ArgumentTypeError(
+                f"unknown node-set option {key!r} (use spc/force/tol/title)")
+    return cs
 
 
 def parse_gravity(text: str) -> tuple[str, float]:
@@ -300,6 +372,29 @@ def build_parser() -> argparse.ArgumentParser:
                         "elements, nodes and material; sets are filtered per "
                         "part, contact cards are skipped, and a face force's "
                         "total is re-spread over each file's own face nodes")
+    p.add_argument("--split-include", action="store_true",
+                   help="write the output as an *INCLUDE assembly: one mesh "
+                        "fragment per body keeping the GLOBAL numbering plus "
+                        "a master deck with the PART/MAT/contact/set cards "
+                        "and *INCLUDE lines (mutually exclusive with "
+                        "--split-parts)")
+    p.add_argument("--part-rigid", type=parse_part_rigid, action="append",
+                   default=[], metavar="BODY[:E[:NU[:RHO]]]",
+                   help="make a body rigid (*MAT_RIGID; E/nu/rho set the "
+                        "contact stiffness), repeatable; overrides --part-mat "
+                        "for that body")
+    p.add_argument("--nset", type=parse_nset, action="append", default=[],
+                   metavar="KIND,PARAMS[,key=value]",
+                   help="coordinate node set (works for STL/OBJ/PLY too): "
+                        "plane,AXIS,OFFSET | box,X0,Y0,Z0,X1,Y1,Z1 | "
+                        "sphere,CX,CY,CZ,R; optional spc=DOFS, "
+                        "force=AXIS:TOTAL, tol=T, title=NAME; repeatable")
+    p.add_argument("--export", action="append", default=[], metavar="FILE",
+                   help="also export the mesh to a gmsh-supported format "
+                        "chosen by the extension (.msh/.vtk/...), repeatable")
+    p.add_argument("--target-dt", type=float, default=None, metavar="DT",
+                   help="with --mat: report the characteristic length needed "
+                        "to reach this explicit timestep (mass-scaling guide)")
     p.add_argument("--preview", action="store_true",
                    help="open the Gmsh viewer on the result")
     return p
@@ -325,6 +420,11 @@ def main(argv=None) -> int:
         return 2
     if args.sym_dofs and any(ch not in "123456" for ch in args.sym_dofs):
         print(f"error: --sym-dofs must be digits 1-6: {args.sym_dofs!r}",
+              file=sys.stderr)
+        return 2
+    if args.split_parts and args.split_include:
+        print("error: --split-parts and --split-include are mutually "
+              "exclusive (standalone files vs. *INCLUDE fragments)",
               file=sys.stderr)
         return 2
     is_shell = mesher.ETYPES[etype]["family"] == "shell"
@@ -372,10 +472,13 @@ def main(argv=None) -> int:
     try:
         result = mesher.mesh_step_auto(
             settings, log=print,
-            preview_path=preview_path if args.preview else None)
+            preview_path=preview_path if args.preview else None,
+            export_paths=tuple(args.export))
     except Exception as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
+    for path in args.export:
+        print(f"Wrote {path}")
 
     sym_sets = []
     if not args.no_sym_sets:
@@ -412,6 +515,23 @@ def main(argv=None) -> int:
                               "nodes": result.face_nodes[tag],
                               "force": (axis, total)})
 
+    # coordinate node sets: selected on the mesh, so they work for any input
+    for i, cs in enumerate(args.nset, start=1):
+        label = cs.get("title") or f"NSET_{i}_{cs['kind'].upper()}"
+        ids = mesher.select_nodes(result.coords, cs["kind"], cs["params"],
+                                  tol=cs.get("tol"))
+        if len(ids) == 0:
+            print(f"warning: coordinate set {label} matched no nodes - "
+                  f"skipped", file=sys.stderr)
+            continue
+        item = {"kind": "node", "title": label, "nodes": ids}
+        if cs["role"] == "spc":
+            item["spc_dofs"] = cs.get("dofs") or "123456"
+        elif cs["role"] == "force":
+            item["force"] = (cs["axis"], cs["value"])
+        face_sets.append(item)
+        print(f"Coordinate set {label}: {len(ids)} nodes")
+
     elem_sets = []
     failed = result.stats.get("failed_elems", ())
     if not args.no_qa_sets and len(failed):
@@ -420,16 +540,34 @@ def main(argv=None) -> int:
 
     n_bodies = len(result.part_names)
     part_mats = {}
-    for body, m in args.part_mat:
-        if body > n_bodies:
-            print(f"warning: --part-mat body {body} ignored - the model has "
-                  f"only {n_bodies} body/bodies", file=sys.stderr)
-            continue
-        part_mats[args.pid + body - 1] = m
+    for opt, pairs in (("--part-mat", args.part_mat),
+                       ("--part-rigid", args.part_rigid)):
+        for body, m in pairs:
+            if body > n_bodies:
+                print(f"warning: {opt} body {body} ignored - the model has "
+                      f"only {n_bodies} body/bodies", file=sys.stderr)
+                continue
+            part_mats[args.pid + body - 1] = m
 
     mass, part_masses, dt_est = mesher.mass_and_timestep(
         result, etype, args.mat, part_mats, args.pid,
         args.thickness if is_shell else 1.0, log=print)
+
+    if args.target_dt and dt_est:
+        lc = result.stats.get("char_length", 0.0)
+        pct = result.stats.get("char_length_pctiles") or {}
+        lc_needed = args.target_dt * lc / dt_est
+        if dt_est >= args.target_dt:
+            print(f"Target dt {args.target_dt:g}: met (estimated dt "
+                  f"{dt_est:.4g})")
+        else:
+            below = [k for k in ("p1", "p10", "p50")
+                     if pct.get(k, lc) < lc_needed]
+            print(f"Target dt {args.target_dt:g}: needs characteristic "
+                  f"length >= {lc_needed:.4g} (worst now {lc:.4g}; "
+                  f"element percentiles below the target: "
+                  f"{', '.join(below) if below else 'none - only outliers'})"
+                  f" - refine the sizing, defeature bad spots, or mass-scale")
 
     part_ids = args.pid + result.elem_parts
     part_titles = {args.pid + i: (name or f"body {i + 1}")
@@ -441,40 +579,39 @@ def main(argv=None) -> int:
         comments.append(f"Symmetry: {sp.axis.upper()} = {sp.offset:g}, "
                         f"kept '{sp.keep}' side")
 
-    dyna_writer.write_k(
-        out, result.coords, result.elems,
+    common = dict(
         element_kind="shell" if is_shell else "solid",
-        pid=args.pid, elform=elform, thickness=args.thickness,
+        elform=elform, thickness=args.thickness,
         start_nid=args.start_nid, start_eid=args.start_eid,
         start_sid=args.start_sid,
         title=args.title or os.path.splitext(os.path.basename(out))[0],
         comments=tuple(comments), sym_sets=tuple(sym_sets), mat=args.mat,
-        part_ids=part_ids, part_titles=part_titles, face_sets=tuple(face_sets),
+        part_mats=part_mats, face_sets=tuple(face_sets),
         elem_sets=tuple(elem_sets), implicit_cards=args.implicit_cards,
-        mesh_only=args.mesh_only, part_mats=part_mats,
-        contact_fs=args.contact, tssfac=args.tssfac, body_load=args.gravity,
-        long_format=args.long_format,
+        mesh_only=args.mesh_only, tssfac=args.tssfac,
+        body_load=args.gravity, long_format=args.long_format,
     )
-    print(f"Wrote {out}")
-
     split_files = []
-    if args.split_parts:
-        split_files = dyna_writer.write_k_split(
-            out, result.coords, result.elems,
+    if args.split_include:
+        split_files = dyna_writer.write_k_include(
+            out, result.coords, result.elems, pid=args.pid,
             part_ids=part_ids, part_titles=part_titles,
-            element_kind="shell" if is_shell else "solid",
-            elform=elform, thickness=args.thickness,
-            start_nid=args.start_nid, start_eid=args.start_eid,
-            start_sid=args.start_sid,
-            title=args.title or os.path.splitext(os.path.basename(out))[0],
-            comments=tuple(comments), sym_sets=tuple(sym_sets), mat=args.mat,
-            part_mats=part_mats, face_sets=tuple(face_sets),
-            elem_sets=tuple(elem_sets), implicit_cards=args.implicit_cards,
-            mesh_only=args.mesh_only, tssfac=args.tssfac,
-            body_load=args.gravity, long_format=args.long_format,
-        )
+            contact_fs=args.contact, **common)
         for p, f in split_files:
-            print(f"Wrote {f} (PID {p})")
+            print(f"Wrote {f} (mesh fragment, PID {p})")
+        print(f"Wrote {out} (master deck with *INCLUDE cards)")
+    else:
+        dyna_writer.write_k(
+            out, result.coords, result.elems, pid=args.pid,
+            part_ids=part_ids, part_titles=part_titles,
+            contact_fs=args.contact, **common)
+        print(f"Wrote {out}")
+        if args.split_parts:
+            split_files = dyna_writer.write_k_split(
+                out, result.coords, result.elems,
+                part_ids=part_ids, part_titles=part_titles, **common)
+            for p, f in split_files:
+                print(f"Wrote {f} (PID {p})")
 
     if args.stats_json:
         payload = {
@@ -495,6 +632,11 @@ def main(argv=None) -> int:
         script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "preview.py")
         subprocess.Popen([sys.executable, script, preview_path])
     return 0
+
+
+def cli_entry() -> None:
+    """Console-script entry point (see pyproject.toml)."""
+    raise SystemExit(main())
 
 
 if __name__ == "__main__":
