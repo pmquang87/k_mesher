@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-07-11
+
 ### Added
 
 - **HEX8 solid meshing** (`--etype hex8`) — structured/transfinite hexahedra
@@ -116,7 +118,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Initial release: mesh STEP geometry to LS-DYNA `.k` files
   (TET4 / TET10 solids, TRI3 / QUAD4 shells).
 
-[Unreleased]: https://github.com/pmquang87/k_mesher/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/pmquang87/k_mesher/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/pmquang87/k_mesher/releases/tag/v0.6.0
 [0.5.0]: https://github.com/pmquang87/k_mesher/releases/tag/v0.5.0
 [0.4.0]: https://github.com/pmquang87/k_mesher/releases/tag/v0.4.0
 [0.3.0]: https://github.com/pmquang87/k_mesher/releases/tag/v0.3.0
