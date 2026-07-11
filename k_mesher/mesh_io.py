@@ -8,12 +8,14 @@ k_mesher stores a mesh as two arrays::
 with these element flavours (matching ``dyna_writer.write_k``):
 
     solids  tet4  -> (M, 4)
+            hex8  -> (M, 8)
             tet10 -> (M, 10)
     shells  tri3  -> (M, 4) stored as a degenerate quad (n4 == n3)
             quad4 -> (M, 4)
 
 meshio uses **0-based** connectivity and groups elements into typed cell
-blocks ("tetra", "tetra10", "triangle", "quad").  meshio deliberately does
+blocks ("tetra", "tetra10", "hexahedron", "triangle", "quad").  meshio
+deliberately does
 *not* support LS-DYNA, so this module lets users import an existing mesh
 (Nastran .bdf, Abaqus .inp, VTK/VTU, gmsh .msh, ...) into k_mesher's arrays,
 or export k_mesher's arrays to any format meshio can write.
@@ -43,6 +45,17 @@ than hard-code that, the permutation is *computed* from the two edge tables
 below (``_DYNA_TET10_EDGES`` / ``_MESHIO_TET10_EDGES``); if a future meshio
 ever reorders its edges, only the ``_MESHIO_TET10_EDGES`` table needs
 updating and everything else follows.
+
+HEX8 node ordering
+------------------
+LS-DYNA ``*ELEMENT_SOLID`` hex8 orders nodes n1..n4 around the bottom quad
+and n5..n8 around the top quad directly above -- exactly the
+``VTK_HEXAHEDRON`` ordering that meshio's "hexahedron" cell type uses, so
+the LS-DYNA <-> meshio permutation is the identity.  This was verified
+empirically (unit-cube hex round-tripped through VTU and Abaqus keeps every
+node in place and its volume positive) and is encoded explicitly in
+``_DYNA_TO_MESHIO_HEX8`` / ``_MESHIO_TO_DYNA_HEX8`` below so any future
+reordering only needs those tables changed.
 """
 from __future__ import annotations
 
@@ -70,6 +83,13 @@ def _tet10_permutation(src_edges, dst_edges):
 _DYNA_TO_MESHIO_TET10 = _tet10_permutation(_DYNA_TET10_EDGES, _MESHIO_TET10_EDGES)
 _MESHIO_TO_DYNA_TET10 = _tet10_permutation(_MESHIO_TET10_EDGES, _DYNA_TET10_EDGES)
 
+# LS-DYNA hex8 and meshio's "hexahedron" both use VTK_HEXAHEDRON ordering
+# (n1-n4 bottom quad, n5-n8 top quad), so the permutation is the identity.
+# Kept as explicit tables (like the tet10 mapping) so a convention change
+# only ever touches these two lines.
+_DYNA_TO_MESHIO_HEX8 = [0, 1, 2, 3, 4, 5, 6, 7]
+_MESHIO_TO_DYNA_HEX8 = [0, 1, 2, 3, 4, 5, 6, 7]
+
 
 def _require_meshio():
     """Import meshio lazily with a friendly error if it is not installed."""
@@ -92,8 +112,8 @@ def to_meshio(coords, elems, element_kind="solid"):
         Node coordinates.
     elems : (M, K) array_like
         1-based connectivity in LS-DYNA ordering.  ``K`` selects the element
-        type: solids use 4 (tet4) or 10 (tet10); shells use 4 (quad4, or a
-        degenerate quad with ``n4 == n3`` for a triangle).
+        type: solids use 4 (tet4), 8 (hex8) or 10 (tet10); shells use 4
+        (quad4, or a degenerate quad with ``n4 == n3`` for a triangle).
     element_kind : {"solid", "shell"}
         Which family ``elems`` describes.
 
@@ -128,12 +148,14 @@ def to_meshio(coords, elems, element_kind="solid"):
         k = conn.shape[1]
         if k == 4:
             cells.append(("tetra", conn))
+        elif k == 8:
+            cells.append(("hexahedron", conn[:, _DYNA_TO_MESHIO_HEX8]))
         elif k == 10:
             cells.append(("tetra10", conn[:, _DYNA_TO_MESHIO_TET10]))
         else:
             raise ValueError(
-                f"unsupported solid connectivity width {k}; expected 4 (tet4) "
-                "or 10 (tet10)"
+                f"unsupported solid connectivity width {k}; expected 4 (tet4), "
+                "8 (hex8) or 10 (tet10)"
             )
     else:  # shell
         k = conn.shape[1]
@@ -154,16 +176,20 @@ def to_meshio(coords, elems, element_kind="solid"):
 
 
 # meshio cell type -> (k_mesher family, connectivity builder)
-_SOLID_TYPES = ("tetra", "tetra10")
+_SOLID_TYPES = ("tetra", "tetra10", "hexahedron")
 _SHELL_TYPES = ("triangle", "quad")
+# Quadratic hexes exist in meshio but have no k_mesher representation yet.
+_UNSUPPORTED_HEX_TYPES = ("hexahedron20", "hexahedron27")
 
 
 def from_meshio(mesh):
     """Convert a :class:`meshio.Mesh` to k_mesher arrays.
 
-    Combines "tetra"/"tetra10" blocks into a solid mesh and
+    Combines "tetra"/"tetra10"/"hexahedron" blocks into a solid mesh and
     "triangle"/"quad" blocks into a shell mesh.  Triangles are padded to a
     degenerate quad (``n4 = n3``) so all shells share one (M, 4) array.
+    Solid meshes must be uniform (all-tet or all-hex); quadratic hexes
+    ("hexahedron20"/"hexahedron27") raise :class:`NotImplementedError`.
 
     If the mesh contains *both* solids and shells (e.g. a solid volume with
     its bounding surface), the **solids win**: the shells are dropped and
@@ -188,6 +214,11 @@ def from_meshio(mesh):
     seen = set()
     for cell_block in mesh.cells:
         ct = cell_block.type
+        if ct in _UNSUPPORTED_HEX_TYPES:
+            raise NotImplementedError(
+                f"meshio cell type {ct!r} (quadratic hexahedron) is not "
+                "supported; only linear 'hexahedron' (hex8) solids are"
+            )
         if ct in blocks:
             blocks[ct].append(np.asarray(cell_block.data, dtype=np.int64))
         else:
@@ -205,12 +236,21 @@ def from_meshio(mesh):
         )
 
     if have_solid:
-        # Mixing tet4 and tet10 in one array is not representable; require one.
+        # k_mesher meshes are uniform: one solid type per (M, K) array.
+        have_tet = bool(blocks["tetra"] or blocks["tetra10"])
+        if have_tet and blocks["hexahedron"]:
+            raise ValueError(
+                "mesh mixes tetrahedra and hexahedra solids; k_mesher meshes "
+                "are uniform -- convert them separately"
+            )
         if blocks["tetra"] and blocks["tetra10"]:
             raise ValueError(
                 "mesh mixes tet4 and tet10 solids; convert them separately"
             )
-        if blocks["tetra10"]:
+        if blocks["hexahedron"]:
+            data = np.vstack(blocks["hexahedron"])
+            elems = data[:, _MESHIO_TO_DYNA_HEX8] + 1
+        elif blocks["tetra10"]:
             data = np.vstack(blocks["tetra10"])
             elems = data[:, _MESHIO_TO_DYNA_TET10] + 1
         else:

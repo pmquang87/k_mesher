@@ -32,6 +32,17 @@ caller that omits them still works):
     endtim, mass_scale, hourglass, control_energy, databases,
     initial_velocity, contacts, define_curves, prescribed_motion,
     rigidwalls, spotwelds
+
+Masses / springs / rigid bodies (all read with a safe default; like
+spotwelds/contacts they go to write_k / write_k_include only, never the
+split files):
+    point_masses -> ({"nid":int,"mass":float,"eid":int?}, ...)
+    discretes -> ({"n1":int,"n2":int,"k":float XOR "c":float,"pid":int?}, ...)
+    nodal_rigid_bodies -> ({"nodes":[nid,...],"pid":int,"title":str?}, ...)
+    damping -> None | {"valdmp":float,"lcid":int?}
+
+HEX8 solids need no extra kopts (element_kind stays "solid"); the optional
+boundary layer arrives on the settings object (settings.boundary_layer).
 """
 from __future__ import annotations
 
@@ -64,6 +75,7 @@ def run_job(settings, out: str, kopts: dict, log=print) -> str:
                                          preview_path=preview_path)
         element_kind = "shell"
         thickness = result.stats["midsurface_thickness"]
+        ms_thicknesses = tuple(result.stats.get("midsurface_thicknesses") or ())
         log(f"Midsurface thickness: {thickness:.4g}")
         # a solid element_type on the settings still needs a shell type for the
         # mass/timestep estimate below (the extracted mesh is shells)
@@ -75,6 +87,7 @@ def run_job(settings, out: str, kopts: dict, log=print) -> str:
                                        preview_path=preview_path)
         element_kind = kopts["element_kind"]
         thickness = kopts["thickness"]
+        ms_thicknesses = ()
         elem_type = settings.element_type
 
     sym_sets = []
@@ -225,12 +238,24 @@ def run_job(settings, out: str, kopts: dict, log=print) -> str:
         prescribed_motion=tuple(kopts.get("prescribed_motion") or ()),
         rigidwalls=tuple(kopts.get("rigidwalls") or ()),
     )
+    if len(ms_thicknesses) > 1:
+        # multi-region midsurface: one *SECTION_SHELL per region with its own
+        # detected wall thickness (region i -> PID pid0 + i)
+        common["part_thickness"] = {pid0 + i: t
+                                    for i, t in enumerate(ms_thicknesses)}
     databases = kopts.get("databases")
     if databases:
         common["databases"] = databases
-    # spotwelds/contacts stay out of `common` so the split files omit them
+    # spotwelds/contacts stay out of `common` so the split files omit them,
+    # and so do the crash cards (masses / springs / rigid bodies / damping)
     spotwelds = tuple(kopts.get("spotwelds") or ()) + auto_spotwelds
     contacts = tuple(kopts.get("contacts") or ()) + auto_contacts
+    crash_cards = dict(
+        point_masses=tuple(kopts.get("point_masses") or ()),
+        discretes=tuple(kopts.get("discretes") or ()),
+        nodal_rigid_bodies=tuple(kopts.get("nodal_rigid_bodies") or ()),
+        damping=kopts.get("damping"),
+    )
     split_mode = kopts.get("split_mode")
     log(f"Writing LS-DYNA keyword file: {out}")
     if split_mode == "include":
@@ -239,7 +264,7 @@ def run_job(settings, out: str, kopts: dict, log=print) -> str:
             part_ids=part_ids, part_titles=part_titles, title=title,
             contact_fs=kopts["contact_fs"], contacts=contacts,
             contact_pairs=auto_contact_pairs,
-            spotwelds=spotwelds, **common)
+            spotwelds=spotwelds, **crash_cards, **common)
         for p, fpath in files:
             log(f"Wrote mesh fragment: {fpath} (PID {p})")
         log(f"Master deck with *INCLUDE cards: {out}")
@@ -249,7 +274,7 @@ def run_job(settings, out: str, kopts: dict, log=print) -> str:
             part_ids=part_ids, part_titles=part_titles, title=title,
             contact_fs=kopts["contact_fs"], contacts=contacts,
             contact_pairs=auto_contact_pairs,
-            spotwelds=spotwelds, **common)
+            spotwelds=spotwelds, **crash_cards, **common)
         if split_mode == "parts":
             files = dyna_writer.write_k_split(
                 out, result.coords, result.elems,

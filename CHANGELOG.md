@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **HEX8 solid meshing** (`--etype hex8`) — structured/transfinite hexahedra
+  for box-like or sweepable solids, written as one-line `*ELEMENT_SOLID` rows
+  with `*SECTION_SOLID` ELFORM 1 (default) or 2. Non-boxlike geometry,
+  tessellation input, mixed (partially recombined) meshes and combinations
+  with symmetry/defeature/refinements/face-sizes/boundary-layer are rejected
+  with clear errors.
+- **Boundary layers** (`--boundary-layer THICKNESS[:RATIO[:NLAYERS[:SIZEWALL]]]`
+  plus `--bl-faces`, and `MeshSettings.boundary_layer`) — distance-graded
+  near-wall sizing (Distance + Threshold fields) from selected or all wall
+  faces, for TET and shell meshing.
+- **Crash cards** in the writer, CLI and `run_job` kopts — lumped masses
+  (`--point-mass` → `*ELEMENT_MASS`), spring/damper elements (`--spring` /
+  `--damper` → `*ELEMENT_DISCRETE` + `*SECTION_DISCRETE` +
+  `*MAT_SPRING_ELASTIC` / `*MAT_DAMPER_VISCOUS`), nodal rigid bodies
+  (`--nodal-rigid-body` → `*CONSTRAINED_NODAL_RIGID_BODY`), global damping
+  (`--damping` → `*DAMPING_GLOBAL`) and geometric rigid walls
+  (`--rigidwall-sphere` / `--rigidwall-cylinder` →
+  `*RIGIDWALL_GEOMETRIC_SPHERE` / `_CYLINDER`).
+- **Multi-region midsurface extraction** — `--midsurface` now handles
+  multi-region plate solids, not just a single detected wall.
+- **Per-part shell thickness** — shell thickness can be set per part instead
+  of one global `*SECTION_SHELL` value.
+
 - **Importable `k_mesher` package** — the flat modules were repackaged into a
   `k_mesher/` package with a public API exposed via `import k_mesher`
   (`MeshSettings`, `MeshResult`, `mesh_step` / `mesh_step_auto`,

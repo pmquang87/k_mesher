@@ -1512,6 +1512,123 @@ def test_job_runner_auto_contact():
     print("OK: scoped per-pair contact via run_job auto_connect 'contact'")
 
 
+# --------------------------------------------------------------------------
+# HEX8 / boundary layer / crash cards
+# --------------------------------------------------------------------------
+
+def section_solid_elform(path):
+    """The ELFORM on the first *SECTION_SOLID of a standard-format file."""
+    lines = open(path).read().splitlines()
+    for i, ln in enumerate(lines):
+        if ln.strip().upper() == "*SECTION_SOLID":
+            return int(lines[i + 2][10:20])
+    return None
+
+
+def test_cli_hex8():
+    print("=== CLI: --etype hex8 (transfinite box) ===")
+    _ensure_plate()
+    k_cli = os.path.join(OUT_DIR, "cli_hex8.k")
+    rc = mesh_cli.main([PLATE, "-o", k_cli, "--size-max", "10",
+                        "--etype", "hex8", "--mat"])
+    assert rc == 0
+    nodes, elems, _, kws = parse_k(k_cli)
+    assert "*ELEMENT_SOLID" in kws and "*ELEMENT_SHELL" not in kws
+    assert "*SECTION_SOLID" in kws
+    assert len(elems) > 5 and len(nodes) > 5
+    # every solid row is eid, pid + 8 DISTINCT node ids (no degenerate tets)
+    assert all(len(set(e[2:10])) == 8 for e in elems), \
+        "hexes must have 8 distinct nodes per element"
+    assert section_solid_elform(k_cli) == 1, "HEX8 default ELFORM must be 1"
+    # an explicit --elform 2 (fully integrated S/R) is honoured
+    k_cli2 = os.path.join(OUT_DIR, "cli_hex8_ef2.k")
+    rc2 = mesh_cli.main([PLATE, "-o", k_cli2, "--size-max", "10",
+                         "--etype", "hex8", "--elform", "2"])
+    assert rc2 == 0
+    assert section_solid_elform(k_cli2) == 2, "--elform 2 must land on the card"
+    # the holed test part is not box-like -> clear mesher error, exit 1
+    rc3 = mesh_cli.main([STEP, "-o", os.path.join(OUT_DIR, "cli_hex8_bad.k"),
+                         "--size-max", "10", "--etype", "hex8"])
+    assert rc3 == 1, "hex8 on a non-boxlike part must exit 1"
+    print(f"OK: {len(elems)} hexes, elform 1 default / 2 explicit, guard fires")
+
+
+def test_cli_boundary_layer():
+    print("=== CLI: --boundary-layer (near-wall grading) ===")
+    _ensure_geometry()
+    k_base = os.path.join(OUT_DIR, "cli_bl_base.k")
+    k_bl = os.path.join(OUT_DIR, "cli_bl.k")
+    rc = mesh_cli.main([STEP, "-o", k_base, "--size-max", "10"])
+    assert rc == 0
+    rc2 = mesh_cli.main([STEP, "-o", k_bl, "--size-max", "10",
+                         "--boundary-layer", "5:1.2:3:3"])
+    assert rc2 == 0
+    _, elems_base, _, _ = parse_k(k_base)
+    _, elems_bl, _, _ = parse_k(k_bl)
+    assert len(elems_bl) > len(elems_base), \
+        (f"boundary layer must refine near the walls: "
+         f"{len(elems_base)} -> {len(elems_bl)}")
+    print(f"OK: {len(elems_base)} -> {len(elems_bl)} tets with the layer")
+
+
+def test_cli_crash_cards():
+    print("=== CLI: masses / springs / rigid bodies / damping / walls ===")
+    _ensure_geometry()
+    k_cli = os.path.join(OUT_DIR, "cli_crash.k")
+    rc = mesh_cli.main([STEP, "-o", k_cli, "--size-max", "10", "--mat",
+                        "--point-mass", "1:0.5", "--spring", "1:2:1000",
+                        "--damper", "3:4:0.2", "--damping", "0.1",
+                        "--nodal-rigid-body", "99:1,2,3",
+                        "--rigidwall-sphere", "0:0:-50:0:0:1:25",
+                        "--rigidwall-cylinder", "0:0:-50:1:0:0:10:100:0.2"])
+    assert rc == 0
+    _, _, _, kws = parse_k(k_cli)
+    for kw in ("*ELEMENT_MASS", "*ELEMENT_DISCRETE", "*SECTION_DISCRETE",
+               "*MAT_SPRING_ELASTIC", "*MAT_DAMPER_VISCOUS", "*DAMPING_GLOBAL",
+               "*CONSTRAINED_NODAL_RIGID_BODY", "*RIGIDWALL_GEOMETRIC_SPHERE",
+               "*RIGIDWALL_GEOMETRIC_CYLINDER"):
+        assert kw in kws, f"missing {kw}"
+    # one spring + one damper -> two discrete property blocks and elements
+    assert kws.count("*ELEMENT_DISCRETE") == 2
+    assert kws.count("*SECTION_DISCRETE") == 2
+    txt = open(k_cli).read()
+    assert "0.1" in txt and "1000" in txt
+    print("OK: all crash cards emitted via the CLI")
+
+
+def test_job_runner_crash_cards():
+    print("=== job_runner: point_masses / discretes / NRB / damping kopts ===")
+    from k_mesher import job_runner
+    _ensure_geometry()
+    kopts = {
+        "pid": 1, "elform": 10, "element_kind": "solid", "thickness": 1.0,
+        "start_nid": 1, "start_eid": 1, "start_sid": 1,
+        "sym_nodeset": False, "sym_spc": False, "sym_constraint": "symmetric",
+        "sym_dofs": "", "sym_segset": False,
+        "mat": dict(STEEL), "part_mats": {},
+        "face_nodesets": False, "face_segsets": False, "face_roles": [],
+        "plain_faces": [], "face_titles": {}, "coord_sets": [],
+        "implicit_cards": False, "qa_sets": False, "mesh_only": False,
+        "split_mode": None, "contact_fs": None, "tssfac": None,
+        "gravity": None,
+        # the GUI-shared contract keys
+        "point_masses": ({"nid": 1, "mass": 0.5},),
+        "discretes": ({"n1": 1, "n2": 2, "k": 1000.0},
+                      {"n1": 3, "n2": 4, "c": 0.2}),
+        "nodal_rigid_bodies": ({"nodes": [1, 2, 3], "pid": 99},),
+        "damping": {"valdmp": 0.1},
+    }
+    settings = mesher.MeshSettings(step_file=STEP, size_max=10.0)
+    out = os.path.join(OUT_DIR, "runner_crash.k")
+    job_runner.run_job(settings, out, kopts, log=QUIET)
+    _, _, _, kws = parse_k(out)
+    for kw in ("*ELEMENT_MASS", "*ELEMENT_DISCRETE", "*SECTION_DISCRETE",
+               "*MAT_SPRING_ELASTIC", "*MAT_DAMPER_VISCOUS", "*DAMPING_GLOBAL",
+               "*CONSTRAINED_NODAL_RIGID_BODY"):
+        assert kw in kws, f"missing {kw}"
+    print("OK: crash cards land through run_job kopts")
+
+
 def main():
     tests = [(name, fn) for name, fn in sorted(globals().items())
              if name.startswith("test_") and callable(fn)]

@@ -3,8 +3,9 @@
 [![tests](https://github.com/pmquang87/k_mesher/actions/workflows/ci.yml/badge.svg)](https://github.com/pmquang87/k_mesher/actions/workflows/ci.yml)
 
 Mesh CAD geometry (STEP / IGES / BREP) or a surface tessellation
-(STL / OBJ / PLY) into solid tetrahedra (TET4/TET10) or shells (TRI3/QUAD4)
-and export an LS-DYNA keyword file (`.k`). Features: symmetry planes
+(STL / OBJ / PLY) into solid tetrahedra (TET4/TET10), structured hexahedra
+(HEX8, box-like/sweepable solids) or shells (TRI3/QUAD4) and export an
+LS-DYNA keyword file (`.k`). Features: symmetry planes
 (half/quarter/eighth models) with separate node-set and boundary-condition
 options (symmetric / anti-symmetric / fixed / custom DOFs), per-body parts
 with per-body materials (elastic or rigid), single-surface contact and
@@ -129,6 +130,15 @@ python -m k_mesher.mesh_cli part.stp --mat --cross-section 0:0:0:1:0:0:MIDCUT \
     --history-node 1,2,3 --history-solid 10,11    # section force + time history
 python -m k_mesher.mesh_cli part.stp \
     --mat-model plastic_kinematic:210000:0.3:7.85e-9:1000:200   # plasticity material
+python -m k_mesher.mesh_cli block.stp --etype hex8 --size-max 5   # structured hexes
+python -m k_mesher.mesh_cli block.stp --etype hex8 --elform 2     # fully integrated S/R
+python -m k_mesher.mesh_cli part.stp --boundary-layer 3:1.2:4     # near-wall grading
+python -m k_mesher.mesh_cli part.stp --boundary-layer 3:1.2:4:0.5 --bl-faces 2,5
+python -m k_mesher.mesh_cli part.stp --mat --point-mass 101:0.5 \
+    --spring 101:202:1000 --damper 101:303:0.2 --damping 0.1 \
+    --nodal-rigid-body 99:1,2,3                 # masses / springs / rigid bodies
+python -m k_mesher.mesh_cli part.stp --mat --rigidwall-sphere 0:0:-50:0:0:1:25 \
+    --rigidwall-cylinder 0:0:-50:1:0:0:10:100:0.2   # geometric rigid walls
 python -m k_mesher.mesh_cli --version
 ```
 
@@ -177,6 +187,38 @@ output / materials" in `-h`):
   place of `--mat`: `plastic_kinematic` (`*MAT_PLASTIC_KINEMATIC`) or
   `piecewise` (`*MAT_PIECEWISE_LINEAR_PLASTICITY`).
 
+**Boundary layers** — `--boundary-layer THICKNESS[:RATIO[:NLAYERS[:SIZEWALL]]]`
+adds **distance-graded near-wall sizing** for TET and shell meshing: the
+element size ramps from a small wall size (an explicit `SIZEWALL`, or the
+first-layer height of a geometric progression of `NLAYERS` layers growing by
+`RATIO`, default 1.2) up to the global size across `THICKNESS` from the wall
+faces. `--bl-faces TAG[,TAG...]` restricts the grading to specific faces (see
+`--list-faces`); the default is all boundary faces. Honest scope note: this
+is graded isotropic **sizing** near the walls (a gmsh Distance + Threshold
+field), not an extruded anisotropic layer stack — it refines the mesh in the
+near-wall band rather than producing wall-normal prism/hex layers. Not
+available with `--etype hex8` (transfinite meshing ignores size fields).
+
+**Masses / springs / rigid bodies** (grouped under "masses / springs / rigid
+bodies" in `-h`; all repeatable except `--damping`):
+
+- `--point-mass NID:MASS` — a lumped `*ELEMENT_MASS` at a node.
+- `--spring N1:N2:K` / `--damper N1:N2:C` — `*ELEMENT_DISCRETE`
+  spring/damper elements between two nodes; each distinct property gets its
+  own `*PART` + `*SECTION_DISCRETE` + `*MAT_SPRING_ELASTIC` (K) or
+  `*MAT_DAMPER_VISCOUS` (C), auto-numbered above the mesh part ids.
+- `--nodal-rigid-body PID:NID1,NID2[,NID3...]` —
+  `*CONSTRAINED_NODAL_RIGID_BODY` over the listed nodes (with its
+  `*SET_NODE_LIST`); pick a `PID` above the mesh part ids.
+- `--damping VALDMP` — `*DAMPING_GLOBAL` system damping.
+- `--rigidwall-sphere TX:TY:TZ:HX:HY:HZ:R[:FRIC]` and
+  `--rigidwall-cylinder TX:TY:TZ:HX:HY:HZ:R:L[:FRIC]` —
+  `*RIGIDWALL_GEOMETRIC_SPHERE` / `_CYLINDER` (tail point, tail→head
+  orientation/axis), alongside the planar `--rigidwall`.
+
+Like contact/spotwelds, these cards go to the single-file and
+`*INCLUDE`-master output only, not the standalone per-part split files.
+
 `python -m k_mesher.mesh_cli -h` lists all options (the new LS-DYNA control / load
 flags are grouped under "LS-DYNA control / loads"). GUI settings are remembered
 between sessions in `k_mesher_settings.json` (written on every run and on
@@ -206,6 +248,9 @@ window close).
      - **TET10** solid (ELFORM 16 or 17) — for implicit stress analysis
        TET10 + ELFORM 16 is strongly recommended; linear tets are
        artificially stiff in bending.
+     - **HEX8** solid (ELFORM 1 or 2) — structured/transfinite hexes for
+       box-like or sweepable solids only; a partial recombination (mixed
+       hex/tet mesh) is rejected (see "Notes on element types").
      - **Shell TRI3** (ELFORM 4 or 17) — triangles on the model surfaces.
      - **Shell QUAD4** (ELFORM 16 or 2) — quad-dominant recombined mesh
        (a few triangles remain, written as degenerate quads).
@@ -333,6 +378,7 @@ window close).
 *LOAD_BODY_X/Y/Z      (optional gravity; scaled unit ramp curve)
 *NODE                 (I8 id, 3 x E16.9 coordinates)
 *ELEMENT_SOLID        (TET4: one line, tet as degenerate hex;
+                       HEX8: one line, 8 distinct nodes;
                        TET10: two-line format, 10 nodes)
 *ELEMENT_SHELL        (quads n1..n4, triangles as n1 n2 n3 n3)
 *SET_NODE_LIST_TITLE  (symmetry planes and selected faces)
@@ -342,7 +388,14 @@ window close).
 *INITIAL_VELOCITY_GENERATION      (optional; --init-velocity)
 *BOUNDARY_PRESCRIBED_MOTION_SET   (optional; --prescribed-motion)
 *RIGIDWALL_PLANAR     (optional; --rigidwall)
+*RIGIDWALL_GEOMETRIC_SPHERE / _CYLINDER   (optional; --rigidwall-sphere /
+                       --rigidwall-cylinder)
 *CONSTRAINED_SPOTWELD (optional; --spotweld, one per node pair)
+*CONSTRAINED_NODAL_RIGID_BODY   (optional; --nodal-rigid-body, + its node set)
+*ELEMENT_MASS         (optional; --point-mass)
+*ELEMENT_DISCRETE     (optional; --spring / --damper, + PART/SECTION_DISCRETE/
+                       MAT_SPRING_ELASTIC or MAT_DAMPER_VISCOUS per property)
+*DAMPING_GLOBAL       (optional; --damping)
 *DATABASE_BINARY_D3PLOT / *DATABASE_<NAME>   (optional; --d3plot-dt / --database)
 *DATABASE_CROSS_SECTION_PLANE     (optional; --cross-section, + auto SECFORC)
 *DATABASE_HISTORY_NODE/_SOLID/_SHELL   (optional; --history-node/-solid/-shell)
@@ -426,11 +479,18 @@ big meshes:
 
 ## Notes on element types
 
-Hex meshing of arbitrary STEP solids is not something gmsh does
-automatically — that would need transfinite/swept regions or an external hex
-mesher, so solid meshes are tetrahedra only. (gmsh's tet-subdivision "all-hex"
-mode exists but produces badly distorted hexes and is deliberately not
-offered.) Shells are meshed on the model's surfaces: use them for
+**Hex meshing** — `--etype hex8` meshes **transfinite/sweepable solids only**
+(box-like volumes, or shapes gmsh's automatic transfinite setup can
+structure): full unstructured hex meshing of arbitrary CAD is not feasible,
+so general solids should stay TET4/TET10. The hexes are written as
+`*ELEMENT_SOLID` with ELFORM 1 (constant stress, the default) or 2 (fully
+integrated S/R) on `*SECTION_SOLID`. Transfinite meshing ignores size
+fields, so HEX8 rejects symmetry planes, defeaturing, refinement regions,
+per-face sizes and boundary layers with a clear error; a geometry that
+recombines only partially (a **mixed** hex/tet/prism mesh) or not at all is
+also rejected — pure hex or nothing. (gmsh's tet-subdivision "all-hex" mode
+exists but produces badly distorted hexes and is deliberately not offered.)
+Shells are meshed on the model's surfaces: use them for
 surface-only STEP exports or thin-walled parts. For thin, roughly
 constant-thickness plate solids (sheet metal), `--midsurface` extracts a
 midsurface shell mesh and sets the shell thickness from the measured wall

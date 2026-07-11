@@ -24,6 +24,11 @@ Examples:
     python mesh_cli.py asm.stp --auto-contact --contact 0.1
     python mesh_cli.py part.stp --cross-section 0:0:0:1:0:0 --history-node 1,2,3
     python mesh_cli.py part.stp --mat-model plastic_kinematic:210000:0.3:7.85e-9:1000:200
+    python mesh_cli.py block.stp --etype hex8 --size-max 5      # box-like solids only
+    python mesh_cli.py part.stp --boundary-layer 3:1.2:4 --bl-faces 2,5
+    python mesh_cli.py part.stp --mat --point-mass 101:0.5 --spring 101:202:1000 \
+                                --damping 0.1 --nodal-rigid-body 99:1,2,3
+    python mesh_cli.py part.stp --rigidwall-sphere 0:0:-50:0:0:1:25:0.2
 """
 from __future__ import annotations
 
@@ -310,6 +315,142 @@ def parse_rigidwall(text: str) -> dict:
     return rw
 
 
+def parse_rigidwall_sphere(text: str) -> dict:
+    """TX:TY:TZ:HX:HY:HZ:R[:FRIC] -> *RIGIDWALL_GEOMETRIC_SPHERE
+    (tail = centre, tail -> head sets the orientation vector)."""
+    parts = text.split(":")
+    if len(parts) not in (7, 8):
+        raise argparse.ArgumentTypeError(
+            f"rigidwall-sphere needs TX:TY:TZ:HX:HY:HZ:R[:FRIC]: {text!r}")
+    try:
+        vals = [float(v) for v in parts]
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"bad rigidwall-sphere numbers in {text!r}") from None
+    if vals[6] <= 0:
+        raise argparse.ArgumentTypeError(
+            f"rigidwall-sphere radius must be > 0: {text!r}")
+    rw = {"tail": tuple(vals[0:3]), "head": tuple(vals[3:6]),
+          "shape": "sphere", "radius": vals[6]}
+    if len(vals) == 8:
+        rw["fric"] = vals[7]
+    return rw
+
+
+def parse_rigidwall_cylinder(text: str) -> dict:
+    """TX:TY:TZ:HX:HY:HZ:R:L[:FRIC] -> *RIGIDWALL_GEOMETRIC_CYLINDER
+    (tail = base-cap centre, tail -> head = axis)."""
+    parts = text.split(":")
+    if len(parts) not in (8, 9):
+        raise argparse.ArgumentTypeError(
+            f"rigidwall-cylinder needs TX:TY:TZ:HX:HY:HZ:R:L[:FRIC]: {text!r}")
+    try:
+        vals = [float(v) for v in parts]
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"bad rigidwall-cylinder numbers in {text!r}") from None
+    if vals[6] <= 0 or vals[7] <= 0:
+        raise argparse.ArgumentTypeError(
+            f"rigidwall-cylinder radius and length must be > 0: {text!r}")
+    rw = {"tail": tuple(vals[0:3]), "head": tuple(vals[3:6]),
+          "shape": "cylinder", "radius": vals[6], "length": vals[7]}
+    if len(vals) == 9:
+        rw["fric"] = vals[8]
+    return rw
+
+
+def parse_boundary_layer(text: str) -> dict:
+    """THICKNESS[:RATIO[:NLAYERS[:SIZEWALL]]] -> near-wall grading spec
+    (distance-graded sizing over THICKNESS; RATIO defaults to 1.2)."""
+    parts = text.split(":")
+    if len(parts) > 4:
+        raise argparse.ArgumentTypeError(
+            f"boundary-layer needs THICKNESS[:RATIO[:NLAYERS[:SIZEWALL]]]: "
+            f"{text!r}")
+    try:
+        thickness = float(parts[0])
+        ratio = float(parts[1]) if len(parts) > 1 and parts[1] else 1.2
+        nb = int(parts[2]) if len(parts) > 2 and parts[2] else None
+        size_wall = float(parts[3]) if len(parts) > 3 and parts[3] else None
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"bad boundary-layer numbers in {text!r} "
+            f"(THICKNESS[:RATIO[:NLAYERS[:SIZEWALL]]])") from None
+    if thickness <= 0:
+        raise argparse.ArgumentTypeError(
+            f"boundary-layer thickness must be > 0: {text!r}")
+    if ratio <= 0:
+        raise argparse.ArgumentTypeError(
+            f"boundary-layer ratio must be > 0: {text!r}")
+    if nb is not None and nb < 1:
+        raise argparse.ArgumentTypeError(
+            f"boundary-layer NLAYERS must be >= 1: {text!r}")
+    if size_wall is not None and size_wall <= 0:
+        raise argparse.ArgumentTypeError(
+            f"boundary-layer SIZEWALL must be > 0: {text!r}")
+    bl = {"thickness": thickness, "ratio": ratio}
+    if nb is not None:
+        bl["nb_layers"] = nb
+    if size_wall is not None:
+        bl["size_wall"] = size_wall
+    return bl
+
+
+def parse_point_mass(text: str) -> dict:
+    """NID:MASS -> one *ELEMENT_MASS at that node."""
+    parts = text.split(":")
+    if len(parts) != 2:
+        raise argparse.ArgumentTypeError(
+            f"point-mass needs NID:MASS: {text!r}")
+    try:
+        return {"nid": int(parts[0]), "mass": float(parts[1])}
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"bad point-mass values in {text!r} (NID:MASS)") from None
+
+
+def _parse_discrete(text: str, key: str, what: str) -> dict:
+    parts = text.split(":")
+    if len(parts) != 3:
+        raise argparse.ArgumentTypeError(
+            f"{what} needs N1:N2:{key.upper()}: {text!r}")
+    try:
+        return {"n1": int(parts[0]), "n2": int(parts[1]),
+                key: float(parts[2])}
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"bad {what} values in {text!r} (N1:N2:{key.upper()})") from None
+
+
+def parse_spring(text: str) -> dict:
+    """N1:N2:K -> a spring *ELEMENT_DISCRETE (*MAT_SPRING_ELASTIC)."""
+    return _parse_discrete(text, "k", "spring")
+
+
+def parse_damper(text: str) -> dict:
+    """N1:N2:C -> a damper *ELEMENT_DISCRETE (*MAT_DAMPER_VISCOUS)."""
+    return _parse_discrete(text, "c", "damper")
+
+
+def parse_nodal_rigid_body(text: str) -> dict:
+    """PID:NID1,NID2[,NID3...] -> *CONSTRAINED_NODAL_RIGID_BODY over the
+    listed nodes (PID must be free, i.e. above the mesh part ids)."""
+    pid_str, sep, nid_list = text.partition(":")
+    if not sep:
+        raise argparse.ArgumentTypeError(
+            f"nodal-rigid-body needs PID:NID1,NID2[,...]: {text!r}")
+    try:
+        pid = int(pid_str)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"nodal-rigid-body PID must be an integer: {text!r}") from None
+    nodes = parse_id_list(nid_list)
+    if len(nodes) < 2:
+        raise argparse.ArgumentTypeError(
+            f"nodal-rigid-body needs at least two node ids: {text!r}")
+    return {"pid": pid, "nodes": nodes}
+
+
 def parse_spotweld(text: str) -> tuple[int, int]:
     """N1:N2 node-id pair -> *CONSTRAINED_SPOTWELD."""
     parts = text.split(":")
@@ -446,8 +587,8 @@ def parse_prescribed_motion(text: str) -> dict:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Mesh a STEP/IGES/BREP/STL file to TET4/TET10/TRI3/QUAD4 "
-                    "and write an LS-DYNA .k file.",
+        description="Mesh a STEP/IGES/BREP/STL file to TET4/TET10/HEX8/TRI3/"
+                    "QUAD4 and write an LS-DYNA .k file.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument("--version", action="version",
                    version=f"%(prog)s {_version.__version__}")
@@ -455,10 +596,11 @@ def build_parser() -> argparse.ArgumentParser:
                                  "surface, or an STL/OBJ/PLY tessellation "
                                  "(shells, or tets if watertight)")
     p.add_argument("-o", "--output", help="output .k file (default: input with .k)")
-    p.add_argument("--etype", choices=["tet4", "tet10", "tri3", "quad4"],
+    p.add_argument("--etype", choices=["tet4", "tet10", "hex8", "tri3", "quad4"],
                    default="tet4",
-                   help="element type: solid tets or shells (tri3 / "
-                        "quad-dominant)")
+                   help="element type: solid tets, solid hexes (hex8 is "
+                        "transfinite/structured and needs box-like or "
+                        "sweepable solids) or shells (tri3 / quad-dominant)")
     p.add_argument("--tet10", action="store_true",
                    help="deprecated alias for --etype tet10")
     p.add_argument("--thickness", type=float, default=1.0,
@@ -502,6 +644,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--refine-box", type=parse_refine_box, action="append",
                    dest="refinements", metavar="X0:Y0:Z0:X1:Y1:Z1:SIZE",
                    help="box refinement region, repeatable")
+    p.add_argument("--boundary-layer", type=parse_boundary_layer, default=None,
+                   metavar="THICKNESS[:RATIO[:NLAYERS[:SIZEWALL]]]",
+                   help="distance-graded near-wall sizing over THICKNESS from "
+                        "the wall faces (RATIO default 1.2, NLAYERS sets the "
+                        "first-layer height unless SIZEWALL is explicit); "
+                        "TET/shell meshing only, see --bl-faces")
+    p.add_argument("--bl-faces", type=parse_id_list, default=None,
+                   metavar="TAG[,TAG...]",
+                   help="wall face tags for --boundary-layer (see "
+                        "--list-faces); default: all boundary faces")
     p.add_argument("--list-faces", action="store_true",
                    help="list the model faces (tag, type, area, centroid) and exit")
     p.add_argument("--face-nodeset", type=int, action="append", default=[],
@@ -543,10 +695,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "mass properties, timestep estimate) as JSON")
     p.add_argument("--pid", type=int, default=1,
                    help="base part ID (multiple bodies get PID, PID+1, ...)")
-    p.add_argument("--elform", type=int, choices=[2, 4, 10, 13, 16, 17],
+    p.add_argument("--elform", type=int, choices=[1, 2, 4, 10, 13, 16, 17],
                    default=None,
                    help="section formulation (defaults: TET4 10, TET10 16, "
-                        "TRI3 4, QUAD4 16)")
+                        "HEX8 1, TRI3 4, QUAD4 16)")
     p.add_argument("--start-nid", type=int, default=1, help="first node ID")
     p.add_argument("--start-eid", type=int, default=1, help="first element ID")
     p.add_argument("--start-sid", type=int, default=1,
@@ -654,6 +806,37 @@ def build_parser() -> argparse.ArgumentParser:
                    help="*BOUNDARY_PRESCRIBED_MOTION_SET (vad 0 vel / 1 accel "
                         "/ 2 disp), repeatable")
 
+    m = p.add_argument_group("masses / springs / rigid bodies")
+    m.add_argument("--point-mass", type=parse_point_mass, action="append",
+                   dest="point_masses", default=[], metavar="NID:MASS",
+                   help="*ELEMENT_MASS lumped mass at a node, repeatable")
+    m.add_argument("--spring", type=parse_spring, action="append",
+                   dest="springs", default=[], metavar="N1:N2:K",
+                   help="spring *ELEMENT_DISCRETE between two nodes "
+                        "(*MAT_SPRING_ELASTIC stiffness K), repeatable")
+    m.add_argument("--damper", type=parse_damper, action="append",
+                   dest="dampers", default=[], metavar="N1:N2:C",
+                   help="damper *ELEMENT_DISCRETE between two nodes "
+                        "(*MAT_DAMPER_VISCOUS constant C), repeatable")
+    m.add_argument("--nodal-rigid-body", type=parse_nodal_rigid_body,
+                   action="append", dest="nodal_rigid_bodies", default=[],
+                   metavar="PID:NID1,NID2[,NID3...]",
+                   help="*CONSTRAINED_NODAL_RIGID_BODY over the listed nodes; "
+                        "PID must be free (above the mesh part ids), "
+                        "repeatable")
+    m.add_argument("--damping", type=float, default=None, metavar="VALDMP",
+                   help="*DAMPING_GLOBAL system damping constant")
+    m.add_argument("--rigidwall-sphere", type=parse_rigidwall_sphere,
+                   action="append", dest="rigidwall_spheres", default=[],
+                   metavar="TX:TY:TZ:HX:HY:HZ:R[:FRIC]",
+                   help="*RIGIDWALL_GEOMETRIC_SPHERE (tail = centre, tail -> "
+                        "head = orientation), repeatable")
+    m.add_argument("--rigidwall-cylinder", type=parse_rigidwall_cylinder,
+                   action="append", dest="rigidwall_cylinders", default=[],
+                   metavar="TX:TY:TZ:HX:HY:HZ:R:L[:FRIC]",
+                   help="*RIGIDWALL_GEOMETRIC_CYLINDER (tail = base-cap "
+                        "centre, tail -> head = axis), repeatable")
+
     c = p.add_argument_group("mesh-time connections / midsurface")
     c.add_argument("--midsurface", action="store_true",
                    help="mesh thin, constant-thickness plate solids as a "
@@ -740,8 +923,8 @@ def main(argv=None) -> int:
             print(f"note: --midsurface writes shells; using {shell_etype} "
                   f"(pass --etype tri3/quad4 to choose)", file=sys.stderr)
         etype = shell_etype
-    defaults = {"TET4": 10, "TET10": 16, "TRI3": 4, "QUAD4": 16}
-    allowed = {"TET4": (10, 13), "TET10": (16, 17),
+    defaults = {"TET4": 10, "TET10": 16, "HEX8": 1, "TRI3": 4, "QUAD4": 16}
+    allowed = {"TET4": (10, 13), "TET10": (16, 17), "HEX8": (1, 2),
                "TRI3": (4, 17), "QUAD4": (2, 16)}
     elform = args.elform if args.elform is not None else defaults[etype]
     if elform not in allowed[etype]:
@@ -758,6 +941,14 @@ def main(argv=None) -> int:
               file=sys.stderr)
         return 2
     is_shell = mesher.ETYPES[etype]["family"] == "shell"
+
+    boundary_layer = None
+    if args.boundary_layer is not None:
+        boundary_layer = dict(args.boundary_layer)
+        boundary_layer["faces"] = args.bl_faces if args.bl_faces else "all"
+    elif args.bl_faces:
+        print("warning: --bl-faces without --boundary-layer has no effect",
+              file=sys.stderr)
 
     face_tags = sorted(set(args.face_nodeset) | set(args.face_segset)
                        | {t for t, _ in args.spc} | {t for t, _ in args.pressure}
@@ -776,6 +967,7 @@ def main(argv=None) -> int:
         occ_unit=args.unit,
         symmetry=args.sym,
         refinements=args.refinements,
+        boundary_layer=boundary_layer,
         face_sizes=dict(args.face_size),
         defeature_faces=args.defeature,
         collect_faces=face_tags,
@@ -994,6 +1186,18 @@ def main(argv=None) -> int:
             history[key] = ids
     history = history or None
 
+    # masses / springs / rigid bodies / global damping (write_k /
+    # write_k_include only, like contact - kept out of `common` so the
+    # per-part split files omit them)
+    point_masses = tuple(args.point_masses)
+    discretes = tuple(args.springs) + tuple(args.dampers)
+    nodal_rigid_bodies = tuple(args.nodal_rigid_bodies)
+    damping = {"valdmp": args.damping} if args.damping is not None else None
+
+    # geometric rigid walls (sphere/cylinder) join the planar ones
+    rigidwalls = tuple(args.rigidwall) + tuple(args.rigidwall_spheres) \
+        + tuple(args.rigidwall_cylinders)
+
     common = dict(
         element_kind="shell" if is_shell else "solid",
         elform=elform, thickness=thickness,
@@ -1010,10 +1214,17 @@ def main(argv=None) -> int:
         initial_velocity=args.init_velocity,
         define_curves=tuple(args.define_curve),
         prescribed_motion=tuple(args.prescribed_motion),
-        rigidwalls=tuple(args.rigidwall),
+        rigidwalls=rigidwalls,
     )
     if databases:
         common["databases"] = databases
+    if args.midsurface:
+        ms_ts = result.stats.get("midsurface_thicknesses") or ()
+        if len(ms_ts) > 1:
+            # multi-region midsurface: per-region *SECTION_SHELL thicknesses
+            # (region i -> PID args.pid + i)
+            common["part_thickness"] = {args.pid + i: t
+                                        for i, t in enumerate(ms_ts)}
     split_files = []
     if args.split_include:
         split_files = dyna_writer.write_k_include(
@@ -1021,7 +1232,9 @@ def main(argv=None) -> int:
             part_ids=part_ids, part_titles=part_titles,
             contact_fs=contact_fs, contacts=contacts,
             contact_pairs=auto_contact_pairs, cross_sections=cross_sections,
-            history=history, spotwelds=spotwelds, **common)
+            history=history, spotwelds=spotwelds, point_masses=point_masses,
+            discretes=discretes, nodal_rigid_bodies=nodal_rigid_bodies,
+            damping=damping, **common)
         for p, f in split_files:
             print(f"Wrote {f} (mesh fragment, PID {p})")
         print(f"Wrote {out} (master deck with *INCLUDE cards)")
@@ -1031,7 +1244,9 @@ def main(argv=None) -> int:
             part_ids=part_ids, part_titles=part_titles,
             contact_fs=contact_fs, contacts=contacts,
             contact_pairs=auto_contact_pairs, cross_sections=cross_sections,
-            history=history, spotwelds=spotwelds, **common)
+            history=history, spotwelds=spotwelds, point_masses=point_masses,
+            discretes=discretes, nodal_rigid_bodies=nodal_rigid_bodies,
+            damping=damping, **common)
         print(f"Wrote {out}")
         if args.split_parts:
             split_files = dyna_writer.write_k_split(

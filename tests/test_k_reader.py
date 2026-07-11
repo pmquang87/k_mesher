@@ -240,3 +240,296 @@ def test_node_set_continuation_rows(tmp_path):
 
     m = k_reader.read_k(str(path))
     assert m.node_sets[1] == list(range(1, 11))
+
+
+# ---------------------------------------------------------------------------
+# HEX8 solids and the newer keyword cards (hand-written decks: the writer's
+# hex support is being added concurrently, so fixtures don't depend on it).
+# ---------------------------------------------------------------------------
+
+def _hex_deck_nodes() -> str:
+    """12 nodes: two stacked unit cubes sharing the z=1 face (ids 5..8)."""
+    rows = []
+    nid = 0
+    for z in (0.0, 1.0, 2.0):
+        for x, y in ((0, 0), (1, 0), (1, 1), (0, 1)):
+            nid += 1
+            rows.append(f"{nid:8d} {float(x):.1f} {float(y):.1f} {z:.1f}\n")
+    return "".join(rows)
+
+
+HEX_DECK = (
+    "*KEYWORD\n"
+    "*TITLE\n"
+    "hex deck\n"
+    "*NODE\n"
+    "$#   nid               x               y               z\n"
+    + _hex_deck_nodes() +
+    "*ELEMENT_SOLID\n"
+    "$#   eid     pid      n1      n2      n3      n4      n5      n6"
+    "      n7      n8\n"
+    "       1       1       1       2       3       4       5       6"
+    "       7       8\n"
+    "       2       1       5       6       7       8       9      10"
+    "      11      12\n"
+    "*PART\n"
+    "hex part\n"
+    "       1       1       1\n"
+    "*SECTION_SOLID\n"
+    "$#   secid    elform       aet\n"
+    "       1       1       0\n"
+    "*MAT_ELASTIC\n"
+    "       1  7800.0    2.0e11       0.3\n"
+    "*END\n"
+)
+
+
+def test_hex8_deck(tmp_path):
+    path = tmp_path / "hex.k"
+    path.write_text(HEX_DECK)
+
+    m = k_reader.read_k(str(path))
+    assert m.node_count == 12
+    assert len(m.solids) == 2
+    assert m.solids[0] == (1, 1, (1, 2, 3, 4, 5, 6, 7, 8))
+    assert m.solids[1] == (2, 1, (5, 6, 7, 8, 9, 10, 11, 12))
+    assert m.solid_widths == [8]
+    assert m.sections[1]["elform"] == 1
+
+    coords, elems = m.to_arrays("solid")
+    assert coords.shape == (12, 3)
+    assert elems.shape == (2, 8)
+    np.testing.assert_array_equal(elems[0], [1, 2, 3, 4, 5, 6, 7, 8])
+    np.testing.assert_array_equal(elems[1], [5, 6, 7, 8, 9, 10, 11, 12])
+
+
+def test_mixed_tet_hex_to_arrays_raises(tmp_path):
+    deck = (
+        "*KEYWORD\n"
+        "*NODE\n"
+        + _hex_deck_nodes() +
+        "*ELEMENT_SOLID\n"
+        "       1       1       1       2       3       4       5       6"
+        "       7       8\n"
+        "       2       1       9      10      11      12      12      12"
+        "      12      12\n"
+        "*END\n"
+    )
+    path = tmp_path / "mixed.k"
+    path.write_text(deck)
+
+    m = k_reader.read_k(str(path))
+    assert m.solid_widths == [4, 8]
+    with pytest.raises(ValueError, match=r"\[4, 8\]"):
+        m.to_arrays("solid")
+
+
+def test_degenerate_tet_row_still_collapses(tmp_path):
+    deck = (
+        "*KEYWORD\n"
+        "*NODE\n"
+        "       1 0.0 0.0 0.0\n"
+        "       2 1.0 0.0 0.0\n"
+        "       3 0.0 1.0 0.0\n"
+        "       4 0.0 0.0 1.0\n"
+        "*ELEMENT_SOLID\n"
+        "       7       2       1       2       3       4       4       4"
+        "       4       4\n"
+        "*END\n"
+    )
+    path = tmp_path / "degen.k"
+    path.write_text(deck)
+
+    m = k_reader.read_k(str(path))
+    assert m.solids == [(7, 2, (1, 2, 3, 4))]
+    _, elems = m.to_arrays("solid")
+    assert elems.shape == (1, 4)
+
+
+def test_wedge_and_pyramid_rows_collapse(tmp_path):
+    deck = (
+        "*KEYWORD\n"
+        "*NODE\n"
+        "       1 0.0 0.0 0.0\n"
+        "       2 1.0 0.0 0.0\n"
+        "       3 1.0 1.0 0.0\n"
+        "       4 0.0 1.0 0.0\n"
+        "       5 0.0 0.0 1.0\n"
+        "       6 1.0 0.0 1.0\n"
+        "*ELEMENT_SOLID\n"
+        "$ wedge: n5 == n6 and n7 == n8\n"
+        "       1       1       1       2       3       4       5       5"
+        "       6       6\n"
+        "$ pyramid: n5 == n6 == n7 == n8\n"
+        "       2       1       1       2       3       4       5       5"
+        "       5       5\n"
+        "*END\n"
+    )
+    path = tmp_path / "wedge.k"
+    path.write_text(deck)
+
+    m = k_reader.read_k(str(path))
+    assert m.solids[0] == (1, 1, (1, 2, 3, 4, 5, 6))   # wedge -> 6 unique
+    assert m.solids[1] == (2, 1, (1, 2, 3, 4, 5))      # pyramid -> 5 unique
+    assert m.solid_widths == [5, 6]
+
+
+def test_include_transform_recorded_not_resolved(tmp_path):
+    frag = (
+        "*KEYWORD\n"
+        "*NODE\n"
+        "      99 9.0 9.0 9.0\n"
+        "*END\n"
+    )
+    (tmp_path / "frag.k").write_text(frag)
+    deck = (
+        "*KEYWORD\n"
+        "*INCLUDE_TRANSFORM\n"
+        "frag.k\n"
+        "$#  idnoff    ideoff    idpoff    idmoff    idsoff    idfoff    iddoff\n"
+        "      1000      2000       100       100       100         0         0\n"
+        "*NODE\n"
+        "       1 0.0 0.0 0.0\n"
+        "*END\n"
+    )
+    path = tmp_path / "master_tf.k"
+    path.write_text(deck)
+
+    m = k_reader.read_k(str(path), resolve_includes=True)
+    assert m.includes == []                        # NOT a plain *INCLUDE
+    assert "*INCLUDE_TRANSFORM" not in m.unknown_keywords
+    assert m.include_transforms == [
+        {"file": "frag.k", "offsets": [1000, 2000, 100, 100, 100, 0, 0]}]
+    assert m.node_count == 1                       # fragment NOT merged in
+
+
+def test_set_part_list_title(tmp_path):
+    deck = (
+        "*KEYWORD\n"
+        "*SET_PART_LIST_TITLE\n"
+        "impact parts\n"
+        "$#     sid       da1       da2       da3       da4    solver\n"
+        "         5       0.0       0.0       0.0       0.0      MECH\n"
+        "         1         2         3\n"
+        "*SET_NODE_LIST\n"
+        "         9\n"
+        "         7         8\n"
+        "*END\n"
+    )
+    path = tmp_path / "psets.k"
+    path.write_text(deck)
+
+    m = k_reader.read_k(str(path))
+    assert m.part_sets == {5: [1, 2, 3]}
+    assert "*SET_PART_LIST_TITLE" not in m.unknown_keywords
+    assert m.node_sets == {9: [7, 8]}              # node sets untouched
+
+
+def test_new_writer_keywords_are_tolerated(tmp_path):
+    """The cards the writer is gaining must skip cleanly around real data."""
+    deck = (
+        "*KEYWORD\n"
+        "*CONSTRAINED_NODAL_RIGID_BODY\n"
+        "         1         0         1\n"
+        "*ELEMENT_MASS\n"
+        "       1       1     0.5\n"
+        "*ELEMENT_DISCRETE\n"
+        "       1       1       1       2       0     0.0         0     0.0\n"
+        "*SECTION_DISCRETE\n"
+        "         2         0       0.0       0.0       0.0       0.0\n"
+        "*MAT_SPRING_ELASTIC\n"
+        "         3     100.0\n"
+        "*MAT_DAMPER_VISCOUS\n"
+        "         4      10.0\n"
+        "*DAMPING_GLOBAL\n"
+        "         0      0.10\n"
+        "*RIGIDWALL_GEOMETRIC_CYLINDER\n"
+        "         1         0         0         0\n"
+        "       0.0       0.0       0.0       0.0       0.0       1.0\n"
+        "       0.5       2.0\n"
+        "*RIGIDWALL_PLANAR\n"
+        "         2         0         0         0\n"
+        "       0.0       0.0       0.0       0.0       0.0       1.0\n"
+        "*DATABASE_CROSS_SECTION_PLANE\n"
+        "         1\n"
+        "       0.0       0.0       0.0       1.0       0.0       0.0\n"
+        "*DATABASE_HISTORY_NODE\n"
+        "         1         2\n"
+        "*CONSTRAINED_SPOTWELD\n"
+        "         1         2\n"
+        "*INITIAL_VELOCITY_GENERATION\n"
+        "         1         2      10.0\n"
+        "*BOUNDARY_PRESCRIBED_MOTION_SET\n"
+        "         1         1         0         1       1.0\n"
+        "*DEFINE_CURVE\n"
+        "         1\n"
+        "       0.0       0.0\n"
+        "       1.0       1.0\n"
+        "*NODE\n"
+        "       1 0.0 0.0 0.0\n"
+        "       2 1.0 2.0 3.0\n"
+        "*END\n"
+    )
+    path = tmp_path / "cards.k"
+    path.write_text(deck)
+
+    m = k_reader.read_k(str(path))
+    assert m.node_count == 2                       # data after the cards reads
+    assert m.nodes[2] == pytest.approx((1.0, 2.0, 3.0))
+    for kw in ("*CONSTRAINED_NODAL_RIGID_BODY", "*ELEMENT_MASS",
+               "*ELEMENT_DISCRETE", "*SECTION_DISCRETE", "*DAMPING_GLOBAL",
+               "*RIGIDWALL_GEOMETRIC_CYLINDER", "*RIGIDWALL_PLANAR",
+               "*DATABASE_CROSS_SECTION_PLANE", "*DATABASE_HISTORY_NODE",
+               "*CONSTRAINED_SPOTWELD", "*INITIAL_VELOCITY_GENERATION",
+               "*BOUNDARY_PRESCRIBED_MOTION_SET", "*DEFINE_CURVE"):
+        assert kw in m.unknown_keywords, kw
+    # the discrete spring/damper materials hit the generic *MAT_ fallback
+    assert m.materials[3]["type"] == "*MAT_SPRING_ELASTIC"
+    assert m.materials[4]["type"] == "*MAT_DAMPER_VISCOUS"
+
+
+def test_long_format_hex_row(tmp_path):
+    def wide(*vals):
+        return "".join(f"{v:>20}" for v in vals) + "\n"
+
+    deck = (
+        "*KEYWORD LONG=Y\n"
+        "*NODE\n"
+        + "".join(wide(i, f"{x:.6e}", f"{y:.6e}", f"{z:.6e}")
+                  for i, (x, y, z) in enumerate(
+                      [(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0),
+                       (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1)], start=1))
+        + "*ELEMENT_SOLID\n"
+        + wide(1, 1, 1, 2, 3, 4, 5, 6, 7, 8)
+        + "*END\n"
+    )
+    path = tmp_path / "long_hex.k"
+    path.write_text(deck)
+
+    m = k_reader.read_k(str(path))
+    assert m.long_format is True
+    assert m.node_count == 8
+    assert m.solids == [(1, 1, (1, 2, 3, 4, 5, 6, 7, 8))]
+    _, elems = m.to_arrays("solid")
+    assert elems.shape == (1, 8)
+
+
+def test_writer_hex_roundtrip_if_supported(tmp_path):
+    """Optional round-trip through dyna_writer once it grows (M, 8) support."""
+    coords = np.array(
+        [[x, y, z] for z in (0.0, 1.0, 2.0)
+         for x, y in ((0, 0), (1, 0), (1, 1), (0, 1))], float)
+    elems = np.array([[1, 2, 3, 4, 5, 6, 7, 8],
+                      [5, 6, 7, 8, 9, 10, 11, 12]])
+    path = tmp_path / "hex_rt.k"
+    try:
+        dyna_writer.write_k(str(path), coords, elems, element_kind="solid",
+                            pid=1)
+    except (TypeError, ValueError) as exc:
+        pytest.skip(f"dyna_writer does not support (M, 8) solids yet: {exc}")
+
+    m = k_reader.read_k(str(path))
+    assert m.solid_widths == [8]
+    out_coords, out_elems = m.to_arrays("solid")
+    np.testing.assert_allclose(out_coords, coords)
+    np.testing.assert_array_equal(out_elems, elems)

@@ -19,6 +19,7 @@ from k_mesher import mesher
 ELEMENT_TYPES = {
     "TET4 (linear tetrahedron)": "TET4",
     "TET10 (quadratic tetrahedron)": "TET10",
+    "HEX8 (box-like solids only)": "HEX8",
     "Shell TRI3 (triangles)": "TRI3",
     "Shell QUAD4 (quad-dominant)": "QUAD4",
 }
@@ -30,6 +31,10 @@ ELFORMS_BY_ETYPE = {
     "TET10": {
         "16 - 4/5-point quadratic tetrahedron": 16,
         "17 - 10-noded composite tetrahedron": 17,
+    },
+    "HEX8": {
+        "1 - constant stress hexahedron": 1,
+        "2 - fully integrated S/R hexahedron": 2,
     },
     "TRI3": {
         "4 - C0 triangular shell": 4,
@@ -252,6 +257,32 @@ class KMesherGUI:
         self.lst_ref.grid(row=2, column=0, columnspan=4, sticky="ew", pady=3)
         ttk.Button(ref, text="Remove", command=self._remove_refinement
                    ).grid(row=2, column=4, sticky="n", pady=3)
+
+        bl = ttk.LabelFrame(tab, text="Boundary layer (near-wall grading)",
+                            padding=6)
+        bl.grid(row=2, column=0, sticky="ew", **pad)
+        self.var_bl = tk.BooleanVar(value=False)
+        ttk.Checkbutton(bl, text="Grade all faces,  thickness:",
+                        variable=self.var_bl).grid(row=0, column=0, sticky="w")
+        self.var_bl_thickness = tk.StringVar(value="")
+        ttk.Entry(bl, textvariable=self.var_bl_thickness, width=8).grid(
+            row=0, column=1, sticky="w", padx=4)
+        ttk.Label(bl, text="ratio:").grid(row=0, column=2, sticky="w")
+        self.var_bl_ratio = tk.StringVar(value="1.2")
+        ttk.Entry(bl, textvariable=self.var_bl_ratio, width=6).grid(
+            row=0, column=3, sticky="w", padx=4)
+        ttk.Label(bl, text="layers:").grid(row=0, column=4, sticky="w")
+        self.var_bl_layers = tk.StringVar(value="")
+        ttk.Entry(bl, textvariable=self.var_bl_layers, width=5).grid(
+            row=0, column=5, sticky="w", padx=4)
+        ttk.Label(bl, text="wall size:").grid(row=0, column=6, sticky="w")
+        self.var_bl_size_wall = tk.StringVar(value="")
+        ttk.Entry(bl, textvariable=self.var_bl_size_wall, width=8).grid(
+            row=0, column=7, sticky="w", padx=4)
+        ttk.Label(bl, text="(TET/shell only - not HEX8; layers/wall size "
+                           "blank = auto)",
+                  foreground="gray").grid(row=1, column=0, columnspan=8,
+                                          sticky="w")
 
     # ---------------------------------------------------- tab: LS-DYNA ----
     def _build_dyna_tab(self, tab, pad):
@@ -1212,6 +1243,29 @@ class KMesherGUI:
                     if r["tag"] not in face_tags:
                         face_tags.append(r["tag"])
 
+        # boundary layer: near-wall grading on all faces (TET/shell only; the
+        # mesher rejects it for HEX8 with a clear error)
+        boundary_layer = None
+        if self.var_bl.get():
+            bl_thickness = num(self.var_bl_thickness, "Boundary-layer thickness")
+            if bl_thickness <= 0:
+                raise ValueError("Boundary-layer thickness must be > 0.")
+            boundary_layer = {
+                "faces": "all",
+                "thickness": bl_thickness,
+                "ratio": num(self.var_bl_ratio, "Boundary-layer ratio",
+                             minval=1.0),
+            }
+            if self.var_bl_layers.get().strip():
+                boundary_layer["nb_layers"] = integer(
+                    self.var_bl_layers, "Boundary-layer layer count", minval=1)
+            size_wall = opt_num(self.var_bl_size_wall,
+                                "Boundary-layer wall size")
+            if size_wall is not None:
+                if size_wall <= 0:
+                    raise ValueError("Boundary-layer wall size must be > 0.")
+                boundary_layer["size_wall"] = size_wall
+
         etype = ELEMENT_TYPES.get(self.var_etype.get(), "TET4")
         is_shell = mesher.ETYPES[etype]["family"] == "shell"
         settings = mesher.MeshSettings(
@@ -1228,6 +1282,7 @@ class KMesherGUI:
             occ_unit=mesher.OCC_UNITS[self.var_unit.get()],
             symmetry=symmetry,
             refinements=list(self.refinements),
+            boundary_layer=boundary_layer,
             face_sizes=face_sizes,
             defeature_faces=defeature,
             collect_faces=face_tags,
@@ -1456,6 +1511,9 @@ class KMesherGUI:
             "algo": self.var_algo, "unit": self.var_unit,
             "opt": self.var_opt, "heal": self.var_heal, "glue": self.var_glue,
             "autoref": self.var_autoref,
+            "bl": self.var_bl, "bl_thickness": self.var_bl_thickness,
+            "bl_ratio": self.var_bl_ratio, "bl_layers": self.var_bl_layers,
+            "bl_size_wall": self.var_bl_size_wall,
             "etype": self.var_etype, "elform": self.var_elform,
             "pid": self.var_pid, "nid0": self.var_nid0, "eid0": self.var_eid0,
             "sid0": self.var_sid0, "thick": self.var_thick,
