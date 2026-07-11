@@ -140,6 +140,31 @@ _PLATE_THICKNESS_RATIO = 0.25  # max thickness / sqrt(in-plane area)
 _PLATE_THICKNESS_VARIATION = 0.25  # max thickness std/mean before warning that
                                    # the constant-thickness assumption is weak
 
+# Multi-region (stepped) generalization: instead of only the single dominant
+# face pair, faces are greedily paired into thin regions (_detect_plate_regions)
+# so a stepped plate (segments of different thickness side by side) yields one
+# midsurface region per segment.
+_REGION_AREA_FLOOR = 0.02      # pairing candidates: min area / largest face area
+                               # (smaller faces are side/edge faces = noise)
+_REGION_GAP_VARIATION = 0.25   # max gap std/mean for a face pair to count as one
+                               # constant-thickness region (same value as the
+                               # single-pair variation warning threshold)
+_REGION_OVERLAP = 0.8          # min fraction of closest-point samples that must
+                               # land INSIDE the partner face's parametric
+                               # bounds (OCC projects onto the untrimmed
+                               # surface, so this is the actual
+                               # projection-overlap test)
+_REGION_COVERAGE = 0.6         # min (paired face area / total boundary face
+                               # area) for a body to be midsurfaceable via
+                               # regions. For a thin plate the two skins carry
+                               # nearly all of the boundary area (sides are
+                               # ~thickness * perimeter), so genuine stepped
+                               # plates score >0.85; 0.6 leaves headroom for
+                               # ribs/steps while still rejecting blocky solids
+                               # where a mid-surface would misrepresent the
+                               # metal. Below the threshold the caller falls
+                               # back to the single dominant-pair detector.
+
 # quality criteria limits (LS-DYNA practice)
 QUALITY_LIMITS = {
     "solid": {"aspect ratio": ("max", 8.0), "SICN": ("min", 0.2)},
@@ -434,24 +459,37 @@ def _sample_thickness(t_src: int, t_dst: int, n_grid: int = 5):
     for each point, takes the true closest-point distance to ``t_dst`` (via
     OpenCASCADE). This is correct for CURVED faces, where a single plane-to-plane
     distance would be wrong. Returns a dict with the mean/std/min/max gap, the
-    sample count, and ``sign`` - the orientation (+/-1) of ``t_src``'s surface
+    sample count, ``sign`` - the orientation (+/-1) of ``t_src``'s surface
     normal relative to the direction toward ``t_dst`` (so a node can be offset
-    ``sign * half_thickness * normal`` to reach the mid-surface). Returns None if
-    nothing could be sampled."""
+    ``sign * half_thickness * normal`` to reach the mid-surface) - plus two
+    pairing measures used by ``_detect_plate_regions``: ``align``, the |mean| of
+    the dot products between the closest-point directions and ``t_src``'s local
+    normals (1.0 = ``t_dst`` sits squarely across the wall, ~0 = it lies
+    sideways, e.g. a perpendicular side face), and ``inside``, the fraction of
+    closest points whose parametric coordinates fall within ``t_dst``'s
+    parametric bounds. The latter matters because OpenCASCADE projects onto the
+    UNTRIMMED surface, so e.g. two coplanar-parallel faces that do not overlap
+    still measure a clean plane-to-plane gap - only ``inside`` exposes that the
+    projection misses the actual face. Returns None if nothing could be
+    sampled."""
     try:
         pmin, pmax = gmsh.model.getParametrizationBounds(2, t_src)
     except Exception:
         return None
+    try:
+        qmin, qmax = gmsh.model.getParametrizationBounds(2, t_dst)
+    except Exception:
+        qmin = qmax = None
     # skip the parametric border (endpoints) to avoid closest points that land
     # on a shared edge rather than across the wall
     us = np.linspace(pmin[0], pmax[0], n_grid + 2)[1:-1]
     vs = np.linspace(pmin[1], pmax[1], n_grid + 2)[1:-1]
-    dists, dots = [], []
+    dists, dots, n_inside = [], [], 0
     for u in us:
         for v in vs:
             try:
                 p = np.array(gmsh.model.getValue(2, t_src, [u, v]), dtype=float)
-                cp, _ = gmsh.model.getClosestPoint(2, t_dst, p.tolist())
+                cp, cp_uv = gmsh.model.getClosestPoint(2, t_dst, p.tolist())
                 d = np.array(cp, dtype=float) - p
             except Exception:
                 continue
@@ -459,6 +497,13 @@ def _sample_thickness(t_src: int, t_dst: int, n_grid: int = 5):
             if dist <= 0:
                 continue
             dists.append(dist)
+            if qmin is not None and len(cp_uv) >= 2:
+                # 5% parametric slack: periodic seams / reparametrization noise
+                du = 0.05 * (qmax[0] - qmin[0]) + 1e-9
+                dv = 0.05 * (qmax[1] - qmin[1]) + 1e-9
+                if (qmin[0] - du <= cp_uv[0] <= qmax[0] + du
+                        and qmin[1] - dv <= cp_uv[1] <= qmax[1] + dv):
+                    n_inside += 1
             try:
                 nn = np.array(gmsh.model.getNormal(t_src, [u, v])[:3], dtype=float)
                 ln = float(np.linalg.norm(nn))
@@ -470,9 +515,12 @@ def _sample_thickness(t_src: int, t_dst: int, n_grid: int = 5):
         return None
     dists = np.array(dists)
     sign = 1.0 if (not dots or float(np.mean(dots)) >= 0) else -1.0
+    align = float(abs(np.mean(dots))) if dots else 0.0
+    inside = n_inside / len(dists) if qmin is not None else 1.0
     return {"mean": float(dists.mean()), "std": float(dists.std()),
             "min": float(dists.min()), "max": float(dists.max()),
-            "n": int(len(dists)), "sign": sign}
+            "n": int(len(dists)), "sign": sign, "align": align,
+            "inside": float(inside)}
 
 
 def _detect_plate(vol: int):
@@ -498,19 +546,30 @@ def _detect_plate(vol: int):
     shells are handled. Limits: a single dominant face per side (a face split into
     patches is not recognised); near-constant thickness only - a strongly tapered
     wall is reported by its mean gap with a variation warning; no medial-axis
-    midsurfacing of general/branching solids."""
+    midsurfacing of general/branching solids. Stepped bodies with several face
+    pairs are handled by ``_detect_plate_regions``."""
     faces = [t for _, t in gmsh.model.getBoundary([(3, vol)], oriented=False)]
     if len(faces) < 2:
         return None
     props = {t: _face_props(t) for t in faces}
     ordered = sorted(faces, key=lambda t: props[t][0], reverse=True)
     t0, t1 = ordered[0], ordered[1]
-    a0, c0, n0 = props[t0]
-    a1, c1, n1 = props[t1]
+    a0 = props[t0][0]
     if a0 <= 0:
         return None
-    if a1 / a0 < _PLATE_AREA_RATIO:                 # areas not nearly equal
+    if props[t1][0] / a0 < _PLATE_AREA_RATIO:       # areas not nearly equal
         return None
+    return _measure_pair(t0, t1, props)
+
+
+def _measure_pair(t0: int, t1: int, props):
+    """Measure the wall between the dominant face ``t0`` (kept and meshed) and
+    the opposite face ``t1`` (dropped) and build the plate/region record used
+    by ``midsurface_shell`` - the shared core of ``_detect_plate`` and
+    ``_detect_plate_regions``. Returns None if the gap cannot be sampled, is
+    zero, or is too wide relative to sqrt(area(t0)) to count as a thin wall."""
+    a0, c0, n0 = props[t0]
+    a1, c1, n1 = props[t1]
     inplane = float(np.sqrt(a0))
     if inplane <= 0:
         return None
@@ -541,7 +600,8 @@ def _detect_plate(vol: int):
     if thickness / inplane > _PLATE_THICKNESS_RATIO:  # too thick to be a shell
         return None
 
-    det = {"dominant": t0, "thickness": thickness, "thickness_std": t_std,
+    det = {"dominant": t0, "partner": t1, "area": float(a0),
+           "thickness": thickness, "thickness_std": t_std,
            "thickness_min": t_min, "thickness_max": t_max, "curved": not planar,
            "mid_move": np.zeros(3), "offset_sign": 0.0}
     if planar:
@@ -550,6 +610,110 @@ def _detect_plate(vol: int):
     else:
         det["offset_sign"] = sign
     return det
+
+
+def _detect_plate_regions(vol: int) -> list[dict]:
+    """Greedily pair opposing boundary faces of solid ``vol`` into thin,
+    roughly constant-thickness regions - the multi-region (stepped-plate)
+    generalization of ``_detect_plate``. Returns one record per region (same
+    layout as ``_detect_plate``, see ``_measure_pair``), or [] when the body
+    is not midsurfaceable this way (the caller then falls back to the
+    single-pair detector).
+
+    Pairing heuristic: faces are visited by area, descending, skipping faces
+    below a noise floor of ``_REGION_AREA_FLOOR`` of the largest face. Each
+    visited face becomes a region's DOMINANT (kept and meshed) face if a
+    partner of equal-or-larger area is found across the wall - the partner
+    must cover the dominant face, so closest-point sampling FROM the dominant
+    face must show (a) locally opposing walls with overlapping projections:
+    the closest-point directions align with the dominant face's surface
+    normals (align >= _PLATE_PARALLEL, rejecting perpendicular side faces)
+    AND the closest points land inside the partner's parametric bounds
+    (inside >= _REGION_OVERLAP, rejecting non-overlapping parallel faces -
+    OCC projects onto the untrimmed surface, so alignment alone cannot see
+    that); (b) a small gap (mean / sqrt(dominant area) <=
+    _PLATE_THICKNESS_RATIO); (c) a roughly constant gap (std/mean <=
+    _REGION_GAP_VARIATION). Accepted pairs are measured with the exact
+    single-pair math (``_measure_pair``). A face used as a dominant is
+    consumed; a PARTNER may be shared by several regions - that is the
+    stepped/L-bracket case where one merged bottom face lies under several
+    top faces of different heights (each top becomes its own region, all
+    paired with the same bottom). Faces that stay unpaired are side/edge
+    faces (or metal the heuristic cannot represent).
+
+    The body is accepted only when the matched faces cover the dominant share
+    of the metal: (dominant + partner face area) >= ``_REGION_COVERAGE`` of
+    the total boundary-face area (see the constant for the rationale)."""
+    faces = [t for _, t in gmsh.model.getBoundary([(3, vol)], oriented=False)]
+    if len(faces) < 2:
+        return []
+    props = {t: _face_props(t) for t in faces}
+    ordered = sorted(faces, key=lambda t: props[t][0], reverse=True)
+    a_big = props[ordered[0]][0]
+    total_area = sum(props[t][0] for t in faces)
+    if a_big <= 0 or total_area <= 0:
+        return []
+    cand = [t for t in ordered if props[t][0] >= _REGION_AREA_FLOOR * a_big]
+
+    dominated = set()    # faces consumed as a region's dominant face
+    partnered = set()    # faces used as a partner (reusable as partner only)
+    regions = []
+    for t in cand:
+        if t in dominated or t in partnered:
+            continue
+        for p in cand:
+            if p == t or p in dominated:
+                continue
+            if props[p][0] < props[t][0] * (1.0 - 1e-9):
+                continue        # the partner must be able to cover t
+            samp = _sample_thickness(t, p)
+            if samp is None or samp["mean"] <= 0:
+                continue
+            if samp["align"] < _PLATE_PARALLEL:
+                continue        # not locally opposing (e.g. a side face)
+            if samp["inside"] < _REGION_OVERLAP:
+                continue        # projections do not overlap
+            if samp["mean"] / float(np.sqrt(props[t][0])) > _PLATE_THICKNESS_RATIO:
+                continue        # gap too wide to be a wall
+            if samp["std"] / samp["mean"] > _REGION_GAP_VARIATION:
+                continue        # gap not roughly constant
+            det = _measure_pair(t, p, props)
+            if det is None:
+                continue
+            regions.append(det)
+            dominated.add(t)
+            partnered.add(p)
+            break
+    if not regions:
+        return []
+    paired_area = sum(props[t][0] for t in dominated | partnered)
+    if paired_area / total_area < _REGION_COVERAGE:
+        return []
+    return regions
+
+
+def _region_elem_parts(region_of_face: dict, n_elems: int):
+    """Per-element 0-based region index for the extracted midsurface mesh,
+    aligned with the row order of ``_extract_shells`` (which stacks all TRI3
+    elements, then all QUAD4 elements; within each type gmsh returns the
+    global element list grouped by face in entity-tag order). Returns None if
+    the per-face counts do not add up to ``n_elems`` (the caller then keeps a
+    single part rather than mislabel elements)."""
+    blocks = []
+    for gtype in (GMSH_TRI3, GMSH_QUAD4):
+        for _, tag in sorted(gmsh.model.getEntities(2)):
+            try:
+                etags, _ = gmsh.model.mesh.getElementsByType(gtype, tag)
+            except Exception:
+                continue
+            if len(etags) == 0:
+                continue
+            blocks.append(np.full(len(etags), region_of_face.get(tag, 0),
+                                  dtype=np.int64))
+    if not blocks:
+        return None
+    parts = np.concatenate(blocks)
+    return parts if len(parts) == n_elems else None
 
 
 def _offset_shell_nodes(tag: int, dist: float, sign: float, log) -> None:
@@ -592,29 +756,45 @@ def midsurface_shell(settings: MeshSettings, log=print,
     thickness - both FLAT plates and CURVED (bent/cylindrical) shells, the common
     sheet-metal cases - and set the shell thickness from the measured wall gap.
 
-    For every solid body the detector looks for two dominant boundary faces of
-    nearly equal area a small, roughly constant gap apart; that gap (measured by
-    closest-point sampling between the faces, so it is correct for curved walls)
-    is the wall thickness. A FLAT plate's dominant face is translated to the
-    mid-plane and meshed; a CURVED shell's dominant face is meshed and each node
-    is then offset inward by half the wall thickness along the local surface
-    normal, so the shell lands on the true mid-surface. Bodies that are not
-    thin-shell-like are skipped with a warning; if none qualifies a RuntimeError
-    is raised.
+    For every solid body the detector greedily pairs opposing boundary faces
+    into thin regions (``_detect_plate_regions``): a plain plate/shell yields
+    one region (the two dominant faces), a STEPPED plate (segments of different
+    thickness side by side) yields one region per segment. Each region's gap
+    (measured by closest-point sampling between its faces, so it is correct for
+    curved walls) is that region's wall thickness. A FLAT region's dominant face
+    is translated to its mid-plane and meshed; a CURVED region's dominant face
+    is meshed and each node is then offset inward by half the wall thickness
+    along the local surface normal, so the shell lands on the true mid-surface.
+    If region pairing does not cover the body (paired area < ``_REGION_COVERAGE``
+    of the boundary), the single dominant-pair detector (``_detect_plate``) is
+    tried as a fallback; bodies that still do not qualify are skipped with a
+    warning, and if none qualifies a RuntimeError is raised.
 
-    The measured thickness is reported as ``stats["midsurface_thickness"]`` (the
-    mean over bodies) and ``stats["midsurface_thicknesses"]`` (per body); the
-    per-body mean/std/min/max and a curved flag are in
-    ``stats["midsurface_thickness_stats"]``. Feed the thickness to
-    ``dyna_writer.write_k(..., element_kind="shell", thickness=...)``.
+    Parts: with a single region the result is one part (``part_names == [""]``,
+    ``elem_parts`` all 0), exactly as before. With several regions each region
+    becomes its own part - ``elem_parts`` holds the 0-based region index
+    (regions numbered per body, flattened across bodies in body order) and
+    ``part_names`` reads ``"body<i>_region<j>"`` (1-based). Region midsurfaces
+    are meshed independently, so they do NOT share nodes where regions meet
+    (their midplanes are offset by the thickness jump anyway) - tie them in the
+    solver (tied contact / *CONSTRAINED_NODAL_RIGID_BODY); a NOTE is logged.
 
-    Approximation / limits: constant-thickness only - the offset uses one mean
-    wall thickness per body, so a strongly tapered wall is meshed at its mean gap
-    (with a variation warning); each body must present a single dominant face per
-    side (a face split into patches is not recognised); no medial-axis
-    midsurfacing of general/branching solids. For a genuinely constant-thickness
-    plate or shell the result is the true mid-surface; the reported thickness is
-    the measured wall gap.
+    The measured thickness is reported as ``stats["midsurface_thickness"]``
+    (the area-weighted mean over regions - identical to the region thickness
+    for single-region bodies) and ``stats["midsurface_thicknesses"]`` (per
+    region, in ``elem_parts`` order); the per-region mean/std/min/max and a
+    curved flag are in ``stats["midsurface_thickness_stats"]``. Feed the
+    thickness(es) to ``dyna_writer.write_k(..., element_kind="shell",
+    thickness=...)`` - or, for stepped results, one thickness per part via
+    ``write_k(..., part_thickness={pid: t, ...})``.
+
+    Approximation / limits: constant-thickness only per region - the offset
+    uses one mean wall thickness per region, so a strongly tapered wall is
+    meshed at its mean gap (with a variation warning); each region needs a
+    single dominant face per side (a face split into patches pairs only its
+    largest patch); no medial-axis midsurfacing of general/branching solids.
+    For genuinely constant-thickness regions the result is the true
+    mid-surface; the reported thickness is the measured wall gap.
 
     ``settings.element_type`` selects the shell element when it is a shell type
     (TRI3/QUAD4); otherwise TRI3 is used. Symmetry/refinement/defeature options
@@ -637,26 +817,49 @@ def midsurface_shell(settings: MeshSettings, log=print,
             occ = gmsh.model.occ
             vols = [t for _, t in gmsh.model.getEntities(3)]
 
-            plates = []
+            plates = []          # flattened region records across bodies
+            region_names = []    # part name per region ("body<i>_region<j>")
+            n_bodies = 0
+            multi_region = False
             for v in vols:
-                det = _detect_plate(v)
-                if det is None:
+                regions = _detect_plate_regions(v)
+                if len(regions) == 1:
+                    # a single-pair body: route it through the legacy
+                    # single-pair detector when it found the same face pair,
+                    # so the behavior (dominant = LARGEST face) stays
+                    # byte-identical to the pre-region code
+                    det = _detect_plate(v)
+                    if det is not None and (
+                            {det["dominant"], det["partner"]}
+                            == {regions[0]["dominant"], regions[0]["partner"]}):
+                        regions = [det]
+                elif not regions:
+                    det = _detect_plate(v)   # single dominant-pair fallback
+                    regions = [det] if det is not None else []
+                if not regions:
                     log(f"WARNING: solid {v} is not plate-like (no pair of "
                         f"large, nearly parallel faces of equal area a small "
                         f"gap apart) - skipped for midsurface extraction")
-                else:
-                    plates.append(det)
+                    continue
+                n_bodies += 1
+                if len(regions) > 1:
+                    multi_region = True
+                for i, det in enumerate(regions):
+                    where = (f"solid {v}" if len(regions) == 1
+                             else f"solid {v} region {i + 1}/{len(regions)}")
                     kind = "curved shell" if det["curved"] else "flat plate"
-                    log(f"{kind} solid {v}: wall thickness "
+                    log(f"{kind} {where}: wall thickness "
                         f"{det['thickness']:.4g} (min {det['thickness_min']:.4g}, "
                         f"max {det['thickness_max']:.4g})")
                     if det["thickness"] > 0 and (det["thickness_std"]
                             / det["thickness"]) > _PLATE_THICKNESS_VARIATION:
-                        log(f"  WARNING: wall thickness of solid {v} varies a "
+                        log(f"  WARNING: wall thickness of {where} varies a "
                             f"lot (std/mean "
                             f"{det['thickness_std'] / det['thickness']:.2f}) - "
                             f"the constant-thickness assumption is weak; using "
                             f"the mean {det['thickness']:.4g}")
+                    region_names.append(f"body{n_bodies}_region{i + 1}")
+                    plates.append(det)
             if not plates:
                 raise RuntimeError(
                     "No plate-like solid found. Midsurface extraction handles "
@@ -665,9 +868,15 @@ def midsurface_shell(settings: MeshSettings, log=print,
                     "sheet-metal case). This model looks like a general/blocky "
                     "solid. Mesh it with solids or boundary shells instead, or "
                     "export the midsurface from CAD.")
+            if multi_region:
+                log("NOTE: stepped-region midsurfaces are meshed independently "
+                    "and are unconnected at the steps - no nodes are shared "
+                    "between regions (the thickness jump offsets the "
+                    "neighbouring midplanes anyway). Tie the regions in the "
+                    "solver, e.g. tied contact or a nodal rigid body.")
 
             # drop the volumes (keeping their faces), then keep only one
-            # dominant face per plate and move it to the mid-plane
+            # dominant face per region and move it to the mid-plane
             if vols:
                 occ.remove([(3, v) for v in vols], recursive=False)
                 occ.synchronize()
@@ -700,21 +909,42 @@ def midsurface_shell(settings: MeshSettings, log=print,
                                         det["offset_sign"], log)
 
             coords, elems, elem_parts, part_names, _, checks = _extract_shells(log)
+            if len(plates) > 1:
+                # one part per region (0-based region index, flattened across
+                # bodies); single-region results keep the one unnamed part
+                region_of_face = {d["dominant"]: i for i, d in enumerate(plates)}
+                parts = _region_elem_parts(region_of_face, len(elems))
+                if parts is not None:
+                    elem_parts, part_names = parts, region_names
+                else:
+                    log("WARNING: could not attribute the shell elements to "
+                        "their regions - keeping a single part")
             sym_nodes: dict = {}
             stats = _collect_stats(coords, elems, shell_type, bbox, elem_parts)
             stats.update(checks)
             stats["duplicate_nodes"] = _count_duplicate_nodes(coords)
             thicknesses = [float(d["thickness"]) for d in plates]
+            areas = [float(d.get("area", 0.0)) for d in plates]
             stats["midsurface_thicknesses"] = thicknesses
-            stats["midsurface_thickness"] = float(np.mean(thicknesses))
+            # area-weighted mean (backward compatible: equals the region
+            # thickness for single-region bodies)
+            stats["midsurface_thickness"] = float(
+                np.average(thicknesses, weights=areas) if sum(areas) > 0
+                else np.mean(thicknesses))
             stats["midsurface_thickness_stats"] = [
                 {"mean": float(d["thickness"]), "std": float(d["thickness_std"]),
                  "min": float(d["thickness_min"]), "max": float(d["thickness_max"]),
                  "curved": bool(d["curved"])} for d in plates]
             _log_stats(stats, sym_nodes, log)
-            log(f"Midsurface shell from {len(plates)} plate body(ies); "
-                f"thickness {stats['midsurface_thickness']:.4g} (per body: "
-                f"{', '.join(f'{t:.4g}' for t in thicknesses)})")
+            per = ", ".join(f"{t:.4g}" for t in thicknesses)
+            if multi_region:
+                log(f"Midsurface shell from {len(plates)} region(s) in "
+                    f"{n_bodies} plate body(ies); thickness "
+                    f"{stats['midsurface_thickness']:.4g} (per region: {per})")
+            else:
+                log(f"Midsurface shell from {len(plates)} plate body(ies); "
+                    f"thickness {stats['midsurface_thickness']:.4g} (per body: "
+                    f"{per})")
 
             for out_path in (([preview_path] if preview_path else [])
                              + list(export_paths)):

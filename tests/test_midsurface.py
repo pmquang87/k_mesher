@@ -182,5 +182,157 @@ def test_midsurface_curved_thickness_roundtrip(half_cyl_step):
     assert abs(t1 - 2.0) < 0.05
 
 
+# --------------------------------------------------------------------------
+# multi-region (stepped) midsurfacing + per-part shell thickness in write_k
+# --------------------------------------------------------------------------
+
+def _make_stepped_step(path: str) -> None:
+    """Write a stepped plate to `path` as STEP: two boxes of different
+    thickness fused side by side - 60x40x2 (y in [0, 40]) and 60x40x4
+    (y in [40, 80]) - sharing the 60-long edge. Yields TWO thin regions
+    (mid-planes at z=1 and z=2)."""
+    gmsh.initialize()
+    try:
+        occ = gmsh.model.occ
+        b1 = occ.addBox(0.0, 0.0, 0.0, 60.0, 40.0, 2.0)
+        b2 = occ.addBox(0.0, 40.0, 0.0, 60.0, 40.0, 4.0)
+        occ.fuse([(3, b1)], [(3, b2)])
+        occ.synchronize()
+        gmsh.write(path)
+    finally:
+        gmsh.finalize()
+
+
+@pytest.fixture(scope="module")
+def stepped_step():
+    os.makedirs(OUT, exist_ok=True)
+    path = os.path.join(OUT, "midsurf_stepped.step")
+    _make_stepped_step(path)
+    return path
+
+
+@pytest.fixture(scope="module")
+def stepped_result(stepped_step):
+    logs = []
+    res = mesher.midsurface_shell(
+        mesher.MeshSettings(step_file=stepped_step, size_max=8.0),
+        log=logs.append)
+    return res, logs
+
+
+def test_midsurface_stepped_plate(stepped_result):
+    res, logs = stepped_result
+
+    # accepted as a shell mesh
+    assert res.elems.ndim == 2 and res.elems.shape[1] == 4
+    assert res.stats["measure_label"] == "area"
+    assert res.stats["n_elems"] > 0
+
+    # TWO regions with per-region thicknesses ~ {2, 4}
+    ths = res.stats["midsurface_thicknesses"]
+    assert sorted(ths) == pytest.approx([2.0, 4.0], abs=1e-6)
+    assert len(res.stats["midsurface_thickness_stats"]) == 2
+    assert all(s["curved"] is False
+               for s in res.stats["midsurface_thickness_stats"])
+
+    # backward-compatible mean thickness: area-weighted (equal areas -> 3.0)
+    assert res.stats["midsurface_thickness"] == pytest.approx(3.0, abs=1e-6)
+
+    # one part per region with plausible element counts and region names
+    assert set(np.unique(res.elem_parts).tolist()) == {0, 1}
+    assert set(res.part_names) == {"body1_region1", "body1_region2"}
+    counts = np.bincount(res.elem_parts)
+    assert counts.min() >= 10
+
+    # each region's shell area ~ 60*40, total ~ 2 * 2400
+    assert res.stats["part_measures"] == pytest.approx([2400.0, 2400.0],
+                                                       rel=0.02)
+    assert abs(res.stats["measure"] - 4800.0) / 4800.0 < 0.02
+
+    # each region sits on ITS mid-plane: z = 1 (2-thick) and z = 2 (4-thick)
+    z = np.unique(np.round(res.coords[:, 2], 6))
+    assert set(z.tolist()) == {1.0, 2.0}
+
+    # honesty NOTE: the regions are meshed independently, not stitched
+    assert any("unconnected at the steps" in m for m in logs)
+
+
+def test_midsurface_stepped_part_thickness_writer(stepped_result):
+    res, _ = stepped_result
+    ths = res.stats["midsurface_thicknesses"]
+    part_ids = res.elem_parts + 1                # region i -> pid i + 1
+    pt = {i + 1: float(t) for i, t in enumerate(ths)}
+
+    k = os.path.join(OUT, "midsurf_stepped.k")
+    dyna_writer.write_k(k, res.coords, res.elems, element_kind="shell",
+                        part_ids=part_ids, part_thickness=pt,
+                        thickness=res.stats["midsurface_thickness"])
+    lines = open(k).read().splitlines()
+
+    # one *SECTION_SHELL per part, each with its region's thickness
+    sec_idx = [i for i, ln in enumerate(lines) if ln == "*SECTION_SHELL"]
+    assert len(sec_idx) == 2
+    secs = {int(lines[i + 2][0:10]): float(lines[i + 4][0:10])
+            for i in sec_idx}
+    assert secs == pytest.approx(pt, abs=1e-3)
+    assert sorted(round(v, 3) for v in secs.values()) == [2.0, 4.0]
+
+    # each *PART references its own SECID (= its pid)
+    part_idx = [i for i, ln in enumerate(lines) if ln == "*PART"]
+    assert len(part_idx) == 2
+    for i in part_idx:
+        card = lines[i + 3]
+        assert int(card[10:20]) == int(card[0:10])
+
+
+def test_write_k_default_section_unchanged(plate_step):
+    # golden-line check: without part_thickness the single shared section and
+    # the *PART SECID are byte-identical to the historical output
+    res = mesher.midsurface_shell(
+        mesher.MeshSettings(step_file=plate_step, size_max=15.0), log=QUIET)
+    th = res.stats["midsurface_thickness"]
+
+    k = os.path.join(OUT, "midsurf_plate_default.k")
+    dyna_writer.write_k(k, res.coords, res.elems, element_kind="shell",
+                        thickness=th)
+    lines = open(k).read().splitlines()
+
+    assert lines.count("*SECTION_SHELL") == 1
+    i = lines.index("*SECTION_SHELL")
+    assert lines[i:i + 5] == [
+        "*SECTION_SHELL",
+        "$#   secid    elform      shrf       nip     propt"
+        "   qr/irid     icomp     setyp",
+        f"{1:10d}{2:10d}{0.8333:10.4f}{5:10d}{1.0:10.1f}"
+        f"{0:10d}{0:10d}{1:10d}",
+        "$#      t1        t2        t3        t4      nloc"
+        "     marea      idof    edgset",
+        f"{th:10.4g}" * 4,
+    ]
+    j = lines.index("*PART")
+    card = lines[j + 3]
+    assert int(card[0:10]) == 1 and int(card[10:20]) == 1
+
+
+def test_write_k_split_part_thickness(stepped_result):
+    # write_k_split forwards part_thickness via **kw: each split file's single
+    # part gets its own section thickness
+    res, _ = stepped_result
+    ths = res.stats["midsurface_thicknesses"]
+    pt = {i + 1: float(t) for i, t in enumerate(ths)}
+
+    base = os.path.join(OUT, "midsurf_stepped_split.k")
+    written = dyna_writer.write_k_split(
+        base, res.coords, res.elems, part_ids=res.elem_parts + 1,
+        element_kind="shell", part_thickness=pt, thickness=9.9)
+    assert sorted(p for p, _ in written) == [1, 2]
+    for p, path in written:
+        lines = open(path).read().splitlines()
+        assert lines.count("*SECTION_SHELL") == 1
+        i = lines.index("*SECTION_SHELL")
+        assert int(lines[i + 2][0:10]) == p
+        assert float(lines[i + 4][0:10]) == pytest.approx(pt[p], abs=1e-3)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

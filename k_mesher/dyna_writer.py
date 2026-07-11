@@ -109,6 +109,26 @@ def write_k(
                                        # the usual alternative), TET10->16,
                                        # shell->2)
     thickness: float = 1.0,    # shell thickness (shells only)
+    part_thickness: dict[int, float] | None = None,  # shells only: per-part
+                               # thickness (pid -> t), e.g. for stepped
+                               # midsurfaces where every region/part has its
+                               # own wall thickness. When set, one
+                               # *SECTION_SHELL is written per listed part
+                               # (SECID = that part's pid, same elform/NIP/
+                               # SHRF as the base section, its own thickness)
+                               # and that *PART's SECID points at it; parts
+                               # WITHOUT an entry keep the base section
+                               # (SECID = pid, `thickness`). Corner case: if
+                               # some parts have no entry while `pid` itself
+                               # does, the pid entry's section doubles as the
+                               # base (its thickness wins). None (default) ->
+                               # the single shared section, byte-identical
+                               # output. IGNORED for solids (*SECTION_SOLID
+                               # has no thickness). Forwarded by
+                               # write_k_include (the master deck carries the
+                               # sections) and by write_k_split (each split
+                               # file's single part uses its own entry)
+                               # via **kw.
     start_nid: int = 1,
     start_eid: int = 1,
     start_sid: int = 1,        # first set id (node/segment/SPC/element sets)
@@ -341,13 +361,19 @@ def write_k(
                 _write_control_energy(f, w)
 
             # --- PART / SECTION / MAT ---------------------------------------
+            # per-part shell sections: a part with a part_thickness entry gets
+            # its own *SECTION_SHELL (SECID = its pid); everything else shares
+            # the base section (SECID = pid). Solids ignore part_thickness.
+            own_section = (set() if element_kind != "shell" or not part_thickness
+                           else {p for p in unique_pids if p in part_thickness})
             for p in unique_pids:
                 mid = p if p in part_mats else pid
+                secid = p if p in own_section else pid
                 f.write("*PART\n")
                 f.write(f"{part_titles.get(p, f'part {p}')[:70]}\n")
                 f.write("$#     pid     secid       mid     eosid      hgid"
                         "      grav    adpopt      tmid\n")
-                f.write(w.ints(p, pid, mid, 0, hgid, 0, 0, 0) + "\n")
+                f.write(w.ints(p, secid, mid, 0, hgid, 0, 0, 0) + "\n")
 
             # one material card per referenced MID; per-part materials
             # override the global one for their pid
@@ -367,15 +393,25 @@ def write_k(
                 f.write("$#   secid    elform       aet\n")
                 f.write(w.ints(pid, elform, 0) + "\n")
             else:
-                f.write("*SECTION_SHELL\n")
-                f.write("$#   secid    elform      shrf       nip     propt"
-                        "   qr/irid     icomp     setyp\n")
-                f.write(f"{pid:{w.f}d}{elform:{w.f}d}{0.8333:{w.f}.4f}"
-                        f"{5:{w.f}d}{1.0:{w.f}.1f}{0:{w.f}d}{0:{w.f}d}"
-                        f"{1:{w.f}d}\n")
-                f.write("$#      t1        t2        t3        t4      nloc"
-                        "     marea      idof    edgset\n")
-                f.write(f"{thickness:{w.f}.4g}" * 4 + "\n")
+                # base section first (when some part still references SECID=pid
+                # and pid has no entry of its own), then one section per
+                # part_thickness entry, in part order
+                base_needed = (any(p not in own_section for p in unique_pids)
+                               or not unique_pids)
+                sections = ([(pid, thickness)]
+                            if base_needed and pid not in own_section else [])
+                sections += [(p, float(part_thickness[p]))
+                             for p in unique_pids if p in own_section]
+                for secid, t in sections:
+                    f.write("*SECTION_SHELL\n")
+                    f.write("$#   secid    elform      shrf       nip     propt"
+                            "   qr/irid     icomp     setyp\n")
+                    f.write(f"{secid:{w.f}d}{elform:{w.f}d}{0.8333:{w.f}.4f}"
+                            f"{5:{w.f}d}{1.0:{w.f}.1f}{0:{w.f}d}{0:{w.f}d}"
+                            f"{1:{w.f}d}\n")
+                    f.write("$#      t1        t2        t3        t4      nloc"
+                            "     marea      idof    edgset\n")
+                    f.write(f"{t:{w.f}.4g}" * 4 + "\n")
 
             for mid in sorted(mats_by_mid):
                 m = mats_by_mid[mid]
@@ -620,7 +656,9 @@ def write_k_include(
     cards plus everything else (PART/SECTION/MAT, contact, control cards,
     sets, BCs and loads, all referencing the global ids). Editing or
     re-exporting one part's fragment leaves the rest of the assembly files
-    untouched. Returns [(pid, fragment path), ...].
+    untouched. Remaining write_k options (e.g. per-part shell
+    ``part_thickness``) are forwarded to the master deck via ``**kw``.
+    Returns [(pid, fragment path), ...].
     """
     part_ids = np.asarray(part_ids, dtype=np.int64)
     part_titles = part_titles or {}
@@ -692,8 +730,11 @@ def write_k_split(
     start IDs for that). Node/segment/element sets are filtered to the part
     and renumbered; sets that end up empty are omitted. The part's own
     material (``part_mats`` falling back to ``mat``) is written with
-    SECID = MID = PID. Contact cards are skipped - contact acts between
-    parts. Returns [(pid, file path), ...] in part order.
+    SECID = MID = PID. A per-part shell ``part_thickness`` map (via ``**kw``)
+    is honoured naturally: each split file holds a single part with
+    pid = SECID = p, so its *SECTION_SHELL uses ``part_thickness[p]`` when
+    present, else the base ``thickness``. Contact cards are skipped - contact
+    acts between parts. Returns [(pid, file path), ...] in part order.
     """
     part_ids = np.asarray(part_ids, dtype=np.int64)
     part_titles = part_titles or {}

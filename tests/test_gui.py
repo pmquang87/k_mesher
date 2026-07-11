@@ -315,3 +315,80 @@ def test_connections_settings_round_trip(app):
     assert app.var_connect_mode.get() == "Tied contact"
     assert app.var_connect_tol.get() == "0.25"
     assert app.var_connect_fs.get() == "0.2"
+
+
+HEX8_LABEL = next(k for k, v in gui.ELEMENT_TYPES.items() if v == "HEX8")
+
+
+def test_hex8_etype_and_elforms(app):
+    _ensure_geometry()
+    assert "HEX8" in gui.ELEMENT_TYPES.values()
+    assert set(gui.ELFORMS_BY_ETYPE["HEX8"].values()) == {1, 2}
+    app.var_etype.set(HEX8_LABEL)
+    app._sync_elforms()
+    values = list(app.cmb_elform["values"])
+    assert [gui.ELFORMS_ALL[v] for v in values] == [1, 2]
+    assert app.var_elform.get() == values[0]
+    # thickness stays disabled for solids (same as TET4)
+    assert str(app.ent_thick.cget("state")) == "disabled"
+    settings, _, kopts = app._collect_inputs(need_out=False)
+    assert settings.element_type == "HEX8"
+    assert kopts["element_kind"] == "solid"
+    assert kopts["elform"] == 1
+
+
+def test_boundary_layer_default_off(app):
+    _ensure_geometry()
+    settings, _, _ = app._collect_inputs(need_out=False)
+    assert settings.boundary_layer is None
+
+
+def test_boundary_layer_wiring(app):
+    _ensure_geometry()
+    app.var_bl.set(True)
+    app.var_bl_thickness.set("2")
+    # ratio keeps its 1.2 default; optional fields blank -> omitted
+    settings, _, _ = app._collect_inputs(need_out=False)
+    assert settings.boundary_layer == {"faces": "all", "thickness": 2.0,
+                                       "ratio": 1.2}
+    app.var_bl_layers.set("5")
+    app.var_bl_size_wall.set("0.4")
+    settings, _, _ = app._collect_inputs(need_out=False)
+    assert settings.boundary_layer == {"faces": "all", "thickness": 2.0,
+                                       "ratio": 1.2, "nb_layers": 5,
+                                       "size_wall": 0.4}
+
+
+def test_boundary_layer_validation(app):
+    _ensure_geometry()
+    app.var_bl.set(True)
+    app.var_bl_thickness.set("0")       # thickness must be > 0
+    with pytest.raises(ValueError):
+        app._collect_inputs(need_out=False)
+    app.var_bl_thickness.set("2")
+    app.var_bl_ratio.set("0.9")         # ratio must be >= 1
+    with pytest.raises(ValueError):
+        app._collect_inputs(need_out=False)
+
+
+def test_boundary_layer_settings_round_trip(app):
+    _ensure_geometry()
+    app.var_bl.set(True)
+    app.var_bl_thickness.set("1.5")
+    app.var_bl_ratio.set("1.3")
+    app.var_bl_layers.set("4")
+    app.var_bl_size_wall.set("0.2")
+    data = app._collect_settings_data()
+    for key in ("bl", "bl_thickness", "bl_ratio", "bl_layers", "bl_size_wall"):
+        assert key in data
+    app.var_bl.set(False)
+    app.var_bl_thickness.set("")
+    app.var_bl_ratio.set("1.2")
+    app.var_bl_layers.set("")
+    app.var_bl_size_wall.set("")
+    app._apply_settings_data(data)
+    assert app.var_bl.get() is True
+    assert app.var_bl_thickness.get() == "1.5"
+    assert app.var_bl_ratio.get() == "1.3"
+    assert app.var_bl_layers.get() == "4"
+    assert app.var_bl_size_wall.get() == "0.2"
