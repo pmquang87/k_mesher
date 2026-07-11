@@ -1415,6 +1415,103 @@ def test_job_runner_midsurface_and_connect():
     print("OK: midsurface shell + spotweld + tied contact via run_job kopts")
 
 
+def test_cli_auto_contact():
+    print("=== CLI: --auto-contact (per-pair scoped contact) ===")
+    _ensure_geometry()
+    # STEP2 is two boxes touching at x=20; UNglued -> two bodies with a
+    # detectable interface -> one scoped contact for the touching pair
+    k_cli = os.path.join(OUT_DIR, "cli_auto_contact.k")
+    rc = mesh_cli.main([STEP2, "-o", k_cli, "--size-max", "8",
+                        "--auto-contact"])
+    assert rc == 0
+    _, _, _, kws = parse_k(k_cli)
+    assert "*CONTACT_AUTOMATIC_SURFACE_TO_SURFACE" in kws, \
+        "auto-contact must scope a surface-to-surface contact"
+    assert "*SET_PART_LIST_TITLE" in kws, "scoped contact uses part-list sets"
+    # an explicit TYPE picks the contact keyword
+    k_cli2 = os.path.join(OUT_DIR, "cli_auto_contact_tied.k")
+    rc2 = mesh_cli.main([STEP2, "-o", k_cli2, "--size-max", "8",
+                         "--auto-contact", "tied_surface_to_surface"])
+    assert rc2 == 0
+    _, _, _, kws2 = parse_k(k_cli2)
+    assert "*CONTACT_TIED_SURFACE_TO_SURFACE" in kws2
+    # single body -> warn, no contact card
+    k_cli3 = os.path.join(OUT_DIR, "cli_auto_contact_single.k")
+    rc3 = mesh_cli.main([STEP, "-o", k_cli3, "--size-max", "10",
+                         "--auto-contact"])
+    assert rc3 == 0
+    _, _, _, kws3 = parse_k(k_cli3)
+    assert not any(k.startswith("*CONTACT_") for k in kws3), \
+        "single-body model must not get a contact card"
+    print("OK: scoped per-pair contact, type choice, single-body warns")
+
+
+def test_cli_cross_section_and_history():
+    print("=== CLI: --cross-section + --history-node ===")
+    _ensure_geometry()
+    k_cli = os.path.join(OUT_DIR, "cli_cross_hist.k")
+    rc = mesh_cli.main([STEP, "-o", k_cli, "--size-max", "10", "--mat",
+                        "--cross-section", "0:0:0:1:0:0:MIDCUT",
+                        "--history-node", "1,2,3", "--d3plot-dt", "1e-4"])
+    assert rc == 0
+    _, _, _, kws = parse_k(k_cli)
+    assert "*DATABASE_CROSS_SECTION_PLANE" in kws, "cross-section plane card"
+    assert "*DATABASE_SECFORC" in kws, "SECFORC must be added automatically"
+    assert "*DATABASE_HISTORY_NODE" in kws, "history node card"
+    txt = open(k_cli).read()
+    assert "MIDCUT" in txt, "cross-section title must appear"
+    print("OK: cross-section plane + auto SECFORC + history node")
+
+
+def test_cli_mat_model():
+    print("=== CLI: --mat-model (plasticity in place of --mat) ===")
+    _ensure_geometry()
+    k_cli = os.path.join(OUT_DIR, "cli_mat_model.k")
+    rc = mesh_cli.main([
+        STEP, "-o", k_cli, "--size-max", "10",
+        "--mat-model", "plastic_kinematic:210000:0.3:7.85e-9:1000:200"])
+    assert rc == 0
+    _, _, _, kws = parse_k(k_cli)
+    assert "*MAT_PLASTIC_KINEMATIC" in kws, "kinematic plasticity card"
+    assert "*MAT_ELASTIC" not in kws, "mat-model replaces the elastic card"
+    k_cli2 = os.path.join(OUT_DIR, "cli_mat_model_pw.k")
+    rc2 = mesh_cli.main([
+        STEP, "-o", k_cli2, "--size-max", "10",
+        "--mat-model", "piecewise:210000:0.3:7.85e-9:1000"])
+    assert rc2 == 0
+    _, _, _, kws2 = parse_k(k_cli2)
+    assert "*MAT_PIECEWISE_LINEAR_PLASTICITY" in kws2
+    print("OK: plastic_kinematic + piecewise via --mat-model")
+
+
+def test_job_runner_auto_contact():
+    print("=== job_runner: auto_connect mode 'contact' ===")
+    from k_mesher import job_runner
+    _ensure_geometry()
+    base = {
+        "pid": 1, "elform": 10, "element_kind": "solid", "thickness": 1.0,
+        "start_nid": 1, "start_eid": 1, "start_sid": 1,
+        "sym_nodeset": False, "sym_spc": False, "sym_constraint": "symmetric",
+        "sym_dofs": "", "sym_segset": False,
+        "mat": dict(STEEL), "part_mats": {},
+        "face_nodesets": False, "face_segsets": False, "face_roles": [],
+        "plain_faces": [], "face_titles": {}, "coord_sets": [],
+        "implicit_cards": False, "qa_sets": False, "mesh_only": False,
+        "split_mode": None, "contact_fs": None, "tssfac": None,
+        "gravity": None,
+    }
+    kopts = {**base, "auto_connect": {"mode": "contact", "tol": None,
+                                      "ctype": "automatic_surface_to_surface",
+                                      "fs": 0.0}}
+    out = os.path.join(OUT_DIR, "runner_contact.k")
+    job_runner.run_job(mesher.MeshSettings(step_file=STEP2, size_max=8.0),
+                       out, kopts, log=QUIET)
+    _, _, _, kws = parse_k(out)
+    assert "*CONTACT_AUTOMATIC_SURFACE_TO_SURFACE" in kws
+    assert "*SET_PART_LIST_TITLE" in kws
+    print("OK: scoped per-pair contact via run_job auto_connect 'contact'")
+
+
 def main():
     tests = [(name, fn) for name, fn in sorted(globals().items())
              if name.startswith("test_") and callable(fn)]

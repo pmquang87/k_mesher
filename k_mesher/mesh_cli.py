@@ -21,6 +21,9 @@ Examples:
     python mesh_cli.py part.stl --etype tet4 --nset plane,z,0,spc=123 \
                                 --nset sphere,0,0,40,15,force=z:-500
     python mesh_cli.py part.stp --export part.vtk --mat --target-dt 5e-7
+    python mesh_cli.py asm.stp --auto-contact --contact 0.1
+    python mesh_cli.py part.stp --cross-section 0:0:0:1:0:0 --history-node 1,2,3
+    python mesh_cli.py part.stp --mat-model plastic_kinematic:210000:0.3:7.85e-9:1000:200
 """
 from __future__ import annotations
 
@@ -348,6 +351,77 @@ def parse_define_curve(text: str) -> dict:
     return {"lcid": lcid, "points": points}
 
 
+def parse_cross_section(text: str) -> dict:
+    """X:Y:Z:NX:NY:NZ[:TITLE] -> a *DATABASE_CROSS_SECTION_PLANE cut through
+    the whole model (PSID 0), defined by an in-plane point and a normal."""
+    parts = text.split(":")
+    if len(parts) not in (6, 7):
+        raise argparse.ArgumentTypeError(
+            f"cross-section needs X:Y:Z:NX:NY:NZ[:TITLE]: {text!r}")
+    try:
+        vals = [float(v) for v in parts[:6]]
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"bad cross-section numbers in {text!r}") from None
+    cs = {"point": tuple(vals[0:3]), "normal": tuple(vals[3:6])}
+    if len(parts) == 7 and parts[6].strip():
+        cs["title"] = parts[6][:60]
+    return cs
+
+
+def parse_id_list(text: str) -> list[int]:
+    """A comma-separated list of integer ids (e.g. '1,2,3'); the flag is
+    repeatable, so multiple lists accumulate."""
+    ids = []
+    for tok in text.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            ids.append(int(tok))
+        except ValueError:
+            raise argparse.ArgumentTypeError(
+                f"expected comma-separated integer ids: {text!r}") from None
+    if not ids:
+        raise argparse.ArgumentTypeError(
+            f"id list needs at least one integer: {text!r}")
+    return ids
+
+
+# --mat-model MODEL keywords mapped to the dyna_writer.mat_* helpers
+_MAT_MODELS = {
+    "plastic_kinematic": dyna_writer.mat_plastic_kinematic,
+    "kinematic": dyna_writer.mat_plastic_kinematic,
+    "piecewise": dyna_writer.mat_piecewise_linear_plasticity,
+    "piecewise_linear_plasticity": dyna_writer.mat_piecewise_linear_plasticity,
+}
+
+
+def parse_mat_model(text: str) -> dict:
+    """MODEL:E:NU:RHO:SIGY[:ETAN] -> a material dict from the dyna_writer.mat_*
+    helpers (used in place of --mat). MODEL is plastic_kinematic or piecewise
+    (*MAT_PLASTIC_KINEMATIC / *MAT_PIECEWISE_LINEAR_PLASTICITY)."""
+    model, sep, rest = text.partition(":")
+    fn = _MAT_MODELS.get(model.strip().lower())
+    if fn is None:
+        raise argparse.ArgumentTypeError(
+            f"mat-model MODEL must be one of {sorted(_MAT_MODELS)}: {text!r}")
+    if not sep:
+        raise argparse.ArgumentTypeError(
+            f"mat-model needs {model}:E:NU:RHO:SIGY[:ETAN]: {text!r}")
+    try:
+        nums = [float(v) for v in rest.split(":")]
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"bad mat-model numbers in {text!r}") from None
+    if len(nums) not in (4, 5):
+        raise argparse.ArgumentTypeError(
+            f"mat-model needs E:NU:RHO:SIGY[:ETAN]: {text!r}")
+    e, pr, ro, sigy = nums[:4]
+    etan = nums[4] if len(nums) == 5 else 0.0
+    return fn(e, pr, ro, sigy, etan=etan)
+
+
 def parse_prescribed_motion(text: str) -> dict:
     """NSID:DOF:VAD:LCID[:SF] -> *BOUNDARY_PRESCRIBED_MOTION_SET."""
     parts = text.split(":")
@@ -601,6 +675,40 @@ def build_parser() -> argparse.ArgumentParser:
                    help="node-matching tolerance shared by --auto-spotweld and "
                         "--tied-contact (default: 1e-3 of the bounding-box "
                         "diagonal)")
+
+    a = p.add_argument_group("assembly contacts / output / materials")
+    a.add_argument("--auto-contact", nargs="?", choices=CONTACT_TYPES,
+                   const="automatic_surface_to_surface", default=None,
+                   metavar="TYPE",
+                   help="detect the touching part pairs of a multi-body model "
+                        "and write one scoped *CONTACT_ (via *SET_PART_LIST) "
+                        "per pair; the optional TYPE (default "
+                        "automatic_surface_to_surface) picks the contact type, "
+                        "the friction comes from --contact (see --connect-tol). "
+                        "A single-body model warns and writes no card")
+    a.add_argument("--cross-section", type=parse_cross_section, action="append",
+                   dest="cross_sections", default=[],
+                   metavar="X:Y:Z:NX:NY:NZ[:TITLE]",
+                   help="*DATABASE_CROSS_SECTION_PLANE cut (point + normal) "
+                        "through the whole model; *DATABASE_SECFORC is added "
+                        "automatically for the section force output, repeatable")
+    a.add_argument("--history-node", type=parse_id_list, action="append",
+                   default=[], metavar="ID[,ID...]",
+                   help="node ids for *DATABASE_HISTORY_NODE (comma list, "
+                        "repeatable)")
+    a.add_argument("--history-solid", type=parse_id_list, action="append",
+                   default=[], metavar="ID[,ID...]",
+                   help="solid element ids for *DATABASE_HISTORY_SOLID (comma "
+                        "list, repeatable)")
+    a.add_argument("--history-shell", type=parse_id_list, action="append",
+                   default=[], metavar="ID[,ID...]",
+                   help="shell element ids for *DATABASE_HISTORY_SHELL (comma "
+                        "list, repeatable)")
+    a.add_argument("--mat-model", type=parse_mat_model, default=None,
+                   metavar="MODEL:E:NU:RHO:SIGY[:ETAN]",
+                   help="write a plasticity material in place of --mat: MODEL "
+                        "is plastic_kinematic (*MAT_PLASTIC_KINEMATIC) or "
+                        "piecewise (*MAT_PIECEWISE_LINEAR_PLASTICITY)")
     return p
 
 
@@ -769,6 +877,7 @@ def main(argv=None) -> int:
     # files); tied-contact segment sets are merged into face_sets
     auto_spotwelds = ()
     auto_contacts = ()
+    auto_contact_pairs = ()
     if args.auto_spotweld is not None:
         spacing = (None if args.auto_spotweld is _SPOTWELD_ON
                    else args.auto_spotweld)
@@ -789,6 +898,20 @@ def main(argv=None) -> int:
         else:
             print("warning: --tied-contact found no interfaces (single body "
                   "or no bodies within tolerance)", file=sys.stderr)
+    if args.auto_contact is not None:
+        if len(result.part_names) < 2:
+            print("warning: --auto-contact needs a multi-body model - no "
+                  "contact card written", file=sys.stderr)
+        else:
+            auto_contact_pairs = tuple(connections.contact_pairs(
+                result, base_pid=args.pid, tol=args.connect_tol,
+                ctype=args.auto_contact, fs=args.contact or 0.0))
+            if auto_contact_pairs:
+                print(f"Auto-contact: {len(auto_contact_pairs)} scoped "
+                      f"contact pair(s) on the detected interfaces")
+            else:
+                print("warning: --auto-contact found no touching interfaces",
+                      file=sys.stderr)
 
     elem_sets = []
     failed = result.stats.get("failed_elems", ())
@@ -807,8 +930,11 @@ def main(argv=None) -> int:
                 continue
             part_mats[args.pid + body - 1] = m
 
+    # a --mat-model plasticity dict is used in place of a plain --mat elastic
+    mat = args.mat_model if args.mat_model is not None else args.mat
+
     mass, part_masses, dt_est = mesher.mass_and_timestep(
-        result, etype, args.mat, part_mats, args.pid,
+        result, etype, mat, part_mats, args.pid,
         thickness if is_shell else 1.0, log=print)
 
     if args.target_dt and dt_est:
@@ -856,13 +982,25 @@ def main(argv=None) -> int:
     if args.database:
         databases["ascii"] = dict(args.database)
 
+    # cross sections and history requests (write_k / write_k_include only, like
+    # contact - kept out of `common` so the per-part split files omit them)
+    cross_sections = tuple(args.cross_sections)
+    history = {}
+    for key, lists in (("nodes", args.history_node),
+                       ("solids", args.history_solid),
+                       ("shells", args.history_shell)):
+        ids = [i for lst in lists for i in lst]
+        if ids:
+            history[key] = ids
+    history = history or None
+
     common = dict(
         element_kind="shell" if is_shell else "solid",
         elform=elform, thickness=thickness,
         start_nid=args.start_nid, start_eid=args.start_eid,
         start_sid=args.start_sid,
         title=args.title or os.path.splitext(os.path.basename(out))[0],
-        comments=tuple(comments), sym_sets=tuple(sym_sets), mat=args.mat,
+        comments=tuple(comments), sym_sets=tuple(sym_sets), mat=mat,
         part_mats=part_mats, face_sets=tuple(face_sets),
         elem_sets=tuple(elem_sets), implicit_cards=args.implicit_cards,
         mesh_only=args.mesh_only, tssfac=args.tssfac,
@@ -882,7 +1020,8 @@ def main(argv=None) -> int:
             out, result.coords, result.elems, pid=args.pid,
             part_ids=part_ids, part_titles=part_titles,
             contact_fs=contact_fs, contacts=contacts,
-            spotwelds=spotwelds, **common)
+            contact_pairs=auto_contact_pairs, cross_sections=cross_sections,
+            history=history, spotwelds=spotwelds, **common)
         for p, f in split_files:
             print(f"Wrote {f} (mesh fragment, PID {p})")
         print(f"Wrote {out} (master deck with *INCLUDE cards)")
@@ -891,7 +1030,8 @@ def main(argv=None) -> int:
             out, result.coords, result.elems, pid=args.pid,
             part_ids=part_ids, part_titles=part_titles,
             contact_fs=contact_fs, contacts=contacts,
-            spotwelds=spotwelds, **common)
+            contact_pairs=auto_contact_pairs, cross_sections=cross_sections,
+            history=history, spotwelds=spotwelds, **common)
         print(f"Wrote {out}")
         if args.split_parts:
             split_files = dyna_writer.write_k_split(
@@ -907,7 +1047,7 @@ def main(argv=None) -> int:
             "n_parts": len(result.part_names), "part_names": result.part_names,
             "mass": mass, "part_masses": part_masses,
             "critical_timestep": dt_est,
-            "material": args.mat, "part_materials": part_mats,
+            "material": mat, "part_materials": part_mats,
             "split_files": {p: f for p, f in split_files},
             "stats": result.stats,
         }

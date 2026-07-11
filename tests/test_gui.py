@@ -277,6 +277,17 @@ def test_auto_connect_tied_blank_numerics(app):
                                      "spacing": None, "fs": 0.15}
 
 
+def test_auto_connect_contact(app):
+    _ensure_geometry()
+    app.var_connect_mode.set("Contact (per-pair S2S)")
+    app.var_connect_tol.set("")       # blank -> None
+    app.var_connect_fs.set("0.3")
+    _, _, kopts = app._collect_inputs(need_out=False)
+    assert kopts["auto_connect"] == {
+        "mode": "contact", "tol": None, "fs": 0.3,
+        "ctype": "automatic_surface_to_surface"}
+
+
 def test_connect_tol_validation(app):
     _ensure_geometry()
     app.var_connect_mode.set("Spotweld (*CONSTRAINED_SPOTWELD)")

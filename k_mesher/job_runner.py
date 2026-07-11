@@ -17,11 +17,15 @@ still works):
     midsurface -> bool. Mesh thin plate solids as a midsurface shell instead of
         mesh_step_auto; forces element_kind="shell" and takes the thickness from
         the detected wall thickness (stats["midsurface_thickness"]).
-    auto_connect -> None | {"mode": "spotweld"|"tied", "tol": float|None,
-        "spacing": float|None, "fs": float}. After meshing a multi-body model,
-        detect the interfaces and inject *CONSTRAINED_SPOTWELD pairs (spotweld)
-        or the interface segment sets + *CONTACT_TIED_SURFACE_TO_SURFACE (tied)
-        into the write_k / write_k_include calls (never the split files).
+    auto_connect -> None | {"mode": "spotweld"|"tied"|"contact",
+        "tol": float|None, "spacing": float|None, "ctype": str, "fs": float}.
+        After meshing a multi-body model, detect the interfaces and inject
+        *CONSTRAINED_SPOTWELD pairs (spotweld), the interface segment sets +
+        *CONTACT_TIED_SURFACE_TO_SURFACE (tied), or one scoped *CONTACT_ per
+        touching part pair via *SET_PART_LIST (contact; ctype defaults to
+        automatic_surface_to_surface, fs is the friction) into the write_k /
+        write_k_include calls (never the split files). ctype/spacing/fs are all
+        read with .get defaults, so a caller may omit the ones its mode ignores.
 
 Optional LS-DYNA control / load cards (all read with a safe default, so a
 caller that omits them still works):
@@ -137,6 +141,7 @@ def run_job(settings, out: str, kopts: dict, log=print) -> str:
     # like contact); tied segment sets are merged into face_sets
     auto_spotwelds = ()
     auto_contacts = ()
+    auto_contact_pairs = ()
     auto = kopts.get("auto_connect")
     if auto:
         tol = auto.get("tol")
@@ -157,6 +162,17 @@ def run_job(settings, out: str, kopts: dict, log=print) -> str:
                 log(f"Tied contact: {len(tie_sets)} interface segment set(s)")
             else:
                 log("WARNING: auto_connect tied found no interfaces "
+                    "(single body or no bodies within tolerance)")
+        elif auto.get("mode") == "contact":
+            auto_contact_pairs = tuple(connections.contact_pairs(
+                result, base_pid=kopts["pid"], tol=tol,
+                ctype=auto.get("ctype", "automatic_surface_to_surface"),
+                fs=auto.get("fs", 0.0)))
+            if auto_contact_pairs:
+                log(f"Auto-contact: {len(auto_contact_pairs)} scoped contact "
+                    f"pair(s) on the detected interfaces")
+            else:
+                log("WARNING: auto_connect contact found no interfaces "
                     "(single body or no bodies within tolerance)")
 
     elem_sets = []
@@ -222,6 +238,7 @@ def run_job(settings, out: str, kopts: dict, log=print) -> str:
             out, result.coords, result.elems, pid=pid0,
             part_ids=part_ids, part_titles=part_titles, title=title,
             contact_fs=kopts["contact_fs"], contacts=contacts,
+            contact_pairs=auto_contact_pairs,
             spotwelds=spotwelds, **common)
         for p, fpath in files:
             log(f"Wrote mesh fragment: {fpath} (PID {p})")
@@ -231,6 +248,7 @@ def run_job(settings, out: str, kopts: dict, log=print) -> str:
             out, result.coords, result.elems, pid=pid0,
             part_ids=part_ids, part_titles=part_titles, title=title,
             contact_fs=kopts["contact_fs"], contacts=contacts,
+            contact_pairs=auto_contact_pairs,
             spotwelds=spotwelds, **common)
         if split_mode == "parts":
             files = dyna_writer.write_k_split(

@@ -176,6 +176,32 @@ def write_k(
                                        #  tied_nodes_to_surface, "fs":0.0} ->
                                        # the matching *CONTACT_ card over all
                                        # parts (SSID/MSID 0); skipped in mesh_only
+    contact_pairs: tuple[dict, ...] = (),  # per-pair scoped contact via part
+                                       # sets. each {"slave_parts":[pid,...],
+                                       #  "master_parts":[pid,...],
+                                       #  "type":"automatic_surface_to_surface"|
+                                       #   "tied_surface_to_surface"|
+                                       #   "eroding_surface_to_surface"|...,
+                                       #  "fs":0.0, "title":str?} -> a
+                                       # *SET_PART_LIST for the slave pids and one
+                                       # for the master pids (set-id counter,
+                                       # titled) plus the matching *CONTACT_<TYPE>
+                                       # with SSID=slave set/SSTYP=2 and
+                                       # MSID=master set/MSTYP=2, friction fs on
+                                       # card 2; skipped in mesh_only
+    cross_sections: tuple[dict, ...] = (),  # each {"point":(x,y,z),
+                                       #  "normal":(nx,ny,nz), "title":str?,
+                                       #  "id":int?} -> a *DATABASE_CROSS_SECTION_
+                                       # PLANE cut (PSID 0 = whole model). Force
+                                       # output needs *DATABASE_SECFORC, which is
+                                       # emitted automatically (dt from
+                                       # databases["d3plot_dt"], else endtim/100)
+                                       # if the user did not request it in
+                                       # `databases`
+    history: dict | None = None,       # {"nodes":[nid,...],"solids":[eid,...],
+                                       #  "shells":[eid,...]} -> a
+                                       # *DATABASE_HISTORY_NODE/_SOLID/_SHELL card
+                                       # (8 ids per line) for each non-empty list
 ) -> None:
     n_nodes = len(coords)
     nn = elems.shape[1]
@@ -199,6 +225,11 @@ def write_k(
     max_id = max(start_nid + n_nodes - 1, start_eid + len(elems) - 1)
     auto_long = max_id > MAX_STD_ID and not long_format
     w = _Widths(long_format or max_id > MAX_STD_ID)
+
+    # shared set-id counter: consumed first by pairwise-contact *SET_PART_LIST
+    # cards (in the contact section) and then by the symmetry/face/element sets
+    # written after the mesh blocks, so ids never collide across the file
+    sid = start_sid - 1
 
     with open(path, "w", newline="\n") as f:
         f.write("*KEYWORD LONG=Y\n" if w.long else "*KEYWORD\n")
@@ -308,6 +339,8 @@ def write_k(
                 _write_general_contact(f, w, c.get("type",
                                        "automatic_single_surface"),
                                        float(c.get("fs", 0.0)))
+            for cp in contact_pairs:
+                sid = _write_contact_pair(f, w, sid, cp)
 
         if mesh_blocks:
             _write_mesh_blocks(f, w, element_kind, nn, nids, coords,
@@ -334,7 +367,6 @@ def write_k(
                     "        zc       cid\n")
             f.write(f"{curve_id:{w.f}d}{float(accel):{w.f}.4g}\n")
 
-        sid = start_sid - 1
         for s in sym_sets:
             set_nids = np.asarray(s["nodes"], dtype=np.int64) - 1 + start_nid
             if len(set_nids) == 0:   # skip empty *SET_NODE cards entirely
@@ -420,6 +452,10 @@ def write_k(
             _write_spotweld(f, w, int(n1), int(n2))
         if databases is not None:
             _write_databases(f, w, databases)
+        if cross_sections:
+            _write_cross_sections(f, w, cross_sections, databases, endtim)
+        if history is not None:
+            _write_history(f, w, history)
 
         f.write("*END\n")
 
@@ -681,7 +717,20 @@ def _CONTACT_KEYWORDS():
         "automatic_surface_to_surface": "*CONTACT_AUTOMATIC_SURFACE_TO_SURFACE",
         "tied_surface_to_surface": "*CONTACT_TIED_SURFACE_TO_SURFACE",
         "tied_nodes_to_surface": "*CONTACT_TIED_NODES_TO_SURFACE",
+        "eroding_surface_to_surface": "*CONTACT_ERODING_SURFACE_TO_SURFACE",
+        "eroding_single_surface": "*CONTACT_ERODING_SINGLE_SURFACE",
     }
+
+
+def _contact_keyword(ctype: str) -> str:
+    """Resolve a contact type to its ``*CONTACT_`` keyword. Known names come
+    from ``_CONTACT_KEYWORDS``; any other name is turned into
+    ``*CONTACT_<TYPE>`` (uppercased) so uncommon contacts still pass through."""
+    key = ctype.strip().lower()
+    known = _CONTACT_KEYWORDS().get(key)
+    if known is not None:
+        return known
+    return "*CONTACT_" + key.upper()
 
 
 def _write_general_contact(f, w: _Widths, ctype: str, fs: float) -> None:
@@ -702,6 +751,121 @@ def _write_general_contact(f, w: _Widths, ctype: str, fs: float) -> None:
     f.write("$#     sfs       sfm       sst       mst      sfst      sfmt"
             "       fsf       vsf\n")
     f.write(f"{0.0:{w.f}.1f}" * 8 + "\n")
+
+
+def _write_set_part_list(f, w: _Widths, sid: int, title: str, pids) -> None:
+    """A *SET_PART_LIST_TITLE holding the given part ids (8 per line)."""
+    pids = [int(p) for p in pids]
+    f.write("*SET_PART_LIST_TITLE\n")
+    f.write(f"{title[:70]}\n")
+    f.write("$#     sid       da1       da2       da3       da4    solver\n")
+    f.write(f"{sid:{w.f}d}" + f"{0.0:{w.f}.1f}" * 4 + f"{'MECH':>{w.f}s}\n")
+    f.write("$#    pid1      pid2      pid3      pid4      pid5      pid6"
+            "      pid7      pid8\n")
+    for row in range(0, len(pids), 8):
+        chunk = pids[row:row + 8]
+        f.write("".join(f"{p:{w.f}d}" for p in chunk) + "\n")
+
+
+def _write_contact_pair(f, w: _Widths, sid: int, cp: dict) -> int:
+    """Pairwise scoped contact: emit a *SET_PART_LIST for the slave pids and one
+    for the master pids (consuming the shared set-id counter), then the matching
+    *CONTACT_<TYPE> with SSID=slave set/SSTYP=2, MSID=master set/MSTYP=2 and the
+    friction coefficient on card 2. Returns the updated set-id counter."""
+    ctype = cp.get("type", "automatic_surface_to_surface")
+    fs = float(cp.get("fs", 0.0))
+    title = cp.get("title")
+    base = title or f"contact {ctype}"
+    sid += 1
+    ssid = sid
+    _write_set_part_list(f, w, ssid, f"{base} - slave parts", cp["slave_parts"])
+    sid += 1
+    msid = sid
+    _write_set_part_list(f, w, msid, f"{base} - master parts", cp["master_parts"])
+    keyword = _contact_keyword(ctype)
+    if title:
+        f.write(f"$ {title[:78]}\n")
+    f.write(keyword + "\n")
+    f.write("$#    ssid      msid     sstyp     mstyp    sboxid    mboxid"
+            "       spr       mpr\n")
+    f.write(w.ints(ssid, msid, 2, 2, 0, 0, 0, 0) + "\n")
+    f.write("$#      fs        fd        dc        vc       vdc    penchk"
+            "        bt        dt\n")
+    f.write(f"{fs:{w.f}.4f}{fs:{w.f}.4f}" + f"{0.0:{w.f}.1f}" * 6 + "\n")
+    f.write("$#     sfs       sfm       sst       mst      sfst      sfmt"
+            "       fsf       vsf\n")
+    f.write(f"{0.0:{w.f}.1f}" * 8 + "\n")
+    return sid
+
+
+def _write_cross_sections(f, w: _Widths, cross_sections, databases,
+                          endtim) -> None:
+    """One *DATABASE_CROSS_SECTION_PLANE per cut (PSID 0 = whole model). Ensure
+    *DATABASE_SECFORC is present (needed for the force output): if the user did
+    not request SECFORC in `databases`, emit it here with a sensible dt."""
+    have_secforc = False
+    if databases and databases.get("ascii"):
+        have_secforc = any(str(k).strip().upper() == "SECFORC"
+                           for k in databases["ascii"])
+    if not have_secforc:
+        if databases and databases.get("d3plot_dt") is not None:
+            dt = float(databases["d3plot_dt"])
+        elif endtim is not None:
+            dt = float(endtim) / 100.0
+        else:
+            dt = 1.0e-3
+        f.write("$ *DATABASE_SECFORC added automatically for the cross "
+                "section(s) below\n")
+        f.write("*DATABASE_SECFORC\n")
+        f.write("$#      dt    binary\n")
+        f.write(f"{dt:{w.f}.4g}{1:{w.f}d}\n")
+    for i, cs in enumerate(cross_sections):
+        _write_cross_section_plane(f, w, cs, int(cs.get("id", i + 1)))
+
+
+def _write_cross_section_plane(f, w: _Widths, cs: dict, csid: int) -> None:
+    """A cutting plane defined by a point + normal. The head (XCH/YCH/ZCH) is a
+    point one unit along the normal from the head point (XCT/YCT/ZCT); the
+    in-plane edge vector (XHEV/YHEV/ZHEV) is a robust orthonormal basis built
+    from the normal."""
+    px, py, pz = (float(v) for v in cs["point"])
+    n = np.asarray(cs["normal"], dtype=float)
+    nrm = float(np.linalg.norm(n))
+    n = n / nrm if nrm else np.array([0.0, 0.0, 1.0])
+    # any axis not near-parallel to the normal gives a stable in-plane vector
+    ref = np.array([1.0, 0.0, 0.0]) if abs(n[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+    e = np.cross(n, ref)
+    e = e / float(np.linalg.norm(e))
+    hx, hy, hz = px + n[0], py + n[1], pz + n[2]
+    title = cs.get("title")
+    if title:
+        f.write(f"$ cross section: {str(title)[:70]}\n")
+    f.write("*DATABASE_CROSS_SECTION_PLANE\n")
+    f.write("$#    psid       xct       yct       zct       xch       ych"
+            "       zch    radius\n")
+    f.write(f"{0:{w.f}d}{px:{w.f}.4g}{py:{w.f}.4g}{pz:{w.f}.4g}"
+            f"{hx:{w.f}.4g}{hy:{w.f}.4g}{hz:{w.f}.4g}{0.0:{w.f}.1f}\n")
+    f.write("$#    xhev      yhev      zhev      lenl      lenm        id"
+            "     itype\n")
+    f.write(f"{e[0]:{w.f}.4g}{e[1]:{w.f}.4g}{e[2]:{w.f}.4g}"
+            f"{0.0:{w.f}.1f}{0.0:{w.f}.1f}{csid:{w.f}d}{0:{w.f}d}\n")
+
+
+def _write_history(f, w: _Widths, hist: dict) -> None:
+    """*DATABASE_HISTORY_NODE/_SOLID/_SHELL id lists (8 ids per line). Only the
+    non-empty categories are emitted."""
+    for key, kw in (("nodes", "NODE"), ("solids", "SOLID"),
+                    ("shells", "SHELL"), ("beams", "BEAM")):
+        ids = hist.get(key)
+        if ids is None or len(ids) == 0:
+            continue
+        ids = [int(v) for v in np.asarray(ids).ravel()]
+        f.write(f"*DATABASE_HISTORY_{kw}\n")
+        f.write("$#     id1       id2       id3       id4       id5       id6"
+                "       id7       id8\n")
+        for row in range(0, len(ids), 8):
+            chunk = ids[row:row + 8]
+            f.write("".join(f"{v:{w.f}d}" for v in chunk) + "\n")
 
 
 def _write_define_curve(f, w: _Widths, c: dict) -> None:
@@ -850,3 +1014,101 @@ def _write_segment_set(f, w: _Widths, sid: int, title: str, segs: np.ndarray) ->
     f.write(f"{sid:{w.f}d}" + f"{0.0:{w.f}.1f}" * 4 + f"{'MECH':>{w.f}s}\n")
     f.write("$#      n1        n2        n3        n4\n")
     np.savetxt(f, segs, fmt=f"%{w.f}d" * 4)
+
+
+# --------------------------------------------------------------------------
+# Named-material convenience builders
+#
+# Each returns a dict compatible with the write_k `mat`/`part_mats` passthrough:
+#   {"keyword": "*MAT_...", "cards": [pre-formatted card lines],
+#    "e": E, "pr": nu, "ro": density}
+# The first field of the first card is the literal "{mid:>10d}" placeholder,
+# which the passthrough substitutes with the real MID via ``line.format(mid=)``.
+# The e/pr/ro keys let the existing mass/timestep estimate keep working.
+# Cards use the standard 10-character fixed-width columns.
+# --------------------------------------------------------------------------
+
+_MID_FIELD = "{mid:>10d}"   # substituted by the passthrough's .format(mid=...)
+
+
+def _mf(v) -> str:
+    """Format a material value into a 10-character fixed-width column."""
+    s = f"{float(v):.6g}"
+    if len(s) > 10:
+        s = f"{float(v):.4g}"
+    return f"{s:>10s}"
+
+
+def _mi(v) -> str:
+    """Format an integer material field into a 10-character column."""
+    return f"{int(v):>10d}"
+
+
+def mat_piecewise_linear_plasticity(e, pr, ro, sigy, etan=0.0, fail=None,
+                                    lcss=None, c=0.0, p=0.0):
+    """*MAT_024 (*MAT_PIECEWISE_LINEAR_PLASTICITY).
+
+    e/pr/ro: modulus, Poisson, density. sigy: yield stress. etan: tangent
+    modulus (ignored when a hardening curve `lcss` is given). fail: plastic
+    strain at failure (None -> 1e20, i.e. no failure). lcss: load-curve id of
+    the effective-stress / effective-plastic-strain curve. c/p: Cowper-Symonds
+    strain-rate parameters.
+    """
+    failval = 1.0e20 if fail is None else float(fail)
+    card1 = (_MID_FIELD + _mf(ro) + _mf(e) + _mf(pr) + _mf(sigy)
+             + _mf(etan) + _mf(failval) + _mf(0.0))
+    card2 = (_mf(c) + _mf(p) + _mi(lcss or 0) + _mi(0) + _mi(0))
+    return {"keyword": "*MAT_PIECEWISE_LINEAR_PLASTICITY",
+            "cards": [card1, card2], "e": e, "pr": pr, "ro": ro}
+
+
+def mat_plastic_kinematic(e, pr, ro, sigy, etan=0.0, beta=0.0, src=0.0,
+                          srp=0.0, fs=0.0):
+    """*MAT_003 (*MAT_PLASTIC_KINEMATIC).
+
+    beta: hardening parameter (0 = kinematic, 1 = isotropic). src/srp:
+    Cowper-Symonds strain-rate coefficients. fs: failure strain.
+    """
+    card1 = (_MID_FIELD + _mf(ro) + _mf(e) + _mf(pr) + _mf(sigy)
+             + _mf(etan) + _mf(beta))
+    card2 = (_mf(src) + _mf(srp) + _mf(fs) + _mf(0.0))
+    return {"keyword": "*MAT_PLASTIC_KINEMATIC",
+            "cards": [card1, card2], "e": e, "pr": pr, "ro": ro}
+
+
+def mat_johnson_cook(e, pr, ro, a, b, n, c, m, tm, tr, epso=1.0, cp=0.0,
+                     pc=0.0, spall=2.0, it=0.0, d1=0.0, d2=0.0, d3=0.0,
+                     d4=0.0, d5=0.0):
+    """*MAT_015 (*MAT_JOHNSON_COOK).
+
+    Core flow-stress params: a, b, n, c, m (sigma = (A + B*eps^n)(1 + C*ln
+    epsdot*)(1 - T*^m)); tm melt temp, tr room temp, epso reference strain
+    rate. cp specific heat, pc pressure cutoff, spall model, it iteration flag.
+    d1..d5 are the Johnson-Cook damage parameters. The shear modulus G is
+    derived from e and pr. A companion equation of state is normally required.
+    """
+    g = float(e) / (2.0 * (1.0 + float(pr)))
+    card1 = (_MID_FIELD + _mf(ro) + _mf(g) + _mf(e) + _mf(pr)
+             + _mf(0.0) + _mf(0.0) + _mf(0.0))
+    card2 = (_mf(a) + _mf(b) + _mf(n) + _mf(c) + _mf(m) + _mf(tm)
+             + _mf(tr) + _mf(epso))
+    card3 = (_mf(cp) + _mf(pc) + _mf(spall) + _mf(it) + _mf(d1) + _mf(d2)
+             + _mf(d3) + _mf(d4))
+    card4 = _mf(d5)
+    return {"keyword": "*MAT_JOHNSON_COOK",
+            "cards": [card1, card2, card3, card4],
+            "e": e, "pr": pr, "ro": ro}
+
+
+def mat_null(ro, pc=0.0, mu=0.0, terod=0.0, cerod=0.0, e=0.0, pr=0.0):
+    """*MAT_009 (*MAT_NULL).
+
+    A material with no deviatoric strength (used for fluids, or on shells for
+    contact-only skins). ro density, pc pressure cutoff, mu dynamic viscosity,
+    terod/cerod erosion strains. e/pr (YM/PR) are used only for the contact
+    stiffness and for the mass/timestep estimate.
+    """
+    card1 = (_MID_FIELD + _mf(ro) + _mf(pc) + _mf(mu) + _mf(terod)
+             + _mf(cerod) + _mf(e) + _mf(pr))
+    return {"keyword": "*MAT_NULL", "cards": [card1],
+            "e": e, "pr": pr, "ro": ro}

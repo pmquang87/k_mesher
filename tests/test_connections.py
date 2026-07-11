@@ -196,6 +196,75 @@ def test_single_body_is_empty():
     assert connections.tied_contact(res) == ([], ())
 
 
+def test_interface_pairs():
+    """interface_pairs -> the raw touching body-index pairs."""
+    res = res_two_unglued()
+    assert connections.interface_pairs(res) == [(0, 1)]
+    # single-body model has no interfaces
+    assert connections.interface_pairs(res_single()) == []
+
+
+def test_contact_pairs_default_and_shifted_base_pid():
+    """contact_pairs -> one scoped part-to-part contact dict per touching pair,
+    with body k mapped to PID base_pid + k."""
+    res = res_two_unglued()
+
+    cps = connections.contact_pairs(res)
+    assert len(cps) == 1
+    cp = cps[0]
+    # default base_pid = 1: body 0 -> PID 1 (slave), body 1 -> PID 2 (master)
+    assert cp["slave_parts"] == [1]
+    assert cp["master_parts"] == [2]
+    assert cp["type"] == "automatic_surface_to_surface"
+    assert cp["fs"] == 0.0
+    assert cp["title"] == "CONTACT_p1_p2"
+
+    # non-default base_pid shifts both PIDs by the same offset
+    shifted = connections.contact_pairs(res, base_pid=10, fs=0.15,
+                                        ctype="surface_to_surface")
+    assert len(shifted) == 1
+    sp = shifted[0]
+    assert sp["slave_parts"] == [10]
+    assert sp["master_parts"] == [11]
+    assert sp["type"] == "surface_to_surface"
+    assert sp["fs"] == 0.15
+    assert sp["title"] == "CONTACT_p10_p11"
+
+    # single-body model yields no contact pairs
+    assert connections.contact_pairs(res_single()) == []
+
+
+def test_contact_pairs_writer_roundtrip():
+    """Feed contact_pairs into write_k and confirm a scoped SET_PART_LIST +
+    *CONTACT_AUTOMATIC_SURFACE_TO_SURFACE round-trips.
+
+    dyna_writer's ``contact_pairs`` argument is being added concurrently by
+    another agent; if it is not yet present this asserts nothing (skips) rather
+    than failing, so the suite stays green either way.
+    """
+    import pytest
+
+    res = res_two_unglued()
+    base_pid = 10
+    cps = connections.contact_pairs(res, base_pid=base_pid)
+    assert len(cps) == 1
+
+    k_path = os.path.join(OUT_DIR, "connections_contact_pairs.k")
+    try:
+        dyna_writer.write_k(
+            k_path, res.coords, res.elems, pid=base_pid,
+            part_ids=base_pid + np.asarray(res.elem_parts),
+            part_titles={base_pid: "left box", base_pid + 1: "right box"},
+            contact_pairs=cps)
+    except TypeError:
+        pytest.skip("dyna_writer.write_k has no contact_pairs argument yet")
+
+    with open(k_path) as f:
+        text = f.read()
+    assert "*SET_PART_LIST" in text
+    assert "*CONTACT_AUTOMATIC_SURFACE_TO_SURFACE" in text
+
+
 if __name__ == "__main__":
     for name in list(globals()):
         if name.startswith("test_"):

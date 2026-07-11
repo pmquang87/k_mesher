@@ -77,6 +77,7 @@ CONNECT_MODES = {
     "None (no auto-detect)": "none",
     "Spotweld (*CONSTRAINED_SPOTWELD)": "spotweld",
     "Tied contact": "tied",
+    "Contact (per-pair S2S)": "contact",
 }
 # coordinate node-set kinds (label -> (mesher.select_nodes kind, params hint))
 COORD_KINDS = {
@@ -725,12 +726,12 @@ class KMesherGUI:
 
     def _sync_connect(self):
         """Enable the spacing entry only for spotweld mode and the friction
-        entry only for tied mode (both ignored when mode is 'none')."""
+        entry for tied and contact modes (both ignored when mode is 'none')."""
         mode = CONNECT_MODES.get(self.var_connect_mode.get(), "none")
         self.ent_connect_spacing.config(
             state="normal" if mode == "spotweld" else "disabled")
         self.ent_connect_fs.config(
-            state="normal" if mode == "tied" else "disabled")
+            state="normal" if mode in ("tied", "contact") else "disabled")
 
     # -------------------------------------------------- refinements -------
     def _add_refinement(self):
@@ -1274,7 +1275,18 @@ class KMesherGUI:
         midsurface = self.var_midsurface.get()
         connect_mode = CONNECT_MODES.get(self.var_connect_mode.get(), "none")
         auto_connect = None
-        if connect_mode != "none":
+        if connect_mode == "contact":
+            # per-pair automatic surface-to-surface contact between touching
+            # bodies; spacing is spotweld-only and omitted here.
+            auto_connect = {
+                "mode": "contact",
+                "tol": opt_num(self.var_connect_tol, "Connection tolerance",
+                               minval=0.0),
+                "fs": opt_num(self.var_connect_fs, "Contact friction",
+                              minval=0.0) or 0.0,
+                "ctype": "automatic_surface_to_surface",
+            }
+        elif connect_mode != "none":
             auto_connect = {
                 "mode": connect_mode,
                 "tol": opt_num(self.var_connect_tol, "Connection tolerance",
