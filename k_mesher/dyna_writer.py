@@ -1,12 +1,20 @@
-"""LS-DYNA keyword (.k) file writer for TET4/TET10 solid and TRI3/QUAD4
+"""LS-DYNA keyword (.k) file writer for TET4/TET10/HEX8 solid and TRI3/QUAD4
 shell meshes.
 
 Formats used (standard fixed-width small format):
   *NODE            nid(I8)  x,y,z(E16.9)
   *ELEMENT_SOLID   TET4:  eid,pid,n1..n8 (10I8), tet as n1 n2 n3 n4 n4 n4 n4 n4
+                   HEX8:  eid,pid,n1..n8 (10I8), all 8 node ids distinct
                    TET10: two-line format - eid,pid (2I8) / n1..n10 (10I8)
   *ELEMENT_SHELL   eid,pid,n1..n4 (6I8), triangles as n1 n2 n3 n3
   *SET_NODE_LIST / *SET_SEGMENT   I10 fields
+
+HEX8 connectivity convention: elems rows are the 8 corner node ids in LS-DYNA
+order (n1-n4 = one face, n5-n8 = the opposite face with n5 above n1, right
+handed so the jacobian is positive) - identical to VTK_HEXAHEDRON ordering.
+The writer emits the connectivity verbatim; the tet positive-volume
+reorientation (NEGFIX) lives in the mesher and is tet-specific, so hex
+orientation is the CALLER's responsibility.
 
 When a node or element id would overflow the 8-character standard fields the
 file is automatically written as ``*KEYWORD LONG=Y`` with 20-character fields
@@ -86,14 +94,20 @@ def _resolve_sym_dofs(item: dict) -> tuple[int, ...]:
 def write_k(
     path: str,
     coords: np.ndarray,        # (N, 3)
-    elems: np.ndarray,         # solids: (M, 4|10), shells: (M, 4); 1-based,
-                               # LS-DYNA node order, shell tris with n4 = n3
+    elems: np.ndarray,         # solids: (M, 4|8|10), shells: (M, 4); 1-based,
+                               # LS-DYNA node order, shell tris with n4 = n3;
+                               # HEX8 rows in LS-DYNA / VTK_HEXAHEDRON order
+                               # (see module docstring; orientation is the
+                               # caller's job - no NEGFIX for hexes)
     *,
     element_kind: str = "solid",       # "solid" | "shell"
     pid: int = 1,              # base part id; also used as SECID and MID
     elform: int | None = None,         # element formulation; None -> a sensible
                                        # default from element_kind + node count
-                                       # (solid TET4->10, TET10->16, shell->2)
+                                       # (solid TET4->10, HEX8->1 constant
+                                       # stress (2 = fully integrated S/R is
+                                       # the usual alternative), TET10->16,
+                                       # shell->2)
     thickness: float = 1.0,    # shell thickness (shells only)
     start_nid: int = 1,
     start_eid: int = 1,
@@ -167,7 +181,16 @@ def write_k(
                                        #  "sf":1.0} -> *BOUNDARY_PRESCRIBED_MOTION_SET
     rigidwalls: tuple[dict, ...] = (),  # each {"tail":(x,y,z),"head":(x,y,z),
                                        #  "fric":0.0} -> *RIGIDWALL_PLANAR
-                                       # (NSID 0; normal points tail -> head)
+                                       # (NSID 0; normal points tail -> head).
+                                       # Optional "shape" selects a geometric
+                                       # wall instead: "cylinder" (+"radius",
+                                       # "length"; tail = base-cap centre, head
+                                       # = a point along the axis) ->
+                                       # *RIGIDWALL_GEOMETRIC_CYLINDER, or
+                                       # "sphere" (+"radius"; tail = centre,
+                                       # head sets the orientation vector) ->
+                                       # *RIGIDWALL_GEOMETRIC_SPHERE. No
+                                       # "shape" -> planar, output unchanged
     spotwelds: tuple[tuple[int, int], ...] = (),  # node-id pairs (raw, already
                                        # offset) -> one *CONSTRAINED_SPOTWELD each
     contacts: tuple[dict, ...] = (),   # each {"type": automatic_single_surface|
@@ -202,6 +225,52 @@ def write_k(
                                        #  "shells":[eid,...]} -> a
                                        # *DATABASE_HISTORY_NODE/_SOLID/_SHELL card
                                        # (8 ids per line) for each non-empty list
+    nodal_rigid_bodies: tuple[dict, ...] = (),  # each {"nodes":[nid,...],
+                                       #  "pid":int,"title":str?} -> a
+                                       # *SET_NODE_LIST_TITLE (shared set-id
+                                       # counter) + *CONSTRAINED_NODAL_RIGID_BODY
+                                       # referencing it. "pid" is REQUIRED (the
+                                       # rigid-body part id; pick one above the
+                                       # mesh part ids). Node ids are raw
+                                       # (already offset), like spotwelds.
+                                       # Skipped in mesh_only (references a part)
+    point_masses: tuple[dict, ...] = (),  # each {"nid":int,"mass":float,
+                                       #  "eid":int?} -> one *ELEMENT_MASS.
+                                       # nid is raw (already offset). Omitted
+                                       # eids auto-number from the shared
+                                       # element-id counter that starts at
+                                       # start_eid + len(elems); an explicit
+                                       # "eid" is used verbatim and bumps the
+                                       # counter past it. Written even in
+                                       # mesh_only (pure element data)
+    discretes: tuple[dict, ...] = (),  # spring/damper elements: each {"n1":int,
+                                       #  "n2":int,"k":float?,"c":float?,
+                                       #  "pid":int?} (raw node ids). Exactly
+                                       # one of k (spring stiffness) or c
+                                       # (damping constant) per item. One
+                                       # PART/SECTION_DISCRETE/MAT per distinct
+                                       # (k, c, pid) combo: *MAT_SPRING_ELASTIC
+                                       # for k, *MAT_DAMPER_VISCOUS for c.
+                                       # Combos without an explicit "pid" are
+                                       # auto-numbered consecutively above
+                                       # max(mesh part ids, explicit discrete
+                                       # pids). Element ids come from the same
+                                       # counter as point_masses. Skipped in
+                                       # mesh_only (writes PART/SECTION/MAT)
+    damping: dict | None = None,       # {"valdmp":float,"lcid":int?} ->
+                                       # *DAMPING_GLOBAL (system damping
+                                       # constant VALDMP; LCID referenced if
+                                       # given, else 0 = constant). Skipped in
+                                       # mesh_only (a control-level card)
+    include_transforms: tuple[dict, ...] = (),  # each {"file":str,
+                                       #  "idnoff":int?,"ideoff":int?,
+                                       #  "idpoff":int?,"idmoff":int?,
+                                       #  "idsoff":int?,"idfoff":int?,
+                                       #  "idroff":int?,"tranid":int?} ->
+                                       # *INCLUDE_TRANSFORM (unset offsets 0,
+                                       # scale factors 1.0, INCOUT1 0). Written
+                                       # next to the *INCLUDE cards, i.e. also
+                                       # in mesh_only master decks
 ) -> None:
     n_nodes = len(coords)
     nn = elems.shape[1]
@@ -209,8 +278,14 @@ def write_k(
         # sensible default formulation from the element type and node count
         if element_kind == "shell":
             elform = 2
+        elif nn == 10:
+            elform = 16
+        elif nn == 8:
+            # HEX8: 1 = constant-stress solid (the crash workhorse); pass
+            # elform=2 explicitly for the fully integrated S/R alternative
+            elform = 1
         else:
-            elform = 16 if nn == 10 else 10
+            elform = 10
     # hourglass id stamped on every *PART (0 = LS-DYNA default, no *HOURGLASS)
     hgid = int(hourglass.get("hgid", 1)) if hourglass is not None else 0
     nids = np.arange(start_nid, start_nid + n_nodes, dtype=np.int64)
@@ -245,6 +320,8 @@ def write_k(
         for inc in include_files:
             f.write("*INCLUDE\n")
             f.write(f"{inc}\n")
+        for it in include_transforms:
+            _write_include_transform(f, w, it)
 
         if mesh_only:
             f.write(f"$ mesh-only file (for *INCLUDE): define *PART {pid}"
@@ -450,6 +527,17 @@ def write_k(
             _write_rigidwall(f, w, rw)
         for n1, n2 in spotwelds:
             _write_spotweld(f, w, int(n1), int(n2))
+        if nodal_rigid_bodies and not mesh_only:
+            sid = _write_nodal_rigid_bodies(f, w, sid, nodal_rigid_bodies)
+        # shared auto element-id counter for point masses and discretes: the
+        # first free id after the mesh elements
+        next_eid = start_eid + len(elems)
+        if point_masses:
+            next_eid = _write_point_masses(f, w, point_masses, next_eid)
+        if discretes and not mesh_only:
+            _write_discretes(f, w, discretes, unique_pids, next_eid)
+        if damping is not None and not mesh_only:
+            _write_damping_global(f, w, damping)
         if databases is not None:
             _write_databases(f, w, databases)
         if cross_sections:
@@ -477,7 +565,7 @@ def _write_mesh_blocks(f, w: _Widths, element_kind: str, nn: int,
         f.write("$#   eid     pid      n1      n2      n3      n4\n")
         elem_block = np.column_stack((eids, part_ids, elem_nids))
         np.savetxt(f, elem_block, fmt=f"%{w.n}d" * 6)
-    elif nn == 4:
+    elif nn == 4:   # TET4 as degenerate hex (n5..n8 = n4)
         f.write("*ELEMENT_SOLID\n")
         f.write("$#   eid     pid      n1      n2      n3      n4      n5"
                 "      n6      n7      n8\n")
@@ -486,13 +574,25 @@ def _write_mesh_blocks(f, w: _Widths, element_kind: str, nn: int,
              elem_nids[:, 3], elem_nids[:, 3], elem_nids[:, 3], elem_nids[:, 3])
         )
         np.savetxt(f, elem_block, fmt=f"%{w.n}d" * 10)
-    else:  # TET10, two-line format
+    elif nn == 8:   # HEX8, one-line 10-field format, all 8 node ids distinct
+        # connectivity is written verbatim (LS-DYNA / VTK_HEXAHEDRON order,
+        # positive jacobian) - the mesher's tet NEGFIX does not apply to hexes
+        f.write("*ELEMENT_SOLID\n")
+        f.write("$#   eid     pid      n1      n2      n3      n4      n5"
+                "      n6      n7      n8\n")
+        elem_block = np.column_stack((eids, part_ids, elem_nids))
+        np.savetxt(f, elem_block, fmt=f"%{w.n}d" * 10)
+    elif nn == 10:  # TET10, two-line format
         f.write("*ELEMENT_SOLID\n")
         f.write("$#   eid     pid\n")
         f.write("$#    n1      n2      n3      n4      n5      n6      n7"
                 "      n8      n9     n10\n")
         elem_block = np.column_stack((eids, part_ids, elem_nids))
         np.savetxt(f, elem_block, fmt=f"%{w.n}d" * 2 + "\n" + f"%{w.n}d" * 10)
+    else:
+        raise ValueError(
+            f"unsupported solid element with {nn} nodes per element: "
+            f"expected 4 (TET4), 8 (HEX8) or 10 (TET10)")
 
 
 def write_k_include(
@@ -920,20 +1020,46 @@ def _write_prescribed_motion(f, w: _Widths, pm: dict) -> None:
 
 
 def _write_rigidwall(f, w: _Widths, rw: dict) -> None:
-    """*RIGIDWALL_PLANAR over all nodes (NSID 0); the normal points from the
-    tail toward the head."""
+    """A rigid wall over all nodes (NSID 0). Default (no "shape"):
+    *RIGIDWALL_PLANAR whose normal points from the tail toward the head.
+    "shape": "cylinder" -> *RIGIDWALL_GEOMETRIC_CYLINDER (tail = base-cap
+    centre, tail->head = axis, "radius" + "length"); "shape": "sphere" ->
+    *RIGIDWALL_GEOMETRIC_SPHERE (tail = centre, tail->head = orientation,
+    "radius")."""
     xt, yt, zt = (float(v) for v in rw["tail"])
     xh, yh, zh = (float(v) for v in rw["head"])
-    f.write("*RIGIDWALL_PLANAR\n")
-    f.write("$#    nsid    nsidex     boxid    offset     birth     death"
-            "     rwksf\n")
-    f.write(f"{0:{w.f}d}{0:{w.f}d}{0:{w.f}d}{0.0:{w.f}.1f}{0.0:{w.f}.1f}"
-            f"{1.0e28:{w.f}.4g}{1.0:{w.f}.1f}\n")
+    shape = str(rw.get("shape") or "planar").lower()
+    if shape in ("planar", "plane"):
+        f.write("*RIGIDWALL_PLANAR\n")
+        f.write("$#    nsid    nsidex     boxid    offset     birth     death"
+                "     rwksf\n")
+        f.write(f"{0:{w.f}d}{0:{w.f}d}{0:{w.f}d}{0.0:{w.f}.1f}{0.0:{w.f}.1f}"
+                f"{1.0e28:{w.f}.4g}{1.0:{w.f}.1f}\n")
+        f.write("$#      xt        yt        zt        xh        yh        zh"
+                "      fric      wvel\n")
+        f.write(f"{xt:{w.f}.4g}{yt:{w.f}.4g}{zt:{w.f}.4g}"
+                f"{xh:{w.f}.4g}{yh:{w.f}.4g}{zh:{w.f}.4g}"
+                f"{float(rw.get('fric', 0.0)):{w.f}.4g}{0.0:{w.f}.1f}\n")
+        return
+    if shape not in ("cylinder", "sphere"):
+        raise ValueError(f"unknown rigidwall shape {rw.get('shape')!r}: "
+                         f"expected 'cylinder' or 'sphere' (or omit for planar)")
+    f.write(f"*RIGIDWALL_GEOMETRIC_{shape.upper()}\n")
+    f.write("$#    nsid    nsidex     boxid     birth     death\n")
+    f.write(f"{0:{w.f}d}{0:{w.f}d}{0:{w.f}d}{0.0:{w.f}.1f}"
+            f"{1.0e28:{w.f}.4g}\n")
     f.write("$#      xt        yt        zt        xh        yh        zh"
-            "      fric      wvel\n")
+            "      fric\n")
     f.write(f"{xt:{w.f}.4g}{yt:{w.f}.4g}{zt:{w.f}.4g}"
             f"{xh:{w.f}.4g}{yh:{w.f}.4g}{zh:{w.f}.4g}"
-            f"{float(rw.get('fric', 0.0)):{w.f}.4g}{0.0:{w.f}.1f}\n")
+            f"{float(rw.get('fric', 0.0)):{w.f}.4g}\n")
+    if shape == "cylinder":
+        f.write("$#  radcyl    lencyl\n")
+        f.write(f"{float(rw['radius']):{w.f}.4g}"
+                f"{float(rw['length']):{w.f}.4g}\n")
+    else:
+        f.write("$#  radsph\n")
+        f.write(f"{float(rw['radius']):{w.f}.4g}\n")
 
 
 def _write_spotweld(f, w: _Widths, n1: int, n2: int) -> None:
@@ -941,6 +1067,138 @@ def _write_spotweld(f, w: _Widths, n1: int, n2: int) -> None:
     f.write("$#      n1        n2        sn        ss         n         m"
             "     tfail      epsf\n")
     f.write(f"{n1:{w.f}d}{n2:{w.f}d}" + f"{0.0:{w.f}.1f}" * 6 + "\n")
+
+
+def _write_nodal_rigid_bodies(f, w: _Widths, sid: int, nrbs) -> int:
+    """One *SET_NODE_LIST_TITLE (consuming the shared set-id counter) plus a
+    *CONSTRAINED_NODAL_RIGID_BODY referencing it, per item. The rigid-body
+    part id must be given explicitly ("pid"); node ids are raw (already
+    offset). Returns the updated set-id counter."""
+    for nrb in nrbs:
+        if nrb.get("pid") is None:
+            raise ValueError("nodal_rigid_bodies items require an explicit "
+                             "'pid' (the rigid-body part id)")
+        nodes = np.asarray(nrb["nodes"], dtype=np.int64)
+        if len(nodes) == 0:   # skip empty rigid bodies entirely
+            continue
+        pid = int(nrb["pid"])
+        sid += 1
+        _write_node_set(f, w, sid,
+                        nrb.get("title") or f"nodal rigid body {pid}", nodes)
+        f.write("*CONSTRAINED_NODAL_RIGID_BODY\n")
+        f.write("$#     pid       cid      nsid     pnode      iprt    drflag"
+                "    rrflag\n")
+        f.write(w.ints(pid, 0, sid, 0, 0, 0, 0) + "\n")
+    return sid
+
+
+def _write_point_masses(f, w: _Widths, pms, next_eid: int) -> int:
+    """One *ELEMENT_MASS per item. Items without an explicit "eid" take the
+    next id from the shared auto element-id counter (which starts just past
+    the mesh elements); an explicit "eid" is used verbatim and bumps the
+    counter past it. Returns the updated counter."""
+    for pm in pms:
+        if pm.get("eid") is not None:
+            eid = int(pm["eid"])
+            next_eid = max(next_eid, eid + 1)
+        else:
+            eid = next_eid
+            next_eid += 1
+        f.write("*ELEMENT_MASS\n")
+        f.write("$#   eid     nid            mass     pid\n")
+        f.write(f"{eid:{w.n}d}{int(pm['nid']):{w.n}d}"
+                f"{float(pm['mass']):{w.c}.4e}\n")
+    return next_eid
+
+
+def _discrete_prop(d: dict) -> tuple[float, float, int]:
+    """Validate a discretes item and return its (k, c, pid) property key
+    (pid 0 = auto-number). Exactly one of k / c must be set."""
+    k = float(d.get("k") or 0.0)
+    c = float(d.get("c") or 0.0)
+    if (k != 0.0) == (c != 0.0):
+        raise ValueError("each discretes item needs exactly one of 'k' "
+                         "(spring stiffness) or 'c' (damping constant), got "
+                         f"k={d.get('k')!r}, c={d.get('c')!r}")
+    return k, c, int(d.get("pid") or 0)
+
+
+def _write_discretes(f, w: _Widths, discretes, unique_pids, next_eid: int) -> None:
+    """Spring/damper elements. One *PART + *SECTION_DISCRETE + *MAT_SPRING_
+    ELASTIC (k) or *MAT_DAMPER_VISCOUS (c) per distinct (k, c, pid) combo
+    (PID = SECID = MID); combos without an explicit "pid" are auto-numbered
+    consecutively above max(mesh part ids, explicit discrete pids). Then one
+    *ELEMENT_DISCRETE per item, ids from the shared auto element-id counter."""
+    props = [_discrete_prop(d) for d in discretes]
+    auto_base = max([int(p) for p in unique_pids]
+                    + [p for _, _, p in props]) + 1
+    prop_pids: dict[tuple[float, float, int], int] = {}
+    for key in props:
+        if key in prop_pids:
+            continue
+        k, c, pid = key
+        pid = pid or auto_base + sum(1 for v in prop_pids.values()
+                                     if v >= auto_base)
+        prop_pids[key] = pid
+        kind = "spring" if k else "damper"
+        f.write("*PART\n")
+        f.write(f"discrete {kind} k={k:g} c={c:g}"[:70] + "\n")
+        f.write("$#     pid     secid       mid     eosid      hgid"
+                "      grav    adpopt      tmid\n")
+        f.write(w.ints(pid, pid, pid, 0, 0, 0, 0, 0) + "\n")
+        f.write("*SECTION_DISCRETE\n")
+        f.write("$#   secid       dro        kd        v0        cl        fd\n")
+        f.write(f"{pid:{w.f}d}{0:{w.f}d}" + f"{0.0:{w.f}.1f}" * 4 + "\n")
+        f.write("$#      cdl       tdl\n")
+        f.write(f"{0.0:{w.f}.1f}{0.0:{w.f}.1f}\n")
+        if k:
+            f.write("*MAT_SPRING_ELASTIC\n")
+            f.write("$#     mid         k\n")
+            f.write(f"{pid:{w.f}d}{k:{w.f}.4g}\n")
+        else:
+            f.write("*MAT_DAMPER_VISCOUS\n")
+            f.write("$#     mid        dc\n")
+            f.write(f"{pid:{w.f}d}{c:{w.f}.4g}\n")
+    for d, key in zip(discretes, props):
+        f.write("*ELEMENT_DISCRETE\n")
+        f.write("$#   eid     pid      n1      n2     vid               s"
+                "      pf\n")
+        f.write(f"{next_eid:{w.n}d}{prop_pids[key]:{w.n}d}"
+                f"{int(d['n1']):{w.n}d}{int(d['n2']):{w.n}d}"
+                f"{0:{w.n}d}{1.0:{w.c}.1f}{0:{w.n}d}\n")
+        next_eid += 1
+
+
+def _write_damping_global(f, w: _Widths, dmp: dict) -> None:
+    """*DAMPING_GLOBAL: a system damping constant VALDMP, optionally scaled
+    in time by the load curve LCID (0 = constant)."""
+    f.write("*DAMPING_GLOBAL\n")
+    f.write("$#    lcid    valdmp       stx       sty       stz       srx"
+            "       sry       srz\n")
+    f.write(f"{int(dmp.get('lcid') or 0):{w.f}d}"
+            f"{float(dmp['valdmp']):{w.f}.4g}"
+            + f"{0.0:{w.f}.1f}" * 6 + "\n")
+
+
+def _write_include_transform(f, w: _Widths, it: dict) -> None:
+    """*INCLUDE_TRANSFORM: filename line, then the id-offset card (IDNOFF
+    IDEOFF IDPOFF IDMOFF IDSOFF IDFOFF IDDOFF), the IDROFF card, the scale
+    card (FCTMAS FCTTIM FCTLEN FCTTEM INCOUT1) and the TRANID card. Unset
+    offsets stay 0, scale factors 1.0."""
+    f.write("*INCLUDE_TRANSFORM\n")
+    f.write(f"{it['file']}\n")
+    f.write("$#  idnoff    ideoff    idpoff    idmoff    idsoff    idfoff"
+            "    iddoff\n")
+    f.write(w.ints(it.get("idnoff", 0), it.get("ideoff", 0),
+                   it.get("idpoff", 0), it.get("idmoff", 0),
+                   it.get("idsoff", 0), it.get("idfoff", 0), 0) + "\n")
+    f.write("$#  idroff              prefix    suffix\n")
+    f.write(w.ints(it.get("idroff", 0)) + "\n")
+    f.write("$#  fctmas    fcttim    fctlen    fcttem   incout1\n")
+    f.write(f"{1.0:{w.f}.1f}{1.0:{w.f}.1f}{1.0:{w.f}.1f}{1.0:{w.f}.1f}"
+            f"{0:{w.f}d}\n")
+    f.write("$#  tranid\n")
+    f.write(w.ints(it.get("tranid", 0)) + "\n")
 
 
 def _write_databases(f, w: _Widths, db: dict) -> None:

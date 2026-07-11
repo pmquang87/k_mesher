@@ -51,6 +51,25 @@ def _tri3():
     return coords, elems, "shell"
 
 
+def _hex8():
+    """Two stacked unit cubes sharing a face: 12 nodes, 2 hex8 elements.
+
+    Node order per element is LS-DYNA / VTK_HEXAHEDRON: n1-n4 bottom quad
+    (counter-clockwise viewed from above), n5-n8 the top quad directly
+    above."""
+    quad = np.array([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]])
+    coords = np.vstack(
+        [np.column_stack((quad, np.full(4, z))) for z in (0.0, 1.0, 2.0)]
+    )
+    elems = np.array(
+        [
+            [1, 2, 3, 4, 5, 6, 7, 8],  # lower cube
+            [5, 6, 7, 8, 9, 10, 11, 12],  # upper cube
+        ]
+    )
+    return coords, elems, "solid"
+
+
 def _quad4():
     coords = np.array(
         [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0]]
@@ -62,6 +81,7 @@ def _quad4():
 ALL_MESHES = {
     "tet4": _tet4,
     "tet10": _tet10,
+    "hex8": _hex8,
     "tri3": _tri3,
     "quad4": _quad4,
 }
@@ -161,6 +181,7 @@ def test_tet10_permutation_is_self_inverse():
     [
         ("tet4", {"tetra"}),
         ("tet10", {"tetra10"}),
+        ("hex8", {"hexahedron"}),
         ("tri3", {"triangle"}),
         ("quad4", {"quad"}),
     ],
@@ -260,3 +281,90 @@ def test_missing_meshio_friendly_error(monkeypatch):
     monkeypatch.setattr(builtins, "__import__", fake_import)
     with pytest.raises(ImportError, match="pip install meshio"):
         mesh_io._require_meshio()
+
+
+# --------------------------------------------------------------------------
+# HEX8 support.
+# --------------------------------------------------------------------------
+def _hex_volumes(coords, elems):
+    """Signed volume of each hex (elems 1-based, VTK/LS-DYNA node order).
+
+    Uses the standard 5-tet corner decomposition, exact for planar-faced
+    hexes such as the test cubes; sign follows the node-ordering orientation.
+    """
+    tets = [(0, 1, 3, 4), (1, 2, 3, 6), (1, 3, 4, 6), (3, 4, 6, 7), (1, 4, 5, 6)]
+    vols = []
+    for row in elems:
+        c = coords[row - 1]
+        v = 0.0
+        for a, b, d, e in tets:
+            v += np.dot(c[b] - c[a], np.cross(c[d] - c[a], c[e] - c[a])) / 6.0
+        vols.append(v)
+    return np.array(vols)
+
+
+def test_hex8_to_meshio_single_block():
+    coords, elems, kind = _hex8()
+    mesh = mesh_io.to_meshio(coords, elems, kind)
+
+    assert set(mesh.cells_dict) == {"hexahedron"}
+    conn = mesh.cells_dict["hexahedron"]
+    assert conn.shape == (2, 8)
+    # identity permutation: 0-based copy of the 1-based input
+    assert np.array_equal(conn, elems - 1)
+
+
+def test_hex8_from_meshio_inverts_exactly():
+    coords, elems, kind = _hex8()
+    mesh = mesh_io.to_meshio(coords, elems, kind)
+    rc, re, rkind = mesh_io.from_meshio(mesh)
+
+    assert rkind == "solid"
+    assert np.allclose(rc, coords)
+    assert np.array_equal(re, elems)
+    assert re.dtype == np.int64
+
+
+@pytest.mark.parametrize("ext,fmt", [(".vtu", None), (".inp", "abaqus")])
+def test_hex8_orientation_preserved_on_disk(tmp_path, ext, fmt):
+    coords, elems, kind = _hex8()
+    vols_before = _hex_volumes(coords, elems)
+    assert np.all(vols_before > 0)  # sanity: input is positively oriented
+
+    path = str(tmp_path / f"hex8{ext}")
+    mesh_io.export_mesh(path, coords, elems, kind, file_format=fmt)
+    rc, re, rkind = mesh_io.import_mesh(path, file_format=fmt)
+
+    assert rkind == "solid"
+    assert re.shape == (2, 8)
+    vols_after = _hex_volumes(rc, re)
+    assert np.all(vols_after > 0)  # same sign: orientation preserved
+    assert np.allclose(np.sort(vols_after), np.sort(vols_before))
+
+
+def test_mixed_tetra_and_hexahedron_raises():
+    coords, elems, _ = _hex8()
+    hex_mesh = mesh_io.to_meshio(coords, elems, "solid")
+    combined = meshio.Mesh(
+        hex_mesh.points,
+        list(hex_mesh.cells) + [("tetra", np.array([[0, 1, 2, 4]]))],
+    )
+    with pytest.raises(ValueError, match="mixes tetrahedra and hexahedra"):
+        mesh_io.from_meshio(combined)
+
+
+@pytest.mark.parametrize("cell_type,width", [("hexahedron20", 20), ("hexahedron27", 27)])
+def test_quadratic_hex_raises_notimplemented(cell_type, width):
+    mesh = meshio.Mesh(
+        np.zeros((width, 3)),
+        [(cell_type, np.arange(width, dtype=np.int64).reshape(1, width))],
+    )
+    with pytest.raises(NotImplementedError, match=cell_type):
+        mesh_io.from_meshio(mesh)
+
+
+def test_hex8_permutation_is_identity_and_self_inverse():
+    fwd = mesh_io._DYNA_TO_MESHIO_HEX8
+    inv = mesh_io._MESHIO_TO_DYNA_HEX8
+    assert fwd == list(range(8))
+    assert [inv[fwd[i]] for i in range(8)] == list(range(8))

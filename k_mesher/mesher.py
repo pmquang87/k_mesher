@@ -1,4 +1,4 @@
-"""Core meshing: STEP geometry -> TET4/TET10 solids or TRI3/QUAD4 shells
+"""Core meshing: STEP geometry -> TET4/TET10/HEX8 solids or TRI3/QUAD4 shells
 using the gmsh API.
 
 This module is GUI-agnostic so it can also be used from scripts/tests.
@@ -82,6 +82,7 @@ def format_name(path: str) -> str:
 ETYPES = {
     "TET4":  {"family": "solid", "order": 1},
     "TET10": {"family": "solid", "order": 2},
+    "HEX8":  {"family": "solid", "order": 1, "hex": True},
     "TRI3":  {"family": "shell", "recombine": False},
     "QUAD4": {"family": "shell", "recombine": True},
 }
@@ -90,6 +91,30 @@ ETYPES = {
 #                 nodes per surface tri)
 TET_TYPE = {1: (4, 4, 2, 3), 2: (11, 10, 9, 6)}
 GMSH_TRI3, GMSH_QUAD4 = 2, 3
+# gmsh 3D element type ids: tet, hex, prism, pyramid (prism/pyramid/tet are
+# only queried to detect a MIXED solid mesh after a partial recombination)
+GMSH_TET4, GMSH_HEX8, GMSH_PRISM6, GMSH_PYR5 = 4, 5, 6, 7
+
+# gmsh HEX8 -> LS-DYNA HEX8 node ordering: IDENTICAL. Both use the
+# VTK_HEXAHEDRON convention (n1-n4 bottom quad, n5-n8 top quad above it,
+# positive jacobian). Verified empirically on transfinite boxes: every gmsh
+# hex has positive signed volume when read in this ordering, so the map is
+# the identity permutation.
+GMSH2DYNA_HEX8 = [0, 1, 2, 3, 4, 5, 6, 7]
+
+# hex node permutation that mirrors the element (fixes negative volume):
+# swap the bottom (n1..n4) and top (n5..n8) quads
+HEXFLIP = [4, 5, 6, 7, 0, 1, 2, 3]
+
+# hexahedron decomposed into 6 tets fanned around the n1-n7 diagonal
+# (0-based corners; every hex face contains corner 0 or corner 6, so the
+# signed tet volumes sum to the exact volume of the planar-faceted cell)
+HEX2TET6 = ((0, 1, 2, 6), (0, 2, 3, 6), (0, 3, 7, 6),
+            (0, 7, 4, 6), (0, 4, 5, 6), (0, 5, 1, 6))
+
+# the 12 hex edges (0-based corner pairs)
+HEX_EDGES = ((0, 1), (1, 2), (2, 3), (3, 0), (4, 5), (5, 6), (6, 7), (7, 4),
+             (0, 4), (1, 5), (2, 6), (3, 7))
 
 # gmsh TET10 -> LS-DYNA TET10 node ordering: corner nodes and the first four
 # mid-edge nodes coincide; the mid nodes of edges (2,4) and (3,4) are swapped.
@@ -138,7 +163,7 @@ class SymmetryPlane:
 @dataclass
 class MeshSettings:
     step_file: str                     # input CAD/mesh file: STEP/IGES/BREP/STL
-    element_type: str = "TET4"         # TET4 | TET10 | TRI3 | QUAD4
+    element_type: str = "TET4"         # TET4 | TET10 | HEX8 | TRI3 | QUAD4
     size_max: float = 10.0
     size_min: float = 0.0
     curvature_refine: bool = True
@@ -152,6 +177,12 @@ class MeshSettings:
     # refinement regions: {"kind": "sphere", "params": [cx,cy,cz,r], "size": s}
     #                     {"kind": "box", "params": [x0,y0,z0,x1,y1,z1], "size": s}
     refinements: list[dict] = field(default_factory=list)
+    # boundary-layer / near-wall grading (TET and shell meshing, NOT HEX8):
+    #   {"faces": [tags] | "all", "thickness": t, "ratio": 1.2,
+    #    "nb_layers": n?, "size_wall": s?, "size_far": None?}
+    # Implemented as graded near-wall SIZING (Distance + Threshold fields),
+    # not as an extruded anisotropic layer - see _boundary_layer_field.
+    boundary_layer: dict | None = None
     face_sizes: dict[int, float] = field(default_factory=dict)  # tag -> size
     defeature_faces: list[int] = field(default_factory=list)    # remove these
     collect_faces: list[int] = field(default_factory=list)      # face tags for sets
@@ -163,7 +194,8 @@ class MeshSettings:
 @dataclass
 class MeshResult:
     coords: np.ndarray                 # (N, 3) float
-    elems: np.ndarray                  # solids: (M, 4|10), shells: (M, 4)
+    elems: np.ndarray                  # solids: (M, 4|10) tets or (M, 8)
+                                       # hexes, shells: (M, 4)
                                        # 1-based, LS-DYNA node ordering
     elem_parts: np.ndarray             # (M,) 0-based body index per element
     part_names: list[str]              # one entry per body ("" if unnamed)
@@ -212,7 +244,10 @@ def mesh_step(settings: MeshSettings, log=print, preview_path: str | None = None
     formats (.msh/.vtk/... - the format follows the extension)."""
     if settings.element_type not in ETYPES:
         raise ValueError(f"Unknown element type: {settings.element_type}")
-    family = ETYPES[settings.element_type]["family"]
+    etype = ETYPES[settings.element_type]
+    family = etype["family"]
+    if etype.get("hex"):
+        _check_hex_settings(settings)
 
     # interruptible=False: skips SIGINT handler installation, which would fail
     # when meshing runs in the GUI worker thread (signals need the main thread).
@@ -228,7 +263,10 @@ def mesh_step(settings: MeshSettings, log=print, preview_path: str | None = None
                 _generate_mesh(settings, log)
 
             shell_checks = {}
-            if family == "solid":
+            if family == "solid" and etype.get("hex"):
+                coords, elems, elem_parts, part_names, tag_map = \
+                    _extract_hexes(log)
+            elif family == "solid":
                 coords, elems, elem_parts, part_names, tag_map = _extract_tets(
                     ETYPES[settings.element_type]["order"], log)
             else:
@@ -821,6 +859,7 @@ def _load_tessellation(settings: MeshSettings, family: str, log):
         ("symmetry planes", settings.symmetry),
         ("defeaturing", settings.defeature_faces),
         ("refinement regions", settings.refinements),
+        ("boundary layers", settings.boundary_layer),
         ("per-face mesh sizes", settings.face_sizes),
         ("face sets / roles", settings.collect_faces),
     ]
@@ -1020,9 +1059,110 @@ def _apply_symmetry_cuts(planes: list[SymmetryPlane], bbox, log) -> None:
 # meshing
 # --------------------------------------------------------------------------
 
+def _check_hex_settings(settings: MeshSettings) -> None:
+    """Reject option combinations that do not compose with transfinite HEX8
+    meshing: transfinite constraints ignore size fields (refinements,
+    per-face sizes, boundary layers) and rarely survive boolean cuts
+    (symmetry) or topology edits (defeaturing)."""
+    if input_kind(settings.step_file) == "mesh":
+        raise RuntimeError(
+            "HEX8 meshing needs CAD solids (STEP/IGES/BREP) - a tessellated "
+            "mesh (STL/OBJ/PLY) carries only a surface triangulation and "
+            "cannot be hex-meshed. Mesh it as TET4/TET10 instead.")
+    unsupported = [name for name, val in (
+        ("symmetry planes", settings.symmetry),
+        ("defeaturing", settings.defeature_faces),
+        ("refinement regions", settings.refinements),
+        ("per-face mesh sizes", settings.face_sizes),
+        ("a boundary layer", settings.boundary_layer),
+    ) if val]
+    if unsupported:
+        raise RuntimeError(
+            f"HEX8 (transfinite) meshing does not support: "
+            f"{', '.join(unsupported)}. Transfinite/structured meshing "
+            f"ignores size fields and rarely survives boolean cuts - mesh "
+            f"as TET4/TET10 to use these features.")
+
+
+def _bl_first_layer(bl: dict) -> float:
+    """Size at the wall for a boundary-layer spec: the explicit 'size_wall'
+    if given, otherwise the first-layer height of a geometric progression of
+    'nb_layers' (default 4) layers growing by 'ratio' across 'thickness'."""
+    thickness = float(bl["thickness"])
+    if bl.get("size_wall"):
+        return float(bl["size_wall"])
+    ratio = float(bl.get("ratio", 1.2))
+    n = max(int(bl.get("nb_layers") or 4), 1)
+    if ratio == 1.0:
+        return thickness / n
+    return thickness * (ratio - 1.0) / (ratio ** n - 1.0)
+
+
+def _boundary_layer_field(settings: MeshSettings, log) -> int:
+    """Create the near-wall grading field for ``settings.boundary_layer``
+    and return its field id (composed into the global Min field by
+    _apply_refinements).
+
+    Honest scope note: this is implemented as graded near-wall SIZING - a
+    Distance field from the wall faces plus a Threshold ramp from the wall
+    size to the far size across the layer thickness - NOT as gmsh's extruded
+    'BoundaryLayer' field. The extruded 3D boundary-layer field is
+    experimental/fragile in gmsh 4.x and does not compose with the existing
+    Min-field machinery; the Distance+Threshold grading is robust and yields
+    isotropic elements that are fine near the walls (it does not produce
+    anisotropic wall-normal layer stacks)."""
+    bl = settings.boundary_layer
+    thickness = float(bl["thickness"])
+    if thickness <= 0:
+        raise ValueError("boundary_layer['thickness'] must be > 0")
+    size_wall = _bl_first_layer(bl)
+    size_far = float(bl.get("size_far") or settings.size_max)
+
+    faces = bl.get("faces", "all")
+    if isinstance(faces, str):
+        if faces != "all":
+            raise ValueError(
+                f"boundary_layer['faces'] must be a list of face tags or "
+                f"'all', got {faces!r}")
+        vols = gmsh.model.getEntities(3)
+        if vols:
+            tags = sorted({abs(t) for _, t in gmsh.model.getBoundary(
+                vols, combined=False, oriented=False)})
+        else:
+            tags = [t for _, t in gmsh.model.getEntities(2)]
+    else:
+        existing = {t for _, t in gmsh.model.getEntities(2)}
+        tags = []
+        for t in faces:
+            if int(t) in existing:
+                tags.append(int(t))
+            else:
+                log(f"WARNING: boundary-layer face {t} not found - skipped")
+    if not tags:
+        raise RuntimeError("boundary_layer: no (valid) wall faces to grade "
+                           "from - check the face tags")
+
+    fld = gmsh.model.mesh.field
+    fd = fld.add("Distance")
+    fld.setNumbers(fd, "SurfacesList", tags)
+    fld.setNumber(fd, "Sampling", 100)
+    ft = fld.add("Threshold")
+    fld.setNumber(ft, "InField", fd)
+    fld.setNumber(ft, "SizeMin", size_wall)
+    fld.setNumber(ft, "SizeMax", size_far)
+    fld.setNumber(ft, "DistMin", 0.0)
+    fld.setNumber(ft, "DistMax", thickness)
+    log(f"Boundary layer (graded near-wall sizing) on {len(tags)} face(s): "
+        f"size {size_wall:g} at the wall -> {size_far:g} beyond thickness "
+        f"{thickness:g}")
+    return ft
+
+
 def _apply_refinements(settings: MeshSettings, log) -> None:
-    """Create gmsh size fields for refinement regions and per-face sizes."""
-    if not settings.refinements and not settings.face_sizes:
+    """Create gmsh size fields for refinement regions, per-face sizes and
+    the optional boundary layer (all composed into one Min field)."""
+    if (not settings.refinements and not settings.face_sizes
+            and not settings.boundary_layer):
         return
     fld = gmsh.model.mesh.field
     ids = []
@@ -1070,6 +1210,9 @@ def _apply_refinements(settings: MeshSettings, log) -> None:
         ids.append(ft)
         log(f"Local size {size:g} on face {tag}")
 
+    if settings.boundary_layer:
+        ids.append(_boundary_layer_field(settings, log))
+
     fmin = fld.add("Min")
     fld.setNumbers(fmin, "FieldsList", ids)
     fld.setAsBackgroundMesh(fmin)
@@ -1078,11 +1221,17 @@ def _apply_refinements(settings: MeshSettings, log) -> None:
 def _generate_mesh(settings: MeshSettings, log) -> None:
     etype = ETYPES[settings.element_type]
     family = etype["family"]
+    if etype.get("hex"):
+        _generate_hex_mesh(settings, log)
+        return
 
-    # region/face sizes must not be clamped away by the global minimum size
+    # region/face/boundary-layer sizes must not be clamped away by the
+    # global minimum size
     eff_min = min([settings.size_min] +
                   [float(r["size"]) for r in settings.refinements] +
-                  [float(s) for s in settings.face_sizes.values()])
+                  [float(s) for s in settings.face_sizes.values()] +
+                  ([_bl_first_layer(settings.boundary_layer)]
+                   if settings.boundary_layer else []))
     gmsh.option.setNumber("Mesh.MeshSizeMax", settings.size_max)
     gmsh.option.setNumber("Mesh.MeshSizeMin", eff_min)
     gmsh.option.setNumber(
@@ -1136,6 +1285,71 @@ def _generate_mesh(settings: MeshSettings, log) -> None:
         gmsh.model.mesh.setOrder(2)
         log(f"  second order (TET10): {time.perf_counter() - t0:.1f} s")
         _fix_curved_elements(log)
+    log("Mesh generation finished")
+
+
+_HEX_HINT = (
+    "HEX8 (transfinite) meshing only handles box-like/sweepable volumes - "
+    "gmsh must be able to set up automatic transfinite constraints on all "
+    "6-sided volumes. Full unstructured hex meshing of arbitrary CAD is not "
+    "feasible; mesh this geometry as TET4/TET10 instead.")
+
+
+def _generate_hex_mesh(settings: MeshSettings, log) -> None:
+    """Structured all-hex meshing via gmsh's automatic transfinite setup
+    (gmsh >= 4.8), recombined into hexahedra.
+
+    Element sizing: transfinite meshing ignores size fields; gmsh derives
+    the number of divisions per edge from the effective mesh size, so BOTH
+    Mesh.MeshSizeMin and Mesh.MeshSizeMax are pinned to settings.size_max
+    here (otherwise gmsh's bounding-box-based default size wins whenever it
+    is smaller and silently over-refines - verified empirically). The
+    resulting edge spacing never exceeds size_max; gmsh may round division
+    counts up (to an odd count) for recombination, so the mesh can be
+    somewhat finer than a tet mesh at the same size_max.
+
+    Pure-hex or error: a geometry that is not box-like yields zero hexes
+    (plain tets) or a MIXED solid mesh (hexes plus tets/prisms/pyramids from
+    a partial recombination); both are rejected with a RuntimeError."""
+    gmsh.option.setNumber("Mesh.MeshSizeMax", settings.size_max)
+    gmsh.option.setNumber("Mesh.MeshSizeMin", settings.size_max)
+    gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 0)
+    gmsh.option.setNumber("General.NumThreads", os.cpu_count() or 1)
+    gmsh.option.setNumber("Mesh.Optimize", 0)
+    gmsh.option.setNumber("Mesh.OptimizeNetgen", 0)
+
+    log(f"Meshing HEX8 (transfinite, edge spacing <= {settings.size_max:g})"
+        f" ...")
+    try:
+        gmsh.model.mesh.setTransfiniteAutomatic(recombine=True)
+    except Exception as e:
+        raise RuntimeError(
+            f"HEX8 meshing failed: automatic transfinite setup failed: {e}\n"
+            f"{_HEX_HINT}") from e
+    t0 = time.perf_counter()
+    try:
+        gmsh.model.mesh.generate(3)
+    except Exception as e:
+        raise RuntimeError(
+            f"HEX8 mesh generation failed: {e}\n{_HEX_HINT}") from e
+
+    n_hex = len(gmsh.model.mesh.getElementsByType(GMSH_HEX8)[0])
+    others = {name: len(gmsh.model.mesh.getElementsByType(t)[0])
+              for name, t in (("tets", GMSH_TET4), ("prisms", GMSH_PRISM6),
+                              ("pyramids", GMSH_PYR5))}
+    others = {k: n for k, n in others.items() if n}
+    if n_hex == 0:
+        raise RuntimeError(
+            f"HEX8 meshing produced no hexahedra - the geometry is not "
+            f"box-like/sweepable.\n{_HEX_HINT}")
+    if others:
+        mix = ", ".join(f"{n} {k}" for k, n in others.items())
+        raise RuntimeError(
+            f"HEX8 meshing produced a MIXED solid mesh ({n_hex} hexes + "
+            f"{mix}) from a partial recombination; mixed solid meshes are "
+            f"not supported by the writer - pure hex or nothing.\n"
+            f"{_HEX_HINT}")
+    log(f"  volume mesh: {time.perf_counter() - t0:.1f} s ({n_hex} hexes)")
     log("Mesh generation finished")
 
 
@@ -1207,6 +1421,62 @@ def _extract_tets(order: int, log):
         raise RuntimeError(f"{int(zero.sum())} degenerate (zero-volume) tetrahedra found.")
 
     return coords, tets, elem_parts, part_names, tag_map
+
+
+def _hex_volumes(coords: np.ndarray, hexes: np.ndarray) -> np.ndarray:
+    """Signed cell volume of each hex ((M, 8) 1-based, LS-DYNA/VTK ordering):
+    the sum of the 6 signed tetrahedra of the HEX2TET6 decomposition - exact
+    for planar-faceted cells, positive for a correctly ordered element."""
+    p = coords[np.asarray(hexes, dtype=np.int64) - 1]
+    v = np.zeros(len(p))
+    for a, b, c, d in HEX2TET6:
+        v += np.einsum("ij,ij->i",
+                       np.cross(p[:, b] - p[:, a], p[:, c] - p[:, a]),
+                       p[:, d] - p[:, a])
+    return v / 6.0
+
+
+def _extract_hexes(log):
+    """Return (coords, hexes (M, 8) 1-based LS-DYNA node ordering,
+    elem_parts, part_names, tag_map) - the HEX8 counterpart of _extract_tets.
+
+    gmsh's HEX8 node ordering equals the LS-DYNA/VTK ordering (GMSH2DYNA_HEX8
+    is the identity - verified empirically on transfinite cubes), unused
+    nodes are pruned and positive cell volumes are enforced (inverted cells
+    are fixed by swapping the bottom and top quads)."""
+    node_tags, node_xyz = _get_sorted_nodes()
+
+    conn_blocks, part_blocks, part_names = [], [], []
+    for _, tag in sorted(gmsh.model.getEntities(3)):
+        etags, conn = gmsh.model.mesh.getElementsByType(GMSH_HEX8, tag)
+        if len(etags) == 0:
+            continue
+        conn_blocks.append(np.asarray(conn, dtype=np.int64).reshape(-1, 8))
+        part_blocks.append(np.full(len(etags), len(part_names), dtype=np.int64))
+        name = gmsh.model.getEntityName(3, tag)
+        part_names.append(name.split("/")[-1] if name else "")
+    if not conn_blocks:
+        raise RuntimeError("No hexahedra were generated.")
+    conn = np.vstack(conn_blocks)
+    elem_parts = np.concatenate(part_blocks)
+    if len(part_names) > 1:
+        log(f"{len(part_names)} bodies -> separate parts")
+
+    coords, hexes, tag_map = _map_and_prune(node_tags, node_xyz, conn)
+    hexes = hexes[:, GMSH2DYNA_HEX8]
+
+    # enforce positive volume (LS-DYNA requires positive jacobian)
+    v = _hex_volumes(coords, hexes)
+    neg = v < 0
+    if neg.any():
+        hexes[neg] = hexes[neg][:, HEXFLIP]
+        log(f"Reoriented {int(neg.sum())} inverted hexahedra")
+    zero = v == 0
+    if zero.any():
+        raise RuntimeError(
+            f"{int(zero.sum())} degenerate (zero-volume) hexahedra found.")
+
+    return coords, hexes, elem_parts, part_names, tag_map
 
 
 def _extract_shells(log):
@@ -1297,7 +1567,10 @@ def _collect_face_data(face_tags, tag_map, element_type: str, log):
     if not face_tags:
         return {}, {}
     tags_sorted, new_id_all = tag_map
-    if ETYPES[element_type]["family"] == "solid":
+    if ETYPES[element_type].get("hex"):
+        # recombined transfinite meshes have quad boundary faces
+        face_elem_types = [(GMSH_QUAD4, 4, 4)]
+    elif ETYPES[element_type]["family"] == "solid":
         order = ETYPES[element_type]["order"]
         face_elem_types = [(TET_TYPE[order][2], TET_TYPE[order][3], 3)]
     else:
@@ -1434,7 +1707,19 @@ def _quality_criteria(coords, elems, element_type, sicn):
             crit.append({"name": name, "worst": worst, "limit": "info",
                          "n_fail": 0})
 
-    if family == "solid":
+    if family == "solid" and elems.shape[1] == 8:
+        p = coords[elems - 1]                     # (M, 8, 3)
+        el = np.stack([np.linalg.norm(p[:, a] - p[:, b], axis=1)
+                       for a, b in HEX_EDGES], axis=1)
+        add("aspect ratio", el.max(1) / np.maximum(el.min(1), 1e-300))
+        if sicn is not None:
+            add("SICN", sicn)
+        # hex timestep-critical characteristic length: use the minimum edge
+        # length (a conservative proxy for LS-DYNA's volume / max face area,
+        # which it equals for rectangular cells)
+        char_len = el.min(1)
+        add("min edge (dt)", char_len, info_only=True)
+    elif family == "solid":
         p = coords[elems[:, :4] - 1]
         pairs = [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)]
         el = np.stack([np.linalg.norm(p[:, a] - p[:, b], axis=1)
@@ -1496,6 +1781,10 @@ def _quality_criteria(coords, elems, element_type, sicn):
 def _mass_properties(coords, elems, element_type):
     """COG and inertia tensor about the COG, per unit density (solids) or
     per unit density*thickness (shells)."""
+    if ETYPES[element_type]["family"] == "solid" and elems.shape[1] == 8:
+        # hexes: integrate over the 6-tet decomposition of every cell
+        # (exact for the planar-faceted cell)
+        elems = np.vstack([elems[:, list(idx)] for idx in HEX2TET6])
     p = coords[elems[:, :4] - 1]
     if ETYPES[element_type]["family"] == "solid":
         v = np.einsum("ij,ij->i",
@@ -1601,8 +1890,14 @@ def mass_and_timestep(result: MeshResult, element_type: str,
 def _collect_stats(coords: np.ndarray, elems: np.ndarray, element_type: str,
                    bbox, elem_parts: np.ndarray | None = None) -> dict:
     family = ETYPES[element_type]["family"]
-    p = coords[elems[:, :4] - 1]
-    if family == "solid":
+    is_hex = family == "solid" and elems.shape[1] == 8
+    if is_hex:
+        p = coords[elems - 1]                    # (M, 8, 3)
+        measure = _hex_volumes(coords, elems)
+        gmsh_types = [GMSH_HEX8]
+        label = "volume"
+    elif family == "solid":
+        p = coords[elems[:, :4] - 1]
         measure = np.einsum(
             "ij,ij->i",
             np.cross(p[:, 1] - p[:, 0], p[:, 2] - p[:, 0]),
@@ -1611,6 +1906,7 @@ def _collect_stats(coords: np.ndarray, elems: np.ndarray, element_type: str,
         gmsh_types = [TET_TYPE[ETYPES[element_type]["order"]][0]]
         label = "volume"
     else:
+        p = coords[elems[:, :4] - 1]
         a1 = 0.5 * np.linalg.norm(
             np.cross(p[:, 1] - p[:, 0], p[:, 2] - p[:, 0]), axis=1)
         a2 = 0.5 * np.linalg.norm(
@@ -1682,7 +1978,8 @@ def _collect_stats(coords: np.ndarray, elems: np.ndarray, element_type: str,
         # warning against 0.05); getElementsByType returns elements grouped
         # by volume in tag order, matching the row order of `elems`
         bad = np.argsort(q)[:5]
-        pairs = [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)]
+        pairs = (HEX_EDGES if is_hex
+                 else [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)])
         stats["worst_elements"] = []
         for i in bad:
             c = p[i].mean(axis=0)

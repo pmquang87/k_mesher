@@ -9,12 +9,15 @@ Supported keywords
 ``*KEYWORD`` / ``*KEYWORD LONG=Y`` (field width is auto-detected but the
 parser splits on whitespace, so both the standard 8/16/10 format and the
 20-character LONG format read identically), ``*TITLE``, ``*NODE``,
-``*ELEMENT_SOLID`` (both the one-line 10-field TET4/degenerate-hex form and
-the two-line TET10 form), ``*ELEMENT_SHELL`` (triangles written with
-``n4 == n3``), ``*PART``, ``*SECTION_SOLID`` / ``*SECTION_SHELL``,
+``*ELEMENT_SOLID`` (the one-line 10-field form covering HEX8 and its
+degenerate TET4/wedge/pyramid variants, plus the two-line TET10 form),
+``*ELEMENT_SHELL`` (triangles written with ``n4 == n3``), ``*PART``,
+``*SECTION_SOLID`` / ``*SECTION_SHELL``,
 ``*MAT_ELASTIC`` / ``*MAT_RIGID`` (and a generic ``*MAT_*`` fallback),
-``*SET_NODE_LIST[_TITLE]``, ``*SET_SEGMENT[_TITLE]``, ``*INCLUDE`` and
-``*END``. Unknown keywords are skipped gracefully and recorded.
+``*SET_NODE_LIST[_TITLE]``, ``*SET_PART_LIST[_TITLE]``,
+``*SET_SEGMENT[_TITLE]``, ``*INCLUDE``, ``*INCLUDE_TRANSFORM`` (recorded,
+never auto-resolved) and ``*END``. Unknown keywords are skipped gracefully
+and recorded.
 
 Design notes
 ------------
@@ -22,9 +25,15 @@ Every data line ``k_mesher`` emits is space-separated fixed-width, so the
 reader simply splits on whitespace. This is robust to both the standard and
 the LONG=Y widths and tolerates trailing spaces, blank lines and mixed-case
 keywords. ``$`` lines are comments (``$#`` are column headers); both are
-skipped. Degenerate-hex TET4 (``n5..n8`` repeating ``n4``) and triangle
-shells (``n4 == n3``) collapse to their unique nodes (4 and 3 respectively)
-via consecutive-duplicate removal.
+skipped.
+
+Solid connectivity: an 8-node ``*ELEMENT_SOLID`` row with 8 distinct node
+ids is kept as an 8-tuple hexahedron. LS-DYNA's degenerate forms collapse
+via consecutive-duplicate removal to their unique nodes: TET4
+(``n5..n8`` repeating ``n4``) collapses to 4, a wedge/penta
+(``n5 == n6``, ``n7 == n8``) to 6 and a pyramid (``n5 == n6 == n7 == n8``)
+to 5 — none of these error. Triangle shells (``n4 == n3``) likewise
+collapse to 3 nodes.
 """
 from __future__ import annotations
 
@@ -46,7 +55,9 @@ class KModel:
         ``{nid: (x, y, z)}`` mapping (insertion-ordered by appearance).
     solids:
         list of ``(eid, pid, node_ids)`` where ``node_ids`` is a tuple of the
-        element's unique nodes (4 for a TET4/degenerate hex, 10 for a TET10).
+        element's unique nodes (4 for a TET4/degenerate hex, 5 for a
+        degenerate pyramid, 6 for a degenerate wedge, 8 for a HEX8, 10 for a
+        TET10).
     shells:
         list of ``(eid, pid, node_ids)`` (3 for a triangle, 4 for a quad).
     parts:
@@ -57,12 +68,20 @@ class KModel:
         ``{mid: {"type", "params", "raw"}}``.
     node_sets:
         ``{sid: [nid, ...]}``.
+    part_sets:
+        ``{sid: [pid, ...]}`` from ``*SET_PART_LIST[_TITLE]``.
     segment_sets:
         ``{sid: [(n1, n2, n3, n4), ...]}``.
     long_format:
         ``True`` when the deck declared ``*KEYWORD LONG=Y``.
     includes:
         list of filenames referenced by ``*INCLUDE`` cards.
+    include_transforms:
+        list of ``{"file", "offsets"}`` dicts from ``*INCLUDE_TRANSFORM``
+        cards (``offsets`` is the list of integers on the offset card:
+        idnoff, ideoff, idpoff, idmoff, ...). These are recorded verbatim
+        and are **never** auto-resolved, even with ``resolve_includes=True``,
+        because merging them correctly would require applying the offsets.
     unknown_keywords:
         sorted-on-request list of keyword names that were skipped.
     """
@@ -75,9 +94,11 @@ class KModel:
     sections: dict[int, dict] = field(default_factory=dict)
     materials: dict[int, dict] = field(default_factory=dict)
     node_sets: dict[int, list[int]] = field(default_factory=dict)
+    part_sets: dict[int, list[int]] = field(default_factory=dict)
     segment_sets: dict[int, list[tuple[int, int, int, int]]] = field(default_factory=dict)
     long_format: bool = False
     includes: list[str] = field(default_factory=list)
+    include_transforms: list[dict] = field(default_factory=list)
     unknown_keywords: list[str] = field(default_factory=list)
 
     # -- convenience ------------------------------------------------------
@@ -89,20 +110,36 @@ class KModel:
     def element_count(self) -> int:
         return len(self.solids) + len(self.shells)
 
+    @property
+    def solid_widths(self) -> list[int]:
+        """Sorted distinct solid connectivity widths (e.g. ``[4]``, ``[8]``)."""
+        return sorted({len(nodes) for _, _, nodes in self.solids})
+
     def to_arrays(self, kind: str | None = None) -> tuple[np.ndarray, np.ndarray]:
         """Return ``(coords, elems)`` suitable for feeding back to ``write_k``.
 
         ``coords`` is an ``(N, 3)`` float array ordered by ascending node id;
         ``elems`` is an ``(M, K)`` **1-based** int array whose values index
         rows of ``coords`` (i.e. node ids are compacted to ``1..N`` in the
-        same order). Elements with fewer nodes than the widest one in the set
-        are padded by repeating their last node (matching the writer's
-        convention of storing triangles as ``n4 == n3``). ``kind`` selects
-        ``"solid"`` or ``"shell"``; it defaults to solids when present.
+        same order). ``kind`` selects ``"solid"`` or ``"shell"``; it defaults
+        to solids when present.
+
+        Shells with fewer nodes than the widest one in the set are padded by
+        repeating their last node (matching the writer's convention of
+        storing triangles as ``n4 == n3``). Solids must be uniform — an all
+        TET4 model yields ``(M, 4)``, all TET10 ``(M, 10)``, all HEX8
+        ``(M, 8)``; mixing widths (e.g. tets and hexes in one deck) raises
+        :class:`ValueError` because the writer only emits uniform meshes.
         """
         if kind is None:
             kind = "solid" if self.solids else "shell"
         elements = self.solids if kind == "solid" else self.shells
+
+        if kind == "solid" and len(self.solid_widths) > 1:
+            raise ValueError(
+                "to_arrays('solid') needs a uniform solid mesh but this model "
+                f"mixes elements with {self.solid_widths} nodes; split by "
+                "width (see KModel.solid_widths) before converting")
 
         order = sorted(self.nodes)
         remap = {nid: i + 1 for i, nid in enumerate(order)}
@@ -167,7 +204,8 @@ def read_k(path: str, resolve_includes: bool = False) -> KModel:
     model. ``k_mesher`` writes *INCLUDE fragments with global node/element
     numbering, so merging is a plain union of nodes/elements/sets with no
     renumbering. Missing include files are ignored (their names remain in
-    ``.includes``).
+    ``.includes``). ``*INCLUDE_TRANSFORM`` cards are never resolved; they are
+    only recorded in ``.include_transforms``.
     """
     with open(path) as f:
         lines = f.read().splitlines()
@@ -215,9 +253,15 @@ def read_k(path: str, resolve_includes: bool = False) -> KModel:
             _read_mat(model, body, name)
         elif name.startswith("*SET_NODE_LIST"):
             _read_node_set(model, body, "_TITLE" in name)
+        elif name.startswith("*SET_PART_LIST"):
+            _read_part_set(model, body, "_TITLE" in name)
         elif name.startswith("*SET_SEGMENT"):
             _read_segment_set(model, body, "_TITLE" in name)
-        elif name == "*INCLUDE":
+        elif name == "*INCLUDE_TRANSFORM":
+            # recorded but never auto-resolved (the id/coordinate offsets
+            # would have to be applied for a merge to be meaningful)
+            _read_include_transform(model, body)
+        elif name == "*INCLUDE":  # exact match: must NOT catch *INCLUDE_TRANSFORM
             if body:
                 model.includes.append(body[0])
         else:
@@ -247,7 +291,10 @@ def _read_solids(model: KModel, body: list[str]) -> None:
     j = 0
     while j < len(body):
         t = body[j].split()
-        if len(t) >= 10:  # one-line TET4 / degenerate hex: eid pid n1..n8
+        if len(t) >= 10:  # one-line form: eid pid n1..n8
+            # 8 distinct nodes -> HEX8 kept as-is; LS-DYNA degenerate forms
+            # (TET4: n5..n8 == n4, wedge: n5 == n6 and n7 == n8, pyramid:
+            # n5..n8 equal) collapse to their unique nodes (4 / 6 / 5).
             eid, pid = int(t[0]), int(t[1])
             nodes = _collapse([int(x) for x in t[2:]])
             j += 1
@@ -326,6 +373,36 @@ def _read_node_set(model: KModel, body: list[str], has_title: bool) -> None:
     model.node_sets[sid] = nids
 
 
+def _read_part_set(model: KModel, body: list[str], has_title: bool) -> None:
+    """``*SET_PART_LIST[_TITLE]``: sid card, then part ids (8 per row)."""
+    rows = body[1:] if has_title else body
+    if not rows:
+        return
+    sid = int(rows[0].split()[0])
+    pids: list[int] = []
+    for row in rows[1:]:
+        pids.extend(int(_to_float(x)) for x in row.split())
+    model.part_sets[sid] = [p for p in pids if p != 0]
+
+
+def _read_include_transform(model: KModel, body: list[str]) -> None:
+    """``*INCLUDE_TRANSFORM``: filename card, then the id-offset card.
+
+    Recorded as ``{"file": ..., "offsets": [idnoff, ideoff, ...]}`` without
+    resolving the include or applying the offsets.
+    """
+    if not body:
+        return
+    offsets: list[int] = []
+    if len(body) > 1:
+        for tok in body[1].split():
+            try:
+                offsets.append(int(_to_float(tok)))
+            except ValueError:
+                offsets.append(0)
+    model.include_transforms.append({"file": body[0], "offsets": offsets})
+
+
 def _read_segment_set(model: KModel, body: list[str], has_title: bool) -> None:
     rows = body[1:] if has_title else body
     if not rows:
@@ -348,7 +425,9 @@ def _merge(dst: KModel, src: KModel) -> None:
     dst.sections.update(src.sections)
     dst.materials.update(src.materials)
     dst.node_sets.update(src.node_sets)
+    dst.part_sets.update(src.part_sets)
     dst.segment_sets.update(src.segment_sets)
+    dst.include_transforms.extend(src.include_transforms)
     dst.long_format = dst.long_format or src.long_format
     for kwname in src.unknown_keywords:
         if kwname not in dst.unknown_keywords:
