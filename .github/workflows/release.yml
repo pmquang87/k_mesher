@@ -1,7 +1,10 @@
 name: release
 
-# Cut a release by pushing a version tag:
+# Cut a release either by pushing a version tag:
 #   git tag v0.6.0 && git push origin v0.6.0
+# or by dispatching this workflow on main ("Run workflow" in the Actions tab)
+# — the dispatch path derives the tag from k_mesher/_version.py and
+# `gh release create` creates the tag itself.
 # Builds the sdist + wheel, checks them, verifies the tag matches
 # k_mesher/_version.py, creates a GitHub Release with the artifacts, and
 # publishes to PyPI via Trusted Publishing (the `pypi` job needs the trusted
@@ -11,6 +14,7 @@ name: release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -25,14 +29,28 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Check the tag matches the package version
+      - name: Resolve the release tag (and check it matches the version)
         run: |
           PKG_VERSION=$(python -c "import runpy; print(runpy.run_path('k_mesher/_version.py')['__version__'])")
-          TAG_VERSION="${GITHUB_REF_NAME#v}"
-          if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
-            echo "Tag $GITHUB_REF_NAME does not match _version.py ($PKG_VERSION)" >&2
-            exit 1
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            TAG="$GITHUB_REF_NAME"
+            if [ "${TAG#v}" != "$PKG_VERSION" ]; then
+              echo "Tag $TAG does not match _version.py ($PKG_VERSION)" >&2
+              exit 1
+            fi
+          else
+            # workflow_dispatch: only from main; tag derived from _version.py
+            if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+              echo "Dispatch releases only from main (got $GITHUB_REF)" >&2
+              exit 1
+            fi
+            TAG="v$PKG_VERSION"
+            if git ls-remote --exit-code --tags origin "$TAG" >/dev/null 2>&1; then
+              echo "Tag $TAG already exists - bump _version.py first" >&2
+              exit 1
+            fi
           fi
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
 
       - name: Build and check the distributions
         run: |
@@ -56,9 +74,11 @@ jobs:
       - name: Create the GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+        # --target creates the tag at this commit on dispatch runs; it is
+        # ignored when the tag already exists (tag-push runs)
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/* \
-            --title "k_mesher $GITHUB_REF_NAME" --generate-notes
+          gh release create "$TAG" dist/* \
+            --title "k_mesher $TAG" --generate-notes --target "$GITHUB_SHA"
 
   pypi:
     # Publishes via PyPI Trusted Publishing (OIDC). Requires the trusted

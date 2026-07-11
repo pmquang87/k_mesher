@@ -94,15 +94,19 @@ To cut a release:
    the corresponding compare/release links at the bottom.
 3. Because the version is dynamic, you do **not** need to edit `pyproject.toml`
    — it always follows `_version.py`.
-4. Merge those changes to `main`, then tag and push the tag:
+4. Merge those changes to `main`, then either tag and push the tag:
 
    ```bash
    git tag v0.6.0
    git push origin v0.6.0
    ```
 
-   The `release` workflow (`.github/workflows/release.yml`) then builds the
-   sdist + wheel, `twine check`s them, verifies the tag matches
+   or dispatch the `release` workflow on `main` ("Run workflow" in the
+   Actions tab) — the dispatch path derives the tag from `_version.py` and
+   creates it for you (it refuses to run if the tag already exists).
+
+   Either way the `release` workflow (`.github/workflows/release.yml`) builds
+   the sdist + wheel, `twine check`s them, verifies the tag matches
    `_version.py`, smoke-tests the console entry point, and creates a GitHub
    Release with the artifacts attached.
 
