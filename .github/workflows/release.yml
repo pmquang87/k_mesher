@@ -1,0 +1,78 @@
+name: release
+
+# Cut a release by pushing a version tag:
+#   git tag v0.6.0 && git push origin v0.6.0
+# Builds the sdist + wheel, checks them, verifies the tag matches
+# k_mesher/_version.py, creates a GitHub Release with the artifacts, and
+# publishes to PyPI via Trusted Publishing (the `pypi` job needs the trusted
+# publisher configured on pypi.org — see CONTRIBUTING.md; the GitHub Release
+# succeeds regardless).
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check the tag matches the package version
+        run: |
+          PKG_VERSION=$(python -c "import runpy; print(runpy.run_path('k_mesher/_version.py')['__version__'])")
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match _version.py ($PKG_VERSION)" >&2
+            exit 1
+          fi
+
+      - name: Build and check the distributions
+        run: |
+          pip install -U build twine packaging
+          python -m build
+          twine check dist/*
+
+      - name: Smoke-test the wheel (console entry point)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libglu1-mesa libgl1 libxrender1 \
+            libxcursor1 libxft2 libxinerama1 libfontconfig1
+          pip install dist/*.whl
+          k-mesher --version
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "k_mesher $GITHUB_REF_NAME" --generate-notes
+
+  pypi:
+    # Publishes via PyPI Trusted Publishing (OIDC). Requires the trusted
+    # publisher to be configured on pypi.org for this repo + workflow;
+    # until then this job fails while the GitHub Release above still ships.
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - uses: pypa/gh-action-pypi-publish@release/v1

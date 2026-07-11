@@ -5,18 +5,19 @@ development setup, testing, linting, and the release/version-bump procedure.
 
 ## Development setup
 
-k-mesher uses a flat module layout (top-level `.py` modules, no `src/`) with a
-setuptools build backend. Install it in editable mode together with the
-development tools:
+k-mesher is a `k_mesher/` package with a setuptools build backend. Install it
+in editable mode together with the development tools:
 
 ```bash
-pip install -e .
+pip install -e ".[all]"
 pip install pytest pytest-cov ruff
 ```
 
 `pip install -e .` (or `pip install -r requirements.txt`, which does the same
 thing) pulls in the runtime dependencies (`gmsh`, `numpy`) and exposes the
-console scripts `k-mesher` and `k-mesher-gui`.
+console scripts `k-mesher`, `k-mesher-gui`, `k-mesher-doe`, `k-mesher-convert`
+and `k-mesher-post`; the `[all]` extra adds the optional bridge dependencies
+(meshio, lasso-python, scipy, matplotlib) whose tests are otherwise skipped.
 
 ## Running tests
 
@@ -67,12 +68,12 @@ select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
 Start with the low-risk `I` and `UP`, fix what they flag, then layer in `B`,
 `SIM`, and `RUF`.
 
-## Version-bump procedure
+## Release procedure
 
-The version lives in a single place: `_version.py`.
+The version lives in a single place: `k_mesher/_version.py`.
 
 ```python
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 ```
 
 `pyproject.toml` reads it dynamically:
@@ -82,17 +83,37 @@ __version__ = "0.5.0"
 dynamic = ["version"]
 
 [tool.setuptools.dynamic]
-version = { attr = "_version.__version__" }
+version = { attr = "k_mesher._version.__version__" }
 ```
 
-To cut a new version:
+To cut a release:
 
-1. Edit `__version__` in `_version.py`.
+1. Edit `__version__` in `k_mesher/_version.py`.
 2. Move the `## [Unreleased]` items into a new dated section in `CHANGELOG.md`
    following the [Keep a Changelog](https://keepachangelog.com/) format, and add
    the corresponding compare/release links at the bottom.
 3. Because the version is dynamic, you do **not** need to edit `pyproject.toml`
    — it always follows `_version.py`.
+4. Merge those changes to `main`, then tag and push the tag:
+
+   ```bash
+   git tag v0.6.0
+   git push origin v0.6.0
+   ```
+
+   The `release` workflow (`.github/workflows/release.yml`) then builds the
+   sdist + wheel, `twine check`s them, verifies the tag matches
+   `_version.py`, smoke-tests the console entry point, and creates a GitHub
+   Release with the artifacts attached.
+
+### PyPI publishing (Trusted Publishing)
+
+The workflow's `pypi` job publishes via [PyPI Trusted
+Publishing](https://docs.pypi.org/trusted-publishers/) (OIDC — no API token
+stored in the repo). It requires one-time setup on pypi.org: add a trusted
+publisher for the `k-mesher` project with repository `pmquang87/k_mesher`,
+workflow `release.yml`, and environment `pypi`. Until that is configured the
+`pypi` job fails while the GitHub Release still ships.
 
 Verify the resolved version after a bump:
 
